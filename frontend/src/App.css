@@ -88,6 +88,26 @@ body {
   margin: 12px 0 0;
 }
 
+/* Attention hierarchy (Change #3): two sub-groups within the section --
+   "High Attention" and "Worth Checking" -- smaller and less prominent
+   than .attention-heading above, and not colored/badged themselves so
+   they don't compete with the cards' own existing level badges for
+   attention. */
+.attention-group {
+  margin-bottom: 20px;
+}
+
+.attention-group:last-child {
+  margin-bottom: 0;
+}
+
+.attention-group-heading {
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: #bbb;
+  margin: 0 0 10px;
+}
+
 .attention-list {
   list-style: none;
   margin: 0;

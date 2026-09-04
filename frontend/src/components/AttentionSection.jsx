@@ -146,12 +146,56 @@ function summarizeRemaining(remaining) {
   return `${remaining.length} other ${noun} ${verb} in your watchlist.`
 }
 
+// One labeled sub-group of the (already backend-sorted) attention list.
+// Renders nothing when its slice is empty -- callers don't need to
+// guard against an empty heading with nothing under it. Factored out
+// only to avoid maintaining two copies of the same AttentionCard
+// mapping/prop-wiring in sync with each other; it is not a separate
+// abstraction over new behavior.
+function AttentionGroup({ title, groupItems, instrumentsById, onMarkAsSeen, inFlightIds, actionErrors }) {
+  if (groupItems.length === 0) {
+    return null
+  }
+
+  return (
+    <div className="attention-group">
+      <h3 className="attention-group-heading">{title}</h3>
+      <ul className="attention-list">
+        {groupItems.map((item) => (
+          <AttentionCard
+            key={item.instrument_id}
+            item={item}
+            watchlistEntry={instrumentsById.get(item.instrument_id)}
+            onMarkAsSeen={onMarkAsSeen}
+            inFlight={inFlightIds.has(item.instrument_id)}
+            actionError={actionErrors[item.instrument_id]}
+          />
+        ))}
+      </ul>
+    </div>
+  )
+}
+
 export default function AttentionSection({ items, instruments, onMarkAsSeen, inFlightIds, actionErrors }) {
   const instrumentsById = new Map(instruments.map((inst) => [inst.instrument_id, inst]))
 
   const attentionIds = new Set(items.map((item) => item.instrument_id))
   const remaining = instruments.filter((inst) => !attentionIds.has(inst.instrument_id))
   const remainingSummary = summarizeRemaining(remaining)
+
+  // Partition only -- items already arrive from GET /watchlist/attention
+  // sorted by the backend-computed attention_score (see
+  // AttentionEngine.get_ranked_active_items), and filtering a
+  // stably-sorted array preserves the relative order of what survives.
+  // No re-sorting, no new scoring: "medium" and "watch" both land in
+  // "Worth Checking" via the same `!== 'high'` check, so an unknown/
+  // unexpected level value safely falls into "Worth Checking" too,
+  // rather than being silently dropped or invented into a new category
+  // -- its card still renders with its own real (unmodified) badge.
+  const highItems = items.filter((item) => item.attention_level === 'high')
+  const worthCheckingItems = items.filter((item) => item.attention_level !== 'high')
+
+  const groupProps = { instrumentsById, onMarkAsSeen, inFlightIds, actionErrors }
 
   return (
     <section className="attention-section">
@@ -166,18 +210,8 @@ export default function AttentionSection({ items, instruments, onMarkAsSeen, inF
           <p className="attention-count">
             {items.length} {items.length === 1 ? 'thing deserves' : 'things deserve'} your attention
           </p>
-          <ul className="attention-list">
-            {items.map((item) => (
-              <AttentionCard
-                key={item.instrument_id}
-                item={item}
-                watchlistEntry={instrumentsById.get(item.instrument_id)}
-                onMarkAsSeen={onMarkAsSeen}
-                inFlight={inFlightIds.has(item.instrument_id)}
-                actionError={actionErrors[item.instrument_id]}
-              />
-            ))}
-          </ul>
+          <AttentionGroup title="High Attention" groupItems={highItems} {...groupProps} />
+          <AttentionGroup title="Worth Checking" groupItems={worthCheckingItems} {...groupProps} />
         </>
       )}
 
