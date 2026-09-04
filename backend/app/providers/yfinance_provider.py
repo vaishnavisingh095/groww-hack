@@ -1,55 +1,56 @@
 """
 yfinance-backed implementation of MarketDataProvider.
 
-Field mapping is exactly what the live investigation confirmed (see
-architecture.md's "External Dependency: Market Data Provider" section),
-with a correction below for previous_close:
+REVISED FIELD MAPPING (intraday-history-based, replacing fast_info for
+price/volume) -- see the "INTRADAY HISTORY REVISION" note below for the
+full evidence and reasoning:
 
-  last_price      <- fast_info.last_price      (fallback: info.regularMarketPrice)
-  previous_close  <- fast_info.previous_close  (fallback: info.regularMarketPreviousClose)
-  volume          <- fast_info.last_volume     (fallback: info.regularMarketVolume)
+  last_price      <- history(period="1d", interval="1m")'s latest valid Close
+  volume          <- sum of history(period="1d", interval="1m")'s valid
+                      per-minute Volume values for the current session
+  previous_close  <- info.regularMarketPreviousClose (fallback: fast_info.previous_close)
   provider_timestamp <- info.regularMarketTime (diagnostics only, per
                         architecture.md -- NEVER treated as authoritative
                         freshness or exchange trade time anywhere in this
                         codebase)
 
-CRITICAL: fast_info.last_price / last_volume / previous_close are
-snake_case Python @property attributes on yfinance's FastInfo class.
-They are NOT valid keys for FastInfo's separate dict-style .get()/
-.keys() interface, which uses different, camelCase key names
-("lastPrice", "lastVolume", ...) internally mapped back to these same
-properties. Calling fast_info.get("last_price") looks like it should
-work (FastInfo imitates a dict) but silently returns None on every call,
-because "last_price" is never a member of FastInfo.keys() -- this is
-NOT a network failure or a missing-data case, it is asking for a key
-that structurally does not exist under that name. This must be accessed
-via getattr(fast_info, "last_price", None) (i.e., real attribute
-access), not fast_info.get("last_price"). Confirmed directly against a
-live FastInfo instance during debugging; see decisions.md for the
-regression story.
+CRITICAL (retained from the earlier fast_info investigation, for
+historical context -- no longer load-bearing for price/volume since
+those no longer come from fast_info): fast_info.last_price / last_volume
+/ previous_close are snake_case Python @property attributes, not valid
+keys for FastInfo's separate dict-style .get()/.keys() interface. See
+decisions.md for the full regression story. previous_close STILL uses
+fast_info.previous_close as a fallback below, so this distinction still
+matters for that one field.
 
-PREVIOUS_CLOSE FALLBACK (added after a second, distinct bug): real Mac
-runtime evidence (yfinance 1.7.0, live RELIANCE.NS) showed
-fast_info.previous_close can legitimately return None even when
-fast_info.last_price and fast_info.last_volume succeed -- this is
-expected per fast_info.previous_close's own implementation, which
-computes previous close from a separate 1-week pre/post-market history
-fetch that can fail independently of the simpler last_price/last_volume
-lookups. The SAME live evidence confirmed info["regularMarketPreviousClose"]
-(and the equivalent info["previousClose"]) correctly held the real prior
-session's close (1302.5) in that exact case. This is a genuine,
-yfinance-supported field -- not a derived or fabricated value -- so it
-is used as a fallback, mirroring the existing last_price/volume fallback
-pattern rather than introducing a new mechanism.
+INTRADAY HISTORY REVISION (this revision): a direct runtime diagnostic
+confirmed fast_info.last_price and fast_info.last_volume returned the
+EXACT SAME values across three reads 10 seconds apart during live NSE
+market hours, while history(period="1d", interval="1m") for the same
+symbol at the same time returned real, distinct intraday bars with
+changing prices and per-minute volumes. This means fast_info's
+price/volume path (which internally derives from a DAILY-interval
+history call, not live intraday data -- see the fast_info.last_price
+source) does not refresh on a timescale usable for intraday
+change-detection. Price and volume are therefore now sourced from
+1-minute intraday bars instead.
 
-We deliberately do NOT use history(interval="1m").Volume -- the live
-test observed it return near-zero for almost every symbol/bar, and
-architecture.md explicitly excludes it from the volume signal path.
+NOTE ON A PRIOR, CONFLICTING OBSERVATION: architecture.md's original
+live investigation stated that history(interval="1m")'s Volume field
+returned near-zero for almost every bar, and explicitly excluded it from
+the volume path for that reason. The diagnostic behind THIS revision
+found the opposite -- real, non-zero, changing per-minute volumes. Both
+observations are real evidence from real runs; they are not being
+silently reconciled here. This discrepancy is documented in decisions.md
+rather than assumed away. What changed in this revision is a direct
+architectural instruction based on new, explicit runtime evidence
+overriding the earlier documented exclusion for this specific field.
 
 This module is the ONLY place yfinance is imported. Every other module
 depends on the MarketDataProvider/RawQuote abstraction in base.py.
 """
 import logging
+import math
 from datetime import datetime, timezone
 
 import yfinance as yf
@@ -66,16 +67,14 @@ class YFinanceProvider(MarketDataProvider):
         batch call.
 
         Why not batch here: yf.download's multi-symbol DataFrame shape
-        (confirmed in the live test) is convenient for OHLCV history but
-        does not expose fast_info.last_volume / previous_close cleanly
-        per symbol -- those live on the Ticker object's fast_info/info,
-        which is what the confirmed field mapping above depends on.
-        Per-symbol yf.Ticker calls were also confirmed working
-        individually in the live test (~0.9-1.7s each). For this first
-        vertical slice with 5 symbols, sequential per-symbol calls are
-        simple and fast enough; if this becomes a real bottleneck with a
-        larger watchlist, that is a concrete, measurable problem to
-        revisit -- not something to pre-optimize now.
+        is convenient for OHLCV history but per-symbol yf.Ticker calls
+        were confirmed working individually and keep the per-symbol
+        error handling (a single bad symbol must never affect another)
+        simple. For this vertical slice with 5 symbols, sequential
+        per-symbol calls remain simple and fast enough; if this becomes
+        a real bottleneck with a larger watchlist, that is a concrete,
+        measurable problem to revisit -- not something to pre-optimize
+        now.
         """
         results: list[RawQuote] = []
         for symbol in symbols:
@@ -87,61 +86,18 @@ class YFinanceProvider(MarketDataProvider):
         try:
             ticker = yf.Ticker(symbol)
 
-            last_price = None
-            previous_close = None
-            volume = None
-            provider_timestamp = None
-            fast_info_error = None
-            info_error = None
+            last_price, volume, intraday_error = self._get_intraday_price_and_volume(ticker)
 
-            try:
-                fi = ticker.fast_info
-                # ATTRIBUTE access (getattr), NOT fi.get("last_price") --
-                # see the module docstring for why .get() silently fails
-                # here regardless of whether the underlying fetch
-                # succeeded.
-                last_price = self._safe_number(getattr(fi, "last_price", None))
-                previous_close = self._safe_number(getattr(fi, "previous_close", None))
-                vol = getattr(fi, "last_volume", None)
-                if vol is not None:
-                    volume = int(vol)
-            except Exception as e:
-                fast_info_error = f"{type(e).__name__}: {e}"
-                logger.warning(
-                    "fast_info fetch failed for %s: %s", symbol, fast_info_error
-                )
-                # fall through to .info fallback below
+            previous_close, previous_close_error = self._get_previous_close(ticker)
 
-            # Fallback path, and where we get provider_timestamp from.
-            # Also the fallback for previous_close, which fast_info can
-            # legitimately fail to populate even when last_price/volume
-            # succeed -- see module docstring.
-            try:
-                info = ticker.info
-                if info:
-                    if last_price is None:
-                        last_price = self._safe_number(info.get("regularMarketPrice"))
-                    if previous_close is None:
-                        previous_close = self._safe_number(
-                            info.get("regularMarketPreviousClose")
-                        )
-                    if volume is None:
-                        vol = info.get("regularMarketVolume")
-                        if vol is not None:
-                            volume = int(vol)
-                    provider_timestamp = info.get("regularMarketTime")
-            except Exception as e:
-                info_error = f"{type(e).__name__}: {e}"
-                logger.warning("info fetch failed for %s: %s", symbol, info_error)
-                # info is a fallback; its absence alone isn't fatal
+            provider_timestamp = self._get_provider_timestamp(ticker)
 
             if last_price is None:
                 # Surface the REAL underlying failure reason instead of a
                 # generic message -- this is what makes a genuine
-                # provider outage distinguishable from "the field mapping
-                # is wrong" during development, which is exactly the
-                # class of bug this replaces.
-                detail = fast_info_error or info_error or "no error captured"
+                # provider outage distinguishable from a mapping bug
+                # during development.
+                detail = intraday_error or "no error captured"
                 return RawQuote(
                     symbol=symbol,
                     last_price=None,
@@ -153,16 +109,13 @@ class YFinanceProvider(MarketDataProvider):
                     error_message=f"Provider returned no usable price ({detail})",
                 )
 
-            # NOTE: previous_close can still legitimately be None here
-            # even though last_price succeeded (both fast_info and the
-            # .info fallback failed to provide it). This is NOT
-            # fabricated or defaulted to any value -- RawQuote.previous_close
-            # is passed through exactly as found, including None. It is
-            # MarketDataService's explicit job (not this provider's) to
-            # decide what an unusable previous_close means for the
-            # resulting snapshot -- see market_data_service.py. This
-            # provider's only responsibility is honest reporting of what
-            # the data source actually gave us.
+            # previous_close can still legitimately be None here even
+            # though last_price succeeded -- this is NOT fabricated or
+            # defaulted. RawQuote.previous_close is passed through
+            # exactly as found, including None. It is
+            # MarketDataService's job (not this provider's) to decide
+            # what an unusable previous_close means for the resulting
+            # snapshot.
             return RawQuote(
                 symbol=symbol,
                 last_price=last_price,
@@ -191,12 +144,134 @@ class YFinanceProvider(MarketDataProvider):
                 error_message=error_message,
             )
 
+    def _get_intraday_price_and_volume(
+        self, ticker: "yf.Ticker"
+    ) -> tuple[float | None, int | None, str | None]:
+        """
+        Fetch today's 1-minute intraday bars and derive:
+          - last_price: the latest bar with a valid (finite, positive) Close.
+          - volume: the sum of every valid (finite, non-negative) Volume
+            value across today's bars -- this reconstructs cumulative
+            session volume from the intraday series, since we no longer
+            rely on fast_info/info's own cumulative volume field for this.
+
+        Returns (last_price, volume, error_message). Never raises;
+        empty/malformed data results in (None, None, <reason>), which
+        the caller treats as a failed fetch for this symbol -- never a
+        fabricated price or volume.
+
+        Conservative handling of malformed bars: a bar with a
+        NaN/inf/non-positive Close is skipped when searching for the
+        latest valid price (we do not assume the LAST row is
+        automatically usable -- an in-progress or malformed final bar
+        must not silently produce a bad price). A bar with a
+        NaN/negative Volume is excluded from the sum rather than
+        treated as zero or aborting the whole calculation -- one bad
+        minute must not zero out or invalidate the entire session's
+        volume figure.
+        """
+        try:
+            bars = ticker.history(period="1d", interval="1m")
+        except Exception as e:
+            return None, None, f"history() fetch failed: {type(e).__name__}: {e}"
+
+        if bars is None or bars.empty:
+            return None, None, "history() returned no intraday bars"
+
+        if "Close" not in bars.columns or "Volume" not in bars.columns:
+            return None, None, "history() response missing Close/Volume columns"
+
+        last_price = self._latest_valid_close(bars)
+        if last_price is None:
+            return None, None, "no bar had a valid (finite, positive) Close"
+
+        volume = self._sum_valid_volume(bars)
+        # Note: volume can legitimately be 0 (e.g., very start of
+        # session with only one bar and no trades yet) -- 0 is a valid
+        # sum, not a failure. Only last_price being unobtainable fails
+        # the whole fetch, per the existing "missing/invalid PRICE
+        # invalidates the update; volume degrades gracefully" rule
+        # preserved from market_data_service.py's Invalid Data Rules.
+        return last_price, volume, None
+
+    @staticmethod
+    def _latest_valid_close(bars) -> float | None:
+        """Search from the most recent bar backwards for the latest
+        bar with a finite, positive Close -- does not assume the very
+        last row is automatically valid."""
+        for close in reversed(bars["Close"].tolist()):
+            try:
+                f = float(close)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(f) and f > 0:
+                return f
+        return None
+
+    @staticmethod
+    def _sum_valid_volume(bars) -> int:
+        """Sum every finite, non-negative per-minute Volume value,
+        skipping (not zeroing-out or aborting on) any malformed bar."""
+        total = 0
+        for vol in bars["Volume"].tolist():
+            try:
+                f = float(vol)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(f) and f >= 0:
+                total += int(f)
+        return total
+
+    def _get_previous_close(self, ticker: "yf.Ticker") -> tuple[float | None, str | None]:
+        """
+        previous_close continues to come from the source already
+        confirmed reliable in the prior investigation:
+        info.regularMarketPreviousClose, with fast_info.previous_close
+        as a fallback (reversed priority from the earlier revision,
+        since info.regularMarketPreviousClose was the field real Mac
+        evidence confirmed as reliably populated; fast_info.previous_close
+        was the field that was confirmed to unreliably return None).
+        This path is intentionally UNCHANGED in spirit from the prior
+        fix -- only the primary/fallback order is swapped to put the
+        more reliable source first now that we no longer need fast_info
+        for anything else.
+        """
+        previous_close = None
+        error = None
+
+        try:
+            info = ticker.info
+            if info:
+                previous_close = self._safe_number(info.get("regularMarketPreviousClose"))
+        except Exception as e:
+            error = f"info fetch failed: {type(e).__name__}: {e}"
+
+        if previous_close is None:
+            try:
+                fi = ticker.fast_info
+                previous_close = self._safe_number(getattr(fi, "previous_close", None))
+            except Exception as e:
+                if error is None:
+                    error = f"fast_info fetch failed: {type(e).__name__}: {e}"
+
+        return previous_close, error
+
+    @staticmethod
+    def _get_provider_timestamp(ticker: "yf.Ticker") -> int | None:
+        """Diagnostics-only field, unchanged from the prior revision --
+        never authoritative for freshness, never used for price/volume."""
+        try:
+            info = ticker.info
+            if info:
+                return info.get("regularMarketTime")
+        except Exception:
+            pass
+        return None
+
     @staticmethod
     def _safe_number(value) -> float | None:
         """Reject NaN/inf/non-numeric at the provider boundary itself,
         so nothing downstream ever has to re-check this."""
-        import math
-
         if value is None:
             return None
         try:

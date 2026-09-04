@@ -1,75 +1,50 @@
 """
 Tests for YFinanceProvider's field mapping and failure handling.
 
-Uses a fake Ticker (not real network calls) to test OUR mapping logic
-deterministically -- this is exactly what "keep provider-facing code
-separate from domain logic" and "testable without network access" mean
-in practice: we can verify our own field-extraction logic is correct
-without depending on live Yahoo data being in any particular state.
+REVISED (intraday history for price/volume): a direct runtime diagnostic
+confirmed fast_info.last_price/last_volume return the SAME value across
+repeated reads seconds apart during live market hours, while
+history(period="1d", interval="1m") returns real, changing intraday
+bars. Price and volume are therefore now derived from intraday history
+bars, not fast_info. previous_close is UNCHANGED in spirit -- it still
+uses info.regularMarketPreviousClose as primary and
+fast_info.previous_close as fallback (order swapped from the prior
+revision now that info is the confirmed-reliable source and fast_info is
+only needed as a fallback for this one field).
 
-IMPORTANT: the fake fast_info object below is deliberately built to
-mimic REAL yfinance FastInfo behavior, not a convenient plain dict. A
-previous version of this test file used a plain dict for fast_info,
-which supports both attribute-style .get() and item access -- that
-fake accidentally masked a real bug where the provider used
-fast_info.get("last_price") instead of attribute access
-(getattr(fast_info, "last_price")). Real FastInfo's .get() uses a
-DIFFERENT, camelCase key namespace ("lastPrice") than its snake_case
-attributes ("last_price"), so fast_info.get("last_price") silently
-returns None on every real call, always -- a bug this old test suite
-could not have caught. See yfinance_provider.py's module docstring and
-decisions.md for the full story. FakeFastInfo below is built to make
-that exact distinction visible: it raises AttributeError for anything
-accessed except real attributes, and its .get() only recognizes the
-real camelCase key names, exactly like the real class.
+Uses fake Ticker/DataFrame objects (not real network calls) to test OUR
+mapping logic deterministically -- consistent with "keep provider-facing
+code separate from domain logic" and "testable without network access."
 
-Real-network verification against actual yfinance happens separately in
-the manual end-to-end run (see implementation report), not here.
+Real-network verification against actual yfinance happens separately via
+manual end-to-end testing, not here.
 """
+import math
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
+
+import pandas as pd
 
 from app.providers.yfinance_provider import YFinanceProvider
 
 
+# ---------- Fakes ----------
+
+
 class FakeFastInfo:
     """
-    Mimics real yfinance FastInfo's actual dual-interface behavior:
-    - Real attributes (last_price, last_volume, previous_close) are
-      snake_case and accessed via normal attribute access.
-    - A SEPARATE dict-like interface (.get(), .keys()) uses different,
-      camelCase key names and does NOT recognize the snake_case
-      attribute names as valid keys.
-
-    This is what makes fast_info.get("last_price") a real bug: it looks
-    up "last_price" in the camelCase key namespace, where it does not
-    exist, and returns the default (None) -- exactly what real FastInfo
-    does, confirmed directly against yfinance 1.7.0 during debugging.
+    Mimics real yfinance FastInfo's dual-interface behavior (retained
+    from the prior revision since previous_close still falls back to
+    fast_info.previous_close): snake_case attributes are the real data;
+    a separate camelCase .get()/.keys() interface does NOT recognize the
+    snake_case names.
     """
 
-    _CAMEL_CASE_KEYS = {
-        "lastPrice": "last_price",
-        "lastVolume": "last_volume",
-        "previousClose": "previous_close",
-    }
+    _CAMEL_CASE_KEYS = {"previousClose": "previous_close"}
 
-    def __init__(self, last_price=None, last_volume=None, previous_close=None, raise_on_access=False):
-        self._last_price = last_price
-        self._last_volume = last_volume
+    def __init__(self, previous_close=None, raise_on_access=False):
         self._previous_close = previous_close
         self._raise_on_access = raise_on_access
-
-    @property
-    def last_price(self):
-        if self._raise_on_access:
-            raise RuntimeError("simulated fetch failure")
-        return self._last_price
-
-    @property
-    def last_volume(self):
-        if self._raise_on_access:
-            raise RuntimeError("simulated fetch failure")
-        return self._last_volume
 
     @property
     def previous_close(self):
@@ -81,279 +56,354 @@ class FakeFastInfo:
         return list(self._CAMEL_CASE_KEYS.keys())
 
     def get(self, key, default=None):
-        # Real FastInfo.get() only recognizes camelCase keys -- snake_case
-        # attribute names like "last_price" are NOT valid keys here, so
-        # this correctly returns `default` for them, exactly like the
-        # real bug that was found.
         if key in self._CAMEL_CASE_KEYS:
             return getattr(self, self._CAMEL_CASE_KEYS[key])
         return default
 
 
-def _make_fake_ticker(
-    fast_info_kwargs=None,
+def make_intraday_bars(rows):
+    """
+    Build a fake intraday-history DataFrame in the same shape
+    yf.Ticker.history(period="1d", interval="1m") returns: a
+    DatetimeIndex and Open/High/Low/Close/Volume columns.
+
+    `rows` is a list of (close, volume) tuples, oldest first, matching
+    how real bars are ordered.
+    """
+    if not rows:
+        return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+
+    index = pd.date_range("2026-09-04 09:15", periods=len(rows), freq="1min", tz="Asia/Kolkata")
+    closes = [r[0] for r in rows]
+    volumes = [r[1] for r in rows]
+    return pd.DataFrame(
+        {
+            "Open": closes,
+            "High": closes,
+            "Low": closes,
+            "Close": closes,
+            "Volume": volumes,
+        },
+        index=index,
+    )
+
+
+def make_fake_ticker(
+    bars=None,
+    history_raises=False,
     info=None,
-    raise_on_fast_info=False,
-    raise_on_info=False,
+    info_raises=False,
+    fast_info_previous_close=None,
+    fast_info_raises=False,
 ):
     fake = MagicMock()
-    if raise_on_fast_info:
-        type(fake).fast_info = property(lambda self: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    if history_raises:
+        fake.history.side_effect = RuntimeError("history() network failure")
     else:
-        fake.fast_info = FakeFastInfo(**(fast_info_kwargs or {}))
-    if raise_on_info:
-        type(fake).info = property(lambda self: (_ for _ in ()).throw(RuntimeError("boom")))
+        fake.history.return_value = bars if bars is not None else make_intraday_bars([])
+
+    if info_raises:
+        type(fake).info = property(lambda self: (_ for _ in ()).throw(RuntimeError("info failure")))
     else:
-        fake.info = info or {}
+        fake.info = info if info is not None else {}
+
+    if fast_info_raises:
+        type(fake).fast_info = property(lambda self: (_ for _ in ()).throw(RuntimeError("fast_info failure")))
+    else:
+        fake.fast_info = FakeFastInfo(previous_close=fast_info_previous_close)
+
     return fake
 
 
-def test_maps_fast_info_fields_correctly():
-    """Confirms the primary field mapping: fast_info.last_price,
-    fast_info.previous_close, fast_info.last_volume -- via real
-    attribute access, matching actual FastInfo behavior."""
-    fake_ticker = _make_fake_ticker(
-        fast_info_kwargs=dict(last_price=1326.4, previous_close=1302.6, last_volume=9122871)
-    )
+# ---------- 1. Valid intraday bars produce the latest price ----------
+
+
+def test_valid_intraday_bars_produce_the_latest_close_as_last_price():
+    bars = make_intraday_bars([(1300.0, 1000), (1310.0, 1500), (1322.0, 800)])
+    fake_ticker = make_fake_ticker(bars=bars, info={"regularMarketPreviousClose": 1302.5})
+
     with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
-        provider = YFinanceProvider()
-        quotes = provider.get_quotes(["RELIANCE.NS"])
-
-    assert len(quotes) == 1
-    q = quotes[0]
-    assert q.fetch_succeeded is True
-    assert q.last_price == 1326.4
-    assert q.previous_close == 1302.6
-    assert q.volume == 9122871
-
-
-def test_falls_back_to_info_fields_when_fast_info_fails():
-    """Confirms the documented fallback: info.regularMarketPrice /
-    regularMarketVolume / regularMarketPreviousClose when fast_info
-    raises entirely."""
-    fake_ticker = _make_fake_ticker(
-        raise_on_fast_info=True,
-        info={
-            "regularMarketPrice": 2312.8,
-            "regularMarketPreviousClose": 2320.0,
-            "regularMarketVolume": 1722049,
-            "regularMarketTime": 1788509522,
-        },
-    )
-    with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
-        provider = YFinanceProvider()
-        quotes = provider.get_quotes(["TCS.NS"])
+        quotes = YFinanceProvider().get_quotes(["RELIANCE.NS"])
 
     q = quotes[0]
     assert q.fetch_succeeded is True
-    assert q.last_price == 2312.8
-    assert q.previous_close == 2320.0
-    assert q.volume == 1722049
-    assert q.provider_timestamp == 1788509522
+    assert q.last_price == 1322.0  # the LAST bar's Close, not an earlier one
 
 
-def test_previous_close_falls_back_to_info_when_fast_info_gives_none():
-    """
-    REGRESSION TEST for the actual real-world failure: real Mac runtime
-    evidence (yfinance 1.7.0, live RELIANCE.NS) showed fast_info.last_price
-    and fast_info.last_volume succeeding while fast_info.previous_close
-    returned None -- NOT an exception, a legitimate None value, since
-    fast_info.previous_close performs a separate, independently-fragile
-    history lookup internally. The same live evidence confirmed
-    info["regularMarketPreviousClose"] correctly held the real value
-    (1302.5) in that exact scenario.
+def test_latest_price_skips_a_trailing_invalid_bar():
+    """Conservative handling: an in-progress or malformed final bar
+    (NaN/zero/negative Close) must not silently produce a bad price --
+    the search must fall back to the most recent VALID bar instead."""
+    bars = make_intraday_bars([(1300.0, 1000), (1310.0, 1500), (float("nan"), 800)])
+    fake_ticker = make_fake_ticker(bars=bars, info={"regularMarketPreviousClose": 1302.5})
 
-    This must produce a usable quote with a real previous_close, not a
-    quote with previous_close stuck at None despite a working fallback
-    being available.
-    """
-    fake_ticker = _make_fake_ticker(
-        # fast_info succeeds for price/volume but returns None for
-        # previous_close specifically -- not raising, just None.
-        fast_info_kwargs=dict(last_price=1322.0, last_volume=13022095, previous_close=None),
-        info={
-            "regularMarketPreviousClose": 1302.5,
-        },
+    with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
+        quotes = YFinanceProvider().get_quotes(["RELIANCE.NS"])
+
+    assert quotes[0].last_price == 1310.0  # the last VALID close, not NaN
+
+
+def test_latest_price_skips_a_zero_or_negative_trailing_close():
+    bars = make_intraday_bars([(1300.0, 1000), (1310.0, 1500), (0.0, 800), (-5.0, 200)])
+    fake_ticker = make_fake_ticker(bars=bars, info={"regularMarketPreviousClose": 1302.5})
+
+    with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
+        quotes = YFinanceProvider().get_quotes(["RELIANCE.NS"])
+
+    assert quotes[0].last_price == 1310.0
+
+
+# ---------- 2. Cumulative volume is derived correctly ----------
+
+
+def test_cumulative_volume_is_sum_of_all_valid_bar_volumes():
+    bars = make_intraday_bars([(1300.0, 1000), (1305.0, 2500), (1310.0, 4000)])
+    fake_ticker = make_fake_ticker(bars=bars, info={"regularMarketPreviousClose": 1290.0})
+
+    with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
+        quotes = YFinanceProvider().get_quotes(["RELIANCE.NS"])
+
+    assert quotes[0].volume == 1000 + 2500 + 4000
+
+
+def test_volume_sum_excludes_invalid_bars_without_aborting():
+    """One malformed bar's Volume must be excluded from the sum, not
+    zero out or invalidate the entire session total."""
+    bars = make_intraday_bars(
+        [(1300.0, 1000), (1305.0, float("nan")), (1308.0, -50), (1310.0, 4000)]
     )
+    fake_ticker = make_fake_ticker(bars=bars, info={"regularMarketPreviousClose": 1290.0})
+
     with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
-        provider = YFinanceProvider()
-        quotes = provider.get_quotes(["RELIANCE.NS"])
+        quotes = YFinanceProvider().get_quotes(["RELIANCE.NS"])
 
-    q = quotes[0]
-    assert q.fetch_succeeded is True
-    assert q.last_price == 1322.0
-    assert q.volume == 13022095
-    assert q.previous_close == 1302.5  # filled from the .info fallback
+    # NaN and negative volume bars excluded; only 1000 + 4000 counted.
+    assert quotes[0].volume == 1000 + 4000
+    # Price still comes from the last valid close, unaffected by the
+    # excluded-volume bars.
+    assert quotes[0].last_price == 1310.0
 
 
-def test_previous_close_stays_none_when_no_source_has_it():
-    """
-    The other side of the same fix: when NEITHER fast_info NOR info can
-    supply previous_close, it must stay None -- never fabricated,
-    defaulted, or guessed. RawQuote.previous_close=None in this case is
-    the honest, correct signal; it is MarketDataService's job (not this
-    provider's) to decide a snapshot cannot be assembled without it.
-    """
-    fake_ticker = _make_fake_ticker(
-        fast_info_kwargs=dict(last_price=1322.0, last_volume=13022095, previous_close=None),
-        info={},  # no regularMarketPreviousClose key at all
-    )
+def test_zero_total_volume_is_a_valid_sum_not_a_failure():
+    """Very start of session: a single bar with zero volume must be
+    accepted as a legitimate (if uninteresting) volume figure, not
+    treated as missing/invalid data."""
+    bars = make_intraday_bars([(1300.0, 0)])
+    fake_ticker = make_fake_ticker(bars=bars, info={"regularMarketPreviousClose": 1290.0})
+
     with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
-        provider = YFinanceProvider()
-        quotes = provider.get_quotes(["RELIANCE.NS"])
+        quotes = YFinanceProvider().get_quotes(["RELIANCE.NS"])
 
-    q = quotes[0]
-    # last_price/volume still succeed independently -- this provider
-    # reports what it actually has, honestly, per symbol/field.
-    assert q.fetch_succeeded is True
-    assert q.last_price == 1322.0
-    assert q.volume == 13022095
-    assert q.previous_close is None  # NOT fabricated
+    assert quotes[0].fetch_succeeded is True
+    assert quotes[0].volume == 0
 
 
-def test_provider_timestamp_never_used_as_price_or_volume():
-    """Sanity check that provider_timestamp is captured for diagnostics
-    ONLY and never leaks into price/volume fields."""
-    fake_ticker = _make_fake_ticker(
-        fast_info_kwargs=dict(last_price=100.0, previous_close=99.0, last_volume=500),
-        info={"regularMarketTime": 1788509522},
-    )
+# ---------- 3. Empty intraday history ----------
+
+
+def test_empty_intraday_history_produces_fetch_failed_not_exception():
+    fake_ticker = make_fake_ticker(bars=make_intraday_bars([]))
+
     with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
-        provider = YFinanceProvider()
-        quotes = provider.get_quotes(["INFY.NS"])
-
-    q = quotes[0]
-    assert q.provider_timestamp == 1788509522
-    assert q.last_price == 100.0  # not overwritten by provider_timestamp
-    assert q.volume == 500
-
-
-def test_no_usable_price_returns_fetch_failed_not_exception():
-    """When both fast_info and info fail to give a price, get_quotes
-    must return fetch_succeeded=False, never raise."""
-    fake_ticker = _make_fake_ticker(raise_on_fast_info=True, raise_on_info=True)
-    with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
-        provider = YFinanceProvider()
-        quotes = provider.get_quotes(["ICICIBANK.NS"])
+        quotes = YFinanceProvider().get_quotes(["RELIANCE.NS"])
 
     q = quotes[0]
     assert q.fetch_succeeded is False
     assert q.last_price is None
-    assert q.error_message is not None
+    assert q.volume is None
+    assert "no intraday bars" in q.error_message
+
+
+def test_history_raising_produces_fetch_failed_with_real_error_message():
+    fake_ticker = make_fake_ticker(history_raises=True)
+
+    with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
+        quotes = YFinanceProvider().get_quotes(["RELIANCE.NS"])
+
+    q = quotes[0]
+    assert q.fetch_succeeded is False
+    assert "history() fetch failed" in q.error_message
+    assert "network failure" in q.error_message
+
+
+def test_all_bars_invalid_produces_fetch_failed_no_fabricated_price():
+    """Every bar has an unusable Close -- must fail cleanly, never
+    fabricate a price from garbage data."""
+    bars = make_intraday_bars([(float("nan"), 100), (0.0, 200), (-1.0, 300)])
+    fake_ticker = make_fake_ticker(bars=bars)
+
+    with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
+        quotes = YFinanceProvider().get_quotes(["RELIANCE.NS"])
+
+    q = quotes[0]
+    assert q.fetch_succeeded is False
+    assert q.last_price is None
+    assert "no bar had a valid" in q.error_message
+
+
+# ---------- 4. Invalid price/volume (non-finite types) ----------
+
+
+def test_infinite_close_is_rejected_as_invalid():
+    bars = make_intraday_bars([(1300.0, 1000), (float("inf"), 500)])
+    fake_ticker = make_fake_ticker(bars=bars, info={"regularMarketPreviousClose": 1290.0})
+
+    with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
+        quotes = YFinanceProvider().get_quotes(["RELIANCE.NS"])
+
+    assert quotes[0].last_price == 1300.0  # infinite bar skipped
+
+
+def test_non_numeric_close_value_is_skipped_not_crashed_on():
+    bars = make_intraday_bars([(1300.0, 1000), (1310.0, 500)])
+    # Force the Close column to object dtype so a non-numeric value can
+    # be assigned, simulating a malformed cell the provider must not
+    # crash on -- pandas' default float64 column would reject a string
+    # assignment outright, which the real (unofficial, undocumented)
+    # provider response is not guaranteed to do.
+    bars["Close"] = bars["Close"].astype(object)
+    bars.loc[bars.index[-1], "Close"] = "not-a-number"
+
+    fake_ticker = make_fake_ticker(bars=bars, info={"regularMarketPreviousClose": 1290.0})
+
+    with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
+        quotes = YFinanceProvider().get_quotes(["RELIANCE.NS"])
+
+    assert quotes[0].last_price == 1300.0  # malformed cell skipped, not a crash
+
+
+def test_missing_close_or_volume_columns_produces_fetch_failed():
+    bars = pd.DataFrame({"Open": [100.0]}, index=pd.date_range("2026-09-04", periods=1, freq="1min"))
+    fake_ticker = make_fake_ticker(bars=bars)
+
+    with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
+        quotes = YFinanceProvider().get_quotes(["RELIANCE.NS"])
+
+    q = quotes[0]
+    assert q.fetch_succeeded is False
+    assert "missing Close/Volume" in q.error_message
+
+
+# ---------- 5. previous_close fallback (retained from prior revision) ----------
+
+
+def test_previous_close_from_info_regular_market_previous_close():
+    bars = make_intraday_bars([(1322.0, 1000)])
+    fake_ticker = make_fake_ticker(bars=bars, info={"regularMarketPreviousClose": 1302.5})
+
+    with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
+        quotes = YFinanceProvider().get_quotes(["RELIANCE.NS"])
+
+    assert quotes[0].previous_close == 1302.5
+
+
+def test_previous_close_falls_back_to_fast_info_when_info_gives_none():
+    bars = make_intraday_bars([(1322.0, 1000)])
+    fake_ticker = make_fake_ticker(
+        bars=bars,
+        info={},  # no regularMarketPreviousClose key
+        fast_info_previous_close=1302.5,
+    )
+
+    with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
+        quotes = YFinanceProvider().get_quotes(["RELIANCE.NS"])
+
+    assert quotes[0].previous_close == 1302.5
+
+
+def test_previous_close_stays_none_when_no_source_has_it():
+    """Never fabricated -- if neither info nor fast_info can supply it,
+    RawQuote.previous_close must be None, and last_price/volume must
+    still succeed independently."""
+    bars = make_intraday_bars([(1322.0, 1000)])
+    fake_ticker = make_fake_ticker(bars=bars, info={}, fast_info_previous_close=None)
+
+    with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
+        quotes = YFinanceProvider().get_quotes(["RELIANCE.NS"])
+
+    q = quotes[0]
+    assert q.fetch_succeeded is True
+    assert q.last_price == 1322.0
+    assert q.previous_close is None
+
+
+def test_previous_close_falls_back_when_info_access_raises():
+    bars = make_intraday_bars([(1322.0, 1000)])
+    fake_ticker = make_fake_ticker(bars=bars, info_raises=True, fast_info_previous_close=1302.5)
+
+    with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
+        quotes = YFinanceProvider().get_quotes(["RELIANCE.NS"])
+
+    # info raised entirely (so provider_timestamp is also unavailable),
+    # but previous_close still comes through via fast_info, and
+    # price/volume (from history(), independent of info) are unaffected.
+    assert quotes[0].previous_close == 1302.5
+    assert quotes[0].last_price == 1322.0
+    assert quotes[0].provider_timestamp is None
+
+
+# ---------- 6. Provider failure (total outage) ----------
 
 
 def test_ticker_construction_itself_raising_does_not_crash_get_quotes():
-    """Simulates a total provider outage at the lowest level -- even if
-    yf.Ticker() itself raises, get_quotes must not propagate the
-    exception (per base.py's contract)."""
     with patch("app.providers.yfinance_provider.yf.Ticker", side_effect=RuntimeError("network down")):
-        provider = YFinanceProvider()
-        quotes = provider.get_quotes(["HDFCBANK.NS"])
+        quotes = YFinanceProvider().get_quotes(["HDFCBANK.NS"])
 
     assert len(quotes) == 1
     assert quotes[0].fetch_succeeded is False
     assert "network down" in quotes[0].error_message
 
 
-def test_nan_price_from_provider_is_rejected_at_boundary():
-    """NaN/inf values from a provider must be filtered out by
-    _safe_number, not passed through as a 'valid' price."""
-    import math
+def test_total_failure_across_history_info_and_fast_info_is_reported_not_raised():
+    fake_ticker = make_fake_ticker(history_raises=True, info_raises=True, fast_info_raises=True)
 
-    fake_ticker = _make_fake_ticker(
-        fast_info_kwargs=dict(last_price=math.nan, previous_close=100.0, last_volume=500)
-    )
     with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
-        provider = YFinanceProvider()
-        quotes = provider.get_quotes(["RELIANCE.NS"])
+        quotes = YFinanceProvider().get_quotes(["RELIANCE.NS"])
 
-    # last_price is None (NaN filtered), and .info fallback (empty mock)
-    # gives nothing either -> overall fetch should report no usable price
     q = quotes[0]
-    assert q.last_price is None
     assert q.fetch_succeeded is False
+    assert q.last_price is None
+    assert q.previous_close is None
+    assert q.error_message is not None
+
+
+# ---------- Other invariants retained from prior revisions ----------
+
+
+def test_provider_timestamp_never_used_as_price_or_volume():
+    bars = make_intraday_bars([(100.0, 500)])
+    fake_ticker = make_fake_ticker(
+        bars=bars, info={"regularMarketPreviousClose": 99.0, "regularMarketTime": 1788509522}
+    )
+
+    with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
+        quotes = YFinanceProvider().get_quotes(["INFY.NS"])
+
+    q = quotes[0]
+    assert q.provider_timestamp == 1788509522
+    assert q.last_price == 100.0
+    assert q.volume == 500
 
 
 def test_fetched_at_is_set_to_our_own_current_time():
-    """Confirms fetched_at is OUR timestamp (set at call time), not
-    derived from anything the provider returns."""
-    fake_ticker = _make_fake_ticker(
-        fast_info_kwargs=dict(last_price=100.0, previous_close=99.0, last_volume=500)
-    )
+    bars = make_intraday_bars([(100.0, 500)])
+    fake_ticker = make_fake_ticker(bars=bars, info={"regularMarketPreviousClose": 99.0})
+
     before = datetime.now(timezone.utc)
     with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
-        provider = YFinanceProvider()
-        quotes = provider.get_quotes(["RELIANCE.NS"])
+        quotes = YFinanceProvider().get_quotes(["RELIANCE.NS"])
     after = datetime.now(timezone.utc)
 
     assert before <= quotes[0].fetched_at <= after
 
 
 def test_multiple_symbols_each_get_a_quote():
-    fake_ticker = _make_fake_ticker(
-        fast_info_kwargs=dict(last_price=100.0, previous_close=99.0, last_volume=500)
-    )
+    bars = make_intraday_bars([(100.0, 500)])
+    fake_ticker = make_fake_ticker(bars=bars, info={"regularMarketPreviousClose": 99.0})
+
     with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
-        provider = YFinanceProvider()
-        quotes = provider.get_quotes(["RELIANCE.NS", "TCS.NS", "INFY.NS"])
+        quotes = YFinanceProvider().get_quotes(["RELIANCE.NS", "TCS.NS", "INFY.NS"])
 
     assert len(quotes) == 3
     assert {q.symbol for q in quotes} == {"RELIANCE.NS", "TCS.NS", "INFY.NS"}
-
-
-def test_get_style_access_on_snake_case_keys_would_have_masked_this_bug():
-    """
-    REGRESSION TEST for the actual root cause: reproduces the exact
-    failure mode found in production (Mac test succeeded via attribute
-    access; the deployed app returned "unavailable" for all instruments
-    because it used fast_info.get("last_price") instead of
-    fast_info.last_price).
-
-    Confirms FakeFastInfo.get() -- built to mirror real FastInfo's
-    behavior -- returns None for snake_case keys, proving that if the
-    provider regresses back to dict-style .get() access, this test
-    will catch it by asserting the CORRECT (attribute-based) result.
-    """
-    fake_fast_info = FakeFastInfo(last_price=1329.6, last_volume=11676605, previous_close=1300.0)
-
-    # Sanity-check the fake itself mirrors the real bug surface:
-    # .get() with the snake_case name must NOT find the value...
-    assert fake_fast_info.get("last_price") is None
-    # ...but the real camelCase key does...
-    assert fake_fast_info.get("lastPrice") == 1329.6
-    # ...and real attribute access always works, regardless of .get():
-    assert fake_fast_info.last_price == 1329.6
-
-    # Now confirm the ACTUAL PROVIDER gets the right answer, proving it
-    # uses attribute access and not fast_info.get(snake_case_key):
-    fake_ticker = MagicMock()
-    fake_ticker.fast_info = fake_fast_info
-    fake_ticker.info = {}
-
-    with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
-        provider = YFinanceProvider()
-        quotes = provider.get_quotes(["RELIANCE.NS"])
-
-    assert quotes[0].fetch_succeeded is True
-    assert quotes[0].last_price == 1329.6
-    assert quotes[0].volume == 11676605
-
-
-def test_fast_info_access_failure_surfaces_real_error_message():
-    """
-    Per explicit instruction: when fast_info access fails, the real
-    underlying exception must be captured in error_message, not
-    silently converted to a generic "unavailable" with no diagnostic
-    detail.
-    """
-    fake_ticker = _make_fake_ticker(
-        fast_info_kwargs=dict(raise_on_access=True),
-        info={},  # fallback also gives nothing, so failure surfaces
-    )
-    with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
-        provider = YFinanceProvider()
-        quotes = provider.get_quotes(["RELIANCE.NS"])
-
-    q = quotes[0]
-    assert q.fetch_succeeded is False
-    assert "simulated fetch failure" in q.error_message
