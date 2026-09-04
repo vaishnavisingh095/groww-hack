@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import './App.css'
-import { fetchAttention, fetchWatchlist, markInstrumentAsSeen } from './api'
+import { fetchAttention, fetchWatchlist, markAllAsSeen, markInstrumentAsSeen } from './api'
 import AttentionSection from './components/AttentionSection'
 import WatchlistTable from './components/WatchlistTable'
 
@@ -22,6 +22,13 @@ export default function App() {
   const [inFlightIds, setInFlightIds] = useState(() => new Set())
   const [actionErrors, setActionErrors] = useState({})
   const [savedMessages, setSavedMessages] = useState({})
+
+  // Whole-watchlist "mark all as seen" state -- separate from the
+  // per-instrument state above, since this is one action affecting many
+  // instruments at once, not an action scoped to a single instrument id.
+  const [markAllInFlight, setMarkAllInFlight] = useState(false)
+  const [markAllError, setMarkAllError] = useState(null)
+  const [markAllPartialMessage, setMarkAllPartialMessage] = useState(null)
 
   // Both endpoints are fetched together, on the SAME timer -- still
   // exactly one polling interval, not two. They are independent reads,
@@ -106,10 +113,44 @@ export default function App() {
     [loadAll]
   )
 
+  const handleMarkAllAsSeen = useCallback(async () => {
+    setMarkAllInFlight(true)
+    setMarkAllError(null)
+    setMarkAllPartialMessage(null)
+
+    try {
+      const result = await markAllAsSeen()
+      // Truthful partial-success reporting: the backend already tells us
+      // exactly which instruments were skipped (no valid current data)
+      // rather than silently acknowledging only some of them. Never
+      // invent a specific reason beyond what the response provides.
+      if (result.skipped && result.skipped.length > 0) {
+        setMarkAllPartialMessage(
+          'Some stocks couldn’t be updated because current market data was unavailable.'
+        )
+      }
+      // Re-fetch both endpoints so the UI reflects real, current server
+      // state -- exactly the acknowledged instruments (per `updated`)
+      // and only those disappear from the attention list; never a local,
+      // optimistic removal of items this response didn't confirm.
+      await loadAll()
+    } catch (err) {
+      // Explicit failure: do NOT touch instruments/attentionItems -- an
+      // unacknowledged watchlist must never look acknowledged.
+      setMarkAllError(err.message)
+    } finally {
+      setMarkAllInFlight(false)
+    }
+  }, [loadAll])
+
   return (
     <div className="app">
       <header className="app-header">
         <h1>Smart Market Watchlist</h1>
+        <p className="app-tagline">Your market, filtered for attention.</p>
+        <p className="app-subtitle">
+          See what meaningfully changed in your watchlist while you were away.
+        </p>
       </header>
 
       {error && <div className="error-banner">{error}</div>}
@@ -124,10 +165,19 @@ export default function App() {
             onMarkAsSeen={handleMarkAsSeen}
             inFlightIds={inFlightIds}
             actionErrors={actionErrors}
+            onMarkAllAsSeen={handleMarkAllAsSeen}
+            markAllInFlight={markAllInFlight}
+            markAllError={markAllError}
+            markAllPartialMessage={markAllPartialMessage}
           />
 
           <section className="watchlist-section">
-            <h2 className="section-title">Your Watchlist</h2>
+            <div className="watchlist-header">
+              <h2 className="section-title">Your Watchlist</h2>
+              <p className="watchlist-subtitle">
+                The complete list, including instruments with no meaningful change right now.
+              </p>
+            </div>
             <WatchlistTable
               instruments={instruments}
               onMarkAsSeen={handleMarkAsSeen}

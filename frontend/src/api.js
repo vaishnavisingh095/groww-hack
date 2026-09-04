@@ -28,9 +28,7 @@ export async function fetchAttention() {
   return data.attention_items
 }
 
-// Explicit single-instrument "mark as seen" -- the only acknowledgement
-// action this milestone exposes (no "mark all" button; the backend
-// supports one, but nothing in the approved UX requires it here).
+// Explicit single-instrument "mark as seen".
 // Path matches architecture.md's documented contract exactly:
 // POST /watchlist/instruments/{id}/checkpoint.
 export async function markInstrumentAsSeen(instrumentId) {
@@ -38,6 +36,23 @@ export async function markInstrumentAsSeen(instrumentId) {
     `${API_BASE}/watchlist/instruments/${instrumentId}/checkpoint`,
     { method: 'POST' }
   )
+  if (!response.ok) {
+    throw new Error(await parseErrorDetail(response))
+  }
+  return response.json()
+}
+
+// Explicit whole-watchlist "mark all as seen". The backend already
+// treats per-instrument failure as a partial-success case, not a whole-
+// request failure -- it returns {updated: [...], skipped: [...]} with a
+// 200 rather than throwing, so this only rejects on a genuine request
+// failure (network/backend unreachable, non-2xx status), never because
+// some instruments were skipped. Path matches architecture.md's
+// documented contract exactly: POST /watchlist/checkpoint.
+export async function markAllAsSeen() {
+  const response = await fetch(`${API_BASE}/watchlist/checkpoint`, {
+    method: 'POST',
+  })
   if (!response.ok) {
     throw new Error(await parseErrorDetail(response))
   }

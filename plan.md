@@ -208,5 +208,37 @@ early.
 
 ## Current Status
 
-Planning stage. No code written. Awaiting approval of this plan,
-`architecture.md`, and `decisions.md` before implementation begins.
+Backend and frontend both implemented; UI polish in progress. Not yet
+committed past UI Polish Pass 3 — see `decisions.md` for the specific
+decisions behind each item below.
+
+**Completed:**
+- Backend: checkpoint semantics (explicit-only advancement), Meaningful
+  Change Engine, ChangeEvent persistence, Attention Engine, the
+  `GET /watchlist/attention` endpoint, and the `session_date`
+  correctness fix (P1-1).
+- Frontend: attention-first home experience (`GET /watchlist/attention`
+  and `GET /watchlist` joined client-side by `instrument_id`, rendered
+  ahead of the full watchlist table).
+- Frontend: structured "What changed / Why it matters / Signals"
+  explanation per attention item, built only from backend-computed
+  fields (`attention_level`, `price_change_pct`,
+  `volume_acceleration_ratio`) — no new frontend scoring logic.
+- Frontend: High Attention / Worth Checking hierarchy, partitioning the
+  backend-ranked attention list into two groups without re-sorting or
+  re-scoring.
+- Frontend: light desktop web-dashboard visual foundation (color/spacing/
+  radius tokens, re-themed surfaces), header/hero composition (tagline,
+  subtitle), "Since You Last Checked" banner with a high/worth-checking
+  breakdown, and attention-card visual polish (price area with
+  since-checkpoint vs. day-over-day movement, signals list, detection
+  timestamp). Purely presentational — no backend or API changes.
+
+**Remaining (intended order):**
+1. Watchlist table UI polish (currently only re-themed via Pass 1's
+   color tokens; structure/layout untouched).
+2. Real browser visual verification of the full dashboard.
+3. Full frontend/backend regression pass.
+4. Documentation consistency check.
+5. Final Git audit.
+6. Demo rehearsal / submission.

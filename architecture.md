@@ -729,6 +729,41 @@ boundary (or where the near-open guard applied): price-only, with
 `volume_signal_available: false` and no volume claim in the explanation
 string.
 
+## Frontend Consumption of Attention Data
+
+The attention-first web dashboard (built after the sections above) does
+not introduce any new backend API or business logic — it is a read-only
+consumer of the two existing endpoints:
+
+- The attention experience is `GET /watchlist/attention`'s
+  `attention_items` joined, client-side, with `GET /watchlist`'s
+  `instruments` by `instrument_id`. Neither response's shape changed to
+  support this; the frontend only reads fields both already return.
+- The frontend keeps `price_change_pct` (since-checkpoint, from
+  `attention_items`) and `percent_change` (day-over-day, from
+  `instruments`) visually and semantically distinct — they are rendered
+  as two separately labeled figures, never combined or substituted for
+  one another.
+- `detected_at` (when the `ChangeEvent` was created) is displayed as-is
+  as a relative-time label; it is not recomputed or treated as "now."
+- Attention levels, scores, and ranking remain entirely backend-derived
+  (`AttentionEngine`); the frontend only partitions the already-sorted
+  list by the existing `attention_level` value into two display groups
+  (see Important Invariant 4) — it does not sort, score, or reclassify.
+- Freshness/status (`freshness_label`, `status`) remain backend/provider-
+  derived and are displayed unchanged; the frontend does not compute or
+  infer freshness itself.
+- Checkpoint acknowledgement semantics are unchanged: "Mark as seen" on
+  an attention card calls the same explicit per-instrument checkpoint
+  endpoint used elsewhere; there is no "mark all as seen" control in the
+  frontend (the corresponding backend endpoint exists but is not called
+  from the UI — see `decisions.md`).
+- The attention card does not display a company name (`GET /watchlist`
+  does not return one) or a "View details" action or a calculated
+  "strongest signal" — none of these exist in the backend response or in
+  any frontend logic; see `decisions.md` for why each was deliberately
+  left out rather than invented.
+
 ## Major Architectural Trade-offs
 
 - **No tick-level history stored** — `MarketSnapshot` is upsert-only, not

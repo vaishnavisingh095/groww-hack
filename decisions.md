@@ -1278,3 +1278,321 @@ comparison logic in `change_engine.py` is unchanged — only the
 correctness of the value being compared changed. See
 `architecture.md`'s "Session recognition" note, corrected alongside
 this entry.
+
+---
+
+## Decision: Attention-first web dashboard
+
+### Problem
+With the Attention Engine and its `GET /watchlist/attention` endpoint
+already built, the frontend needed a home-screen layout. A generic
+watchlist table (price, change, volume, one row per instrument) puts
+the burden of noticing what matters back on the user — the same burden
+the product's checkpoint/change-detection/attention machinery exists to
+remove (see the "Product thesis" decision above).
+
+### Options
+- A single watchlist table, attention data (if shown at all) as an
+  extra column or badge per row.
+- A dedicated attention-first section — "Since You Last Checked" —
+  rendered above the full watchlist table, itself broken into High
+  Attention and Worth Checking groups, with the full table remaining
+  available below for anything not currently flagged.
+
+### Decision
+Attention-first: the desktop dashboard prioritizes "Since You Last
+Checked" → High Attention → Worth Checking → the full watchlist table,
+in that vertical order.
+
+### Why
+The product's job is surfacing meaningful changes quickly, not making
+the user manually scan a table to find them — the same reasoning
+already governing the backend (checkpoints, deterministic thresholds,
+persisted `ChangeEvent`s). The UI's information hierarchy should match
+that thesis rather than presenting attention data as a minor addition
+to a conventional table.
+
+### Trade-off
+Users who want a plain, uniform table view see the attention section
+first regardless of preference — no per-user layout choice is offered.
+Accepted: out of scope for this build, and the full watchlist table
+remains fully present below, unshortened.
+
+### Consequence
+`AttentionSection` renders above `WatchlistTable` in `App.jsx`;
+`AttentionSection` further partitions its items into "High Attention"
+and "Worth Checking" groups (see the Attention Hierarchy work below).
+No backend change — this is purely a frontend composition/ordering
+decision over data both endpoints already returned.
+
+---
+
+## Decision: Light desktop dashboard visual direction
+
+### Problem
+Once the attention-first layout existed, it needed a visual treatment
+(colors, spacing, surfaces, typography) — undecided territory not
+covered by any prior backend-focused decision in this log.
+
+### Options
+- A dark-themed dashboard.
+- A light/off-white, "premium financial dashboard" visual language —
+  dark navy typography, restrained market colors (green/red kept
+  deliberately muted rather than saturated), subtle borders and
+  shadows, rounded surfaces, a wider desktop canvas.
+
+### Decision
+The light/off-white direction, applied via a CSS custom-property token
+layer in `App.css` (page/surface/border/text/positive/negative/
+attention-level/freshness tokens).
+
+### Why
+This is a presentation-layer choice for the attention-first product
+decided above — it does not encode or imply any product-logic or
+business-rule change. It must not be read as an architecture decision;
+it is recorded here only so the visual direction isn't silently
+undocumented.
+
+### Trade-off
+None material — a token layer means the direction can be revisited
+later by changing token values, not by touching component structure.
+
+### Consequence
+`App.css` gained a `:root` token layer; existing components were
+re-themed to consume the tokens rather than hardcoded colors.
+`architecture.md` intentionally does not enumerate individual token
+values (padding, radius, exact hex codes) — those belong in the CSS
+itself, not in an architecture document; see the "Preserve semantic
+distinctions" entry below for what did warrant recording.
+
+---
+
+## Decision: No "Mark all as seen" CTA introduced during UI polish
+
+### Problem
+A UI-polish task described styling the "Since You Last Checked" banner
+with a prominent "Mark all as seen" call-to-action, on the assumption
+that this functionality already existed. It does not: the frontend only
+ever implemented a per-item "Mark as seen" action
+(`markInstrumentAsSeen`); no `markAllAsSeen` call exists in `api.js`,
+even though the backend endpoint (`POST /watchlist/checkpoint`) does.
+
+### Options
+- Style the banner without any mark-all control, exactly as the
+  frontend currently behaves.
+- Add a real "Mark all as seen" button now, wiring it to the existing
+  backend endpoint.
+
+### Decision
+Style the banner without a mark-all CTA. (Confirmed with the user via
+an explicit choice during Pass 2; this option was selected.)
+
+### Why
+UI polish is scoped to visual presentation of existing behavior — adding
+a mark-all action would be a new interaction, a new client-side call,
+and new state (which instruments it affects, how errors are surfaced
+across many instruments at once), i.e. a functional feature, not visual
+polish. Introducing it silently, just because a reference description
+assumed it existed, would misrepresent what the product does today.
+
+### Trade-off
+The banner has no bulk action; a user with many flagged instruments
+must still act on them one at a time via each card's own "Mark as seen"
+button. Accepted: a real mark-all feature is a legitimate future addition,
+but belongs in its own scoped implementation pass, not folded into
+visual polish.
+
+### Consequence
+The "Since You Last Checked" banner (`.attention-banner` in `App.css`)
+contains only the heading, count, and high/worth-checking breakdown —
+no button. `POST /watchlist/checkpoint` remains implemented on the
+backend and unused by the frontend, exactly as before this pass.
+
+---
+
+## Decision: No "View details" action added during UI polish
+
+### Problem
+A UI-polish task's card redesign spec listed "View details" as a
+required secondary action on each attention card. No such destination,
+route, or handler exists anywhere in the frontend (there is no router
+and no per-instrument detail view).
+
+### Options
+- Add a "View details" button/link even without a real destination
+  (e.g., disabled, or pointing nowhere).
+- Omit it entirely.
+
+### Decision
+Omit it. No "View details" action exists on the attention card.
+
+### Why
+The same UI-polish scope already governing the mark-all decision above
+applies here: inventing an action with no real destination would either
+mislead the user (a button that does nothing) or require building new
+navigation/routing, which is new functionality, not visual polish. The
+task's own instructions to not add new actions during this phase
+resolved this without needing a separate confirmation.
+
+### Trade-off
+None material — the card simply has one action ("Mark as seen"),
+matching what the product actually supports today.
+
+### Consequence
+`AttentionCard` in `AttentionSection.jsx` renders a single action
+(`onMarkAsSeen`). Adding a real details view remains a legitimate future
+feature, not addressed by this decision.
+
+---
+
+## Decision: Attention-card data presentation — existing fields only
+
+### Decision
+The attention card presents: current price, since-checkpoint movement
+(`price_change_pct`), day-over-day movement where available
+(`percent_change`, from the joined `GET /watchlist` row), the existing
+structured "What changed / Why it matters / Signals" explanation, the
+existing price and volume-acceleration signals, freshness/detection
+timing (`freshness_label`, `detected_at`), and the existing "Mark as
+seen" action. All of these are existing, already-available data values
+returned by the two existing endpoints — no new detection or scoring
+logic was introduced in the frontend to produce any of them.
+
+### Why
+This is recorded explicitly because the card's visual redesign (Pass 3)
+touched nearly every field it displays, and it would be easy for a
+reader of the diff to assume some of these values (e.g., the
+since-checkpoint vs. day-over-day split, or the detection timestamp)
+were newly computed by the frontend. They were not — see
+"Frontend Consumption of Attention Data" in `architecture.md`.
+
+### Alternatives considered
+None — this entry documents what was built, not a choice between
+options.
+
+### Consequence
+Any future change to what the card displays should be checked against
+this list: a new figure on the card should trace back to an existing
+backend-computed field, not a new frontend calculation, unless a
+separate, explicitly-scoped decision says otherwise.
+
+---
+
+## Decision: Company name not shown — limitation, not fabrication
+
+### Problem
+A UI-polish reference for the attention card implied a company name
+(e.g., "Reliance Industries Ltd.") alongside the ticker symbol.
+`GET /watchlist` does not return a company name field — only `symbol`
+and `exchange`.
+
+### Options
+- Fabricate or hardcode a name-lookup table in the frontend.
+- Change the backend to fetch and return company names, in scope for a
+  UI-polish pass.
+- Show the data that's actually available (`exchange`) instead, and
+  omit any name.
+
+### Decision
+Show `exchange` next to the symbol; no company name is displayed.
+
+### Why
+Fabricating names risks incorrect or stale data with no backend source
+of truth behind it; changing the backend's data contract is out of
+scope for a visual-polish pass (see the UI-polish constraints repeated
+across every pass in this project). Displaying real, available data
+(`exchange`) is preferable to inventing unavailable data.
+
+### Trade-off
+Cards are less immediately recognizable to a user who thinks in company
+names rather than tickers. Accepted: a real fix (backend returning
+company names) is a legitimate future addition, not a documentation or
+visual-polish concern.
+
+### Consequence
+`AttentionCard` renders `item.symbol` and, when present,
+`watchlistEntry.exchange` — nothing else identifies the instrument.
+
+---
+
+## Decision: No "strongest signal" attribution added
+
+### Problem
+A UI-polish reference suggested visually highlighting which signal
+(price or volume) most drove an item's attention ranking — a
+"strongest signal" treatment. The persisted data does not support this:
+`AttentionItem`'s `attention_score` is `max(price_strength,
+volume_strength)` (see `architecture.md`'s Attention Engine design),
+but neither the API response nor any stored field says *which* of the
+two produced that maximum for a given item.
+
+### Options
+- Compute which signal is "strongest" in the frontend, by comparing
+  `price_change_pct` against `volume_acceleration_ratio` relative to
+  their respective thresholds.
+- Do not introduce this comparison in the frontend; show both signals
+  plainly, as already done.
+
+### Decision
+No strongest-signal attribution. Both signals are shown plainly, with no
+frontend judgment about which one mattered more.
+
+### Why
+Computing a per-item "strongest signal" in the frontend would be new
+scoring logic living outside the Change Engine / Attention Engine — this
+project's standing rule is that meaningful-change and attention scoring
+are 100% backend-computed and deterministic, never duplicated or
+approximated on the client. A UI-polish pass is explicitly not the place
+to introduce a new frontend calculation, however small.
+
+### Trade-off
+The card cannot visually emphasize "this is a volume-driven spike"
+versus "this is a price-driven spike." Accepted: if this attribution is
+wanted, it belongs in the backend (e.g., a new field on `ChangeEvent` or
+`AttentionItem`), as its own scoped decision — not inferred client-side
+from existing numbers.
+
+### Consequence
+The Signals block lists price and volume values side by side with no
+relative emphasis between them.
+
+---
+
+## Decision: Preserve semantic distinctions through UI changes
+
+### Decision
+Four product-level distinctions must remain stable through any future
+UI change, not just the polish passes covered by this documentation
+sync:
+- Since-checkpoint movement (`price_change_pct`) is not day-over-day
+  movement (`percent_change`) — they come from different comparisons
+  and must never be merged into one figure or unlabeled.
+- Attention level (`attention_level`) is not market direction — a HIGH
+  attention item can be a large move in either direction; the level
+  reflects magnitude past threshold, not sign.
+- Freshness/status (`freshness_label`, `status`) is not attention level
+  — a HIGH-attention item can still be Delayed, and a Fresh item can
+  have no attention at all. The two must never be conflated or implied
+  to depend on one another.
+- "Not available" (e.g., `volume_acceleration_available: false`) is not
+  zero — an unavailable signal must render as explicit absence text,
+  never as `0` or `0.0×`, which would misrepresent "we didn't measure
+  this" as "we measured zero."
+
+### Why
+Each distinction above was already established by an earlier backend
+decision in this log (or by `architecture.md`'s Invariants); this entry
+exists so future frontend work has one place confirming they still hold
+after the UI polish work, and so they're checked explicitly rather than
+assumed the next time the UI changes.
+
+### Alternatives considered
+None — this is a consolidation of already-decided semantics, not a new
+choice.
+
+### Consequence
+Any future UI change should be checked against this list before
+shipping; a change that blurs one of these four distinctions (even
+unintentionally, e.g. through a shared label or a merged visual element)
+should be treated as a product-semantics regression, not a pure style
+change.

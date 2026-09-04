@@ -1,3 +1,87 @@
+/* ==========================================================================
+   Design tokens -- Pass 1 (visual foundation only).
+
+   A small, coherent CSS custom-property layer so the dashboard's palette
+   is defined once and reused everywhere, rather than the same hex
+   literal being repeated across dozens of rules (which is how the prior
+   dark theme was written). Values target the reference direction:
+   light/off-white page, dark navy primary type, restrained market
+   red/green, subtle neutral borders, subtle shadows.
+
+   Paired "-bg" tokens exist because several existing rules (status
+   badges, attention-level badges, banners) already used a tinted
+   background + a more saturated foreground of the SAME semantic color
+   in the prior dark theme (e.g. status-ok's dark-green bg + bright-green
+   text) -- these tokens just carry that existing pattern into the light
+   palette, they don't introduce a new visual language.
+
+   "medium" and "watch" attention keep two DISTINCT hues (not merged
+   into one token), even though this pass's brief grouped them under one
+   bullet -- collapsing them would remove real information the
+   individual attention-level badges are still relied on to show (per
+   the "attention levels remain visually distinct" requirement); only
+   the section-level grouping (High Attention / Worth Checking) was
+   ever meant to combine them, not the per-card color itself.
+   ========================================================================== */
+
+:root {
+  /* Page & surfaces */
+  --color-bg: #f4f6f9;
+  --color-surface: #ffffff;
+  --color-surface-elevated: #ffffff; /* same tone as --color-surface today;
+                                         kept as its own token so elevated
+                                         panels can be told apart from
+                                         plain content purely via
+                                         --shadow-md without a call-site
+                                         change later */
+  --color-border: #e3e7ee;
+
+  /* Typography */
+  --color-text-primary: #0f172a;
+  --color-text-secondary: #475569;
+  --color-text-muted: #94a3b8;
+  --color-text-on-primary: #ffffff;
+
+  /* Market movement */
+  --color-positive: #16a34a;
+  --color-positive-bg: #f0fdf4;
+  --color-negative: #dc2626;
+  --color-negative-bg: #fef2f2;
+
+  /* Attention levels (kept distinct from market movement colors) */
+  --color-attention-high: #ea580c;
+  --color-attention-high-bg: #fff7ed;
+  --color-attention-medium: #b45309;
+  --color-attention-medium-bg: #fffbeb;
+  --color-attention-watch: #0369a1;
+  --color-attention-watch-bg: #f0f9ff;
+
+  /* Freshness / data-quality states -- own tokens, not aliases of
+     positive/negative, even though "fresh" and "unavailable" currently
+     share the same hues as positive/negative respectively */
+  --color-fresh: #16a34a;
+  --color-fresh-bg: #f0fdf4;
+  --color-stale: #b45309;
+  --color-stale-bg: #fffbeb;
+  --color-unavailable: #dc2626;
+  --color-unavailable-bg: #fef2f2;
+
+  /* Primary action */
+  --color-primary: #2563eb;
+  --color-primary-hover: #1d4ed8;
+  --color-disabled-bg: #e5e7eb;
+  --color-disabled-text: #9ca3af;
+
+  /* Focus / interaction */
+  --color-focus: #2563eb;
+
+  /* Shape & elevation */
+  --radius: 8px;
+  --radius-pill: 10px;
+  --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.05);
+  --shadow-md: 0 4px 12px rgba(15, 23, 42, 0.06);
+}
+
 * {
   box-sizing: border-box;
 }
@@ -5,96 +89,198 @@
 body {
   margin: 0;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  background: #0f1115;
-  color: #e6e6e6;
+  background: var(--color-bg);
+  color: var(--color-text-primary);
+}
+
+/* Buttons don't get a bespoke focus style per-component -- one rule
+   here covers every button in the app (attention card action, watchlist
+   row action), consistent with "primarily modify CSS, not JSX." */
+button:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
 }
 
 .app {
-  max-width: 1000px;
+  max-width: 1440px;
   margin: 0 auto;
-  padding: 24px;
+  padding: 32px 40px;
 }
 
 .section-title {
-  font-size: 0.85rem;
+  font-size: 1.15rem;
   font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: #999;
-  margin: 0 0 12px;
+  color: var(--color-text-primary);
+  letter-spacing: -0.005em;
+  margin: 0 0 4px;
+}
+
+/* Pass 2: the header doubles as the page's brand + introduction --
+   there is no secondary navigation to give its own row (the app has no
+   other pages/views), so "compact secondary nav treatment" is
+   satisfied by NOT reserving space for controls that don't exist,
+   rather than fabricating an empty placeholder row. */
+.app-header {
+  padding-bottom: 28px;
+  margin-bottom: 36px;
+  border-bottom: 1px solid var(--color-border);
 }
 
 .app-header h1 {
-  font-size: 1.5rem;
+  font-size: 1.75rem;
+  font-weight: 800;
+  margin: 0 0 8px;
+  color: var(--color-text-primary);
+  letter-spacing: -0.015em;
+}
+
+.app-tagline {
+  font-size: 1.05rem;
   font-weight: 600;
-  margin-bottom: 24px;
-  color: #ffffff;
+  color: var(--color-text-secondary);
+  margin: 0 0 6px;
+}
+
+.app-subtitle {
+  font-size: 0.9rem;
+  color: var(--color-text-muted);
+  margin: 0;
 }
 
 .error-banner {
-  background: #3a1f1f;
-  color: #ff8a8a;
+  background: var(--color-negative-bg);
+  color: var(--color-negative);
   padding: 12px 16px;
-  border-radius: 6px;
+  border-radius: var(--radius);
   margin-bottom: 16px;
-  border: 1px solid #5a2a2a;
+  border: 1px solid var(--color-negative-bg);
 }
 
 .loading {
-  color: #999;
+  color: var(--color-text-muted);
 }
 
 /* --- Attention section ("Since You Last Checked") --------------------- */
 /* This is the product's PRIMARY surface -- the whole point of the app
-   is "what deserves my attention right now, and why." Its heading is
-   deliberately larger/bolder/higher-contrast than the watchlist's own
-   (which keeps the existing muted .section-title treatment below), so
-   the two sections read as "hero + supporting detail," not two equal
-   lists. Cards remain visually distinct by attention_level (colored
-   left border) so they read as alerts, not as more rows in a table. */
+   is "what deserves my attention right now, and why." Its heading
+   (1.6rem/800) stays deliberately larger/bolder than the watchlist's own
+   (.section-title, 1.15rem/700, restyled in Pass 4) so the two sections
+   still read as "hero + supporting detail," not two equal lists, even
+   though the watchlist heading is now a real heading rather than a
+   muted eyebrow label. Cards remain visually distinct by attention_level
+   (colored left border) so they read as alerts, not as more rows in a
+   table. */
 
 .attention-section {
-  margin-bottom: 32px;
+  margin-bottom: 28px;
+}
+
+/* The dominant surface near the top of the dashboard -- a wide,
+   attention-tinted, bordered, shadowed panel wrapping the heading, the
+   count/breakdown (or the caught-up message), and the one Mark-all
+   action. */
+.attention-banner {
+  background: var(--color-attention-high-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+  padding: 22px 28px;
+  margin-bottom: 24px;
 }
 
 .attention-heading {
   font-size: 1.6rem;
   font-weight: 800;
-  color: #ffffff;
-  margin: 0 0 8px;
+  color: var(--color-text-primary);
+  margin: 0 0 12px;
   letter-spacing: -0.01em;
+}
+
+/* Text on the left, the Mark-all action on the right -- wraps to a
+   stacked layout on narrow widths via the existing flex-wrap, no extra
+   breakpoint needed. */
+.attention-banner-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+
+.attention-banner-meta {
+  min-width: 0;
 }
 
 .attention-count {
   font-size: 1.05rem;
   font-weight: 600;
-  color: #fb923c;
-  margin: 0 0 16px;
+  color: var(--color-attention-high);
+  margin: 0 0 4px;
+}
+
+.attention-breakdown {
+  font-size: 0.9rem;
+  color: var(--color-text-secondary);
+  margin: 0;
 }
 
 .attention-caught-up {
   font-size: 1rem;
   font-weight: 500;
-  color: #4ade80;
-  background: #143d24;
-  border-radius: 8px;
-  padding: 16px;
-  margin: 0 0 12px;
+  color: var(--color-positive);
+  margin: 0;
+}
+
+.attention-banner-actions {
+  flex-shrink: 0;
+}
+
+/* Same primary-action treatment as .col-action button /
+   .attention-card-action button -- the dashboard's one existing
+   "primary" button style, reused here rather than introducing a second
+   one for a whole-watchlist action. */
+.mark-all-button {
+  background: var(--color-primary);
+  color: var(--color-text-on-primary);
+  border: none;
+  padding: 8px 16px;
+  border-radius: var(--radius);
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.mark-all-button:hover:not(:disabled) {
+  background: var(--color-primary-hover);
+}
+
+.mark-all-button:disabled {
+  background: var(--color-disabled-bg);
+  color: var(--color-disabled-text);
+  cursor: not-allowed;
+}
+
+.mark-all-partial-message {
+  margin-top: 6px;
+  font-size: 0.8rem;
+  color: var(--color-text-secondary);
 }
 
 .attention-remaining-summary {
   font-size: 0.85rem;
-  color: #888;
-  margin: 12px 0 0;
+  color: var(--color-text-muted);
+  margin: 10px 0 0;
 }
 
 /* Attention hierarchy (Change #3): two sub-groups within the section --
-   "High Attention" and "Worth Checking" -- smaller and less prominent
-   than .attention-heading above, and not colored/badged themselves so
-   they don't compete with the cards' own existing level badges for
-   attention. */
+   "High Attention" and "Worth Checking" -- both smaller and less
+   prominent than .attention-heading above. High Attention's own heading
+   (below) is colored with the same attention-high token as the cards'
+   badges/borders, reinforcing (not competing with) that group's
+   already-existing visual weight; Worth Checking's heading stays
+   neutral/muted. */
 .attention-group {
-  margin-bottom: 20px;
+  margin-bottom: 16px;
 }
 
 .attention-group:last-child {
@@ -102,67 +288,128 @@ body {
 }
 
 .attention-group-heading {
-  font-size: 0.95rem;
   font-weight: 700;
-  color: #bbb;
   margin: 0 0 10px;
 }
 
+/* High Attention reads as the dominant group -- larger, bolder heading
+   text in the same primary navy as the rest of the app, with the
+   attention-high token used only as a small accent dot (::before), not
+   as the text color -- coloring the whole heading orange would compete
+   with the market-movement/attention-level color semantics elsewhere on
+   the page. Worth Checking reads as a quiet subordinate label -- smaller,
+   muted, uppercase. Membership/ordering of either group is unchanged;
+   this is typography only. */
+.attention-group-high .attention-group-heading {
+  font-size: 1rem;
+  color: var(--color-text-primary);
+  letter-spacing: -0.005em;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.attention-group-high .attention-group-heading::before {
+  content: '';
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--color-attention-high);
+  flex-shrink: 0;
+}
+
+.attention-group-secondary .attention-group-heading {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.attention-group-secondary .attention-list {
+  gap: 10px;
+}
+
+/* auto-fit (not auto-fill) is the load-bearing part here: auto-fill
+   reserves empty grid TRACKS for however many 280px columns the
+   container could theoretically hold, even when there are fewer real
+   items -- with 3 cards in a 4-column-wide container that left a whole
+   phantom column of unused space on the right. auto-fit collapses those
+   empty tracks and lets the real items' 1fr (capped at 360px so a
+   single lonely card doesn't stretch edge-to-edge) grow to fill the row
+   instead. This is card-count-agnostic by construction -- it behaves
+   correctly whether there are 0, 1, 2, or many cards, not tuned for the
+   current 3-card test state. */
 .attention-list {
   list-style: none;
   margin: 0;
   padding: 0;
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(280px, 360px));
   gap: 12px;
 }
 
 .attention-card {
-  background: #1a1d24;
-  border-radius: 8px;
-  padding: 16px;
-  border-left: 4px solid #555;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  box-shadow: var(--shadow-sm);
+  border-radius: var(--radius);
+  padding: 18px;
+  border-left: 4px solid var(--color-text-muted);
 }
 
+/* High Attention cards read as slightly stronger than Worth Checking
+   ones -- a wider accent border and the existing --shadow-md token (a
+   touch more "lifted" than the default --shadow-sm every card already
+   has), no separate background tint, no size change, so the difference
+   is real but not dramatic (medium/watch already look distinct from
+   high via their own border/badge color; this just gives high a touch
+   more visual weight). */
 .attention-level-high {
-  border-left-color: #fb923c;
+  border-left-color: var(--color-attention-high);
+  border-left-width: 6px;
+  box-shadow: var(--shadow-md);
 }
 
 .attention-level-medium {
-  border-left-color: #facc15;
+  border-left-color: var(--color-attention-medium);
 }
 
 .attention-level-watch {
-  border-left-color: #60a5fa;
+  border-left-color: var(--color-attention-watch);
 }
 
 .attention-card-header {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 8px;
+  margin-bottom: 11px;
 }
 
 .attention-rank {
-  color: #666;
+  color: var(--color-text-muted);
   font-size: 0.75rem;
   font-variant-numeric: tabular-nums;
 }
 
 .attention-symbol {
   font-weight: 700;
-  font-size: 1rem;
-  flex: 1;
+  font-size: 1.05rem;
+  color: var(--color-text-primary);
 }
 
-.attention-pct {
-  font-variant-numeric: tabular-nums;
+.attention-exchange {
+  flex: 1;
+  font-size: 0.72rem;
   font-weight: 600;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 
 .attention-badge {
   padding: 2px 8px;
-  border-radius: 10px;
+  border-radius: var(--radius-pill);
   font-size: 0.7rem;
   font-weight: 700;
   text-transform: uppercase;
@@ -170,37 +417,78 @@ body {
 }
 
 .attention-badge-high {
-  background: #4a2a14;
-  color: #fb923c;
+  background: var(--color-attention-high-bg);
+  color: var(--color-attention-high);
 }
 
 .attention-badge-medium {
-  background: #3d3414;
-  color: #facc15;
+  background: var(--color-attention-medium-bg);
+  color: var(--color-attention-medium);
 }
 
 .attention-badge-watch {
-  background: #1e2f4a;
-  color: #60a5fa;
+  background: var(--color-attention-watch-bg);
+  color: var(--color-attention-watch);
+}
+
+/* PRICE AREA -- the strongest numerical element on the card. A subtle
+   bottom border acts as the divider between this area and the
+   explanation blocks below, per the "internal section divider"
+   requirement -- no separate <hr> element needed. */
+.attention-price-area {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 14px;
+  padding-bottom: 11px;
+  margin-bottom: 11px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.attention-price-large {
+  font-size: 1.55rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-primary);
+}
+
+.attention-pct-large {
+  font-size: 1.05rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.attention-day-pct {
+  font-size: 0.8rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  opacity: 0.85;
+}
+
+.attention-pct-caption {
+  font-size: 0.68rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--color-text-muted);
 }
 
 .attention-price {
   font-variant-numeric: tabular-nums;
-  color: #e6e6e6;
-}
-
-.attention-freshness {
-  font-size: 0.78rem;
-  color: #888;
-  margin: 2px 0 0;
+  color: var(--color-text-primary);
 }
 
 /* What changed / Why it matters / Signals -- three small, consistently
-   labeled blocks inside each card. Sized well below the card header so
-   they read as supporting detail for the (already prominent) rank/
-   symbol/pct/level badge above them, not as a second competing header. */
+   labeled blocks inside each card. Sized well below the price area so
+   they read as supporting detail, not a second competing header. */
 .attention-block {
-  margin-bottom: 10px;
+  margin-bottom: 11px;
 }
 
 .attention-block-label {
@@ -208,13 +496,13 @@ body {
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.05em;
-  color: #777;
+  color: var(--color-text-muted);
   margin: 0 0 3px;
 }
 
 .attention-block-body {
   font-size: 0.85rem;
-  color: #ccc;
+  color: var(--color-text-secondary);
   line-height: 1.4;
   margin: 0;
 }
@@ -224,53 +512,93 @@ body {
   margin: 0;
   padding: 0;
   display: flex;
-  gap: 16px;
+  gap: 10px;
+}
+
+.attention-signals li {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  background: var(--color-bg);
+  border-radius: 6px;
+  padding: 4px 10px;
 }
 
 .attention-signal-name {
-  font-size: 0.78rem;
-  color: #888;
-  margin-right: 6px;
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
 }
 
 .attention-signal-value {
   font-size: 0.85rem;
   font-variant-numeric: tabular-nums;
   font-weight: 600;
-  color: #e6e6e6;
+  color: var(--color-text-primary);
+}
+
+.attention-footer {
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+  margin-bottom: 10px;
+}
+
+/* A defined action row, separated from the metadata footer above it by
+   the same border token used elsewhere on the card (price-area divider),
+   rather than the button simply trailing off the last block. */
+.attention-card-action {
+  border-top: 1px solid var(--color-border);
+  padding-top: 10px;
 }
 
 .attention-card-action button {
-  background: #2563eb;
-  color: white;
+  background: var(--color-primary);
+  color: var(--color-text-on-primary);
   border: none;
   padding: 8px 14px;
-  border-radius: 6px;
+  border-radius: var(--radius);
   font-size: 0.85rem;
   cursor: pointer;
 }
 
 .attention-card-action button:hover:not(:disabled) {
-  background: #1d4ed8;
+  background: var(--color-primary-hover);
 }
 
 .attention-card-action button:disabled {
-  background: #444;
+  background: var(--color-disabled-bg);
+  color: var(--color-disabled-text);
   cursor: not-allowed;
 }
 
 /* --- Watchlist table ---------------------------------------------------- */
+/* Secondary to the attention experience above -- the top border + padding
+   give it a clear seam of its own (on top of .attention-section's own
+   bottom margin) without needing a heavier divider. */
 
 .watchlist-section {
-  margin-top: 8px;
+  margin-top: 0;
+  padding-top: 20px;
+  border-top: 1px solid var(--color-border);
+}
+
+.watchlist-header {
+  margin-bottom: 16px;
+}
+
+.watchlist-subtitle {
+  font-size: 0.85rem;
+  color: var(--color-text-secondary);
+  margin: 0;
 }
 
 .empty-state {
-  color: #777;
-  font-style: italic;
-  background: #1a1d24;
-  border-radius: 8px;
-  padding: 16px;
+  color: var(--color-text-secondary);
+  text-align: center;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+  padding: 32px 16px;
 }
 
 .table-scroll {
@@ -281,26 +609,44 @@ body {
 .watchlist-table {
   width: 100%;
   border-collapse: collapse;
-  background: #1a1d24;
-  border-radius: 8px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
   overflow: hidden;
 }
 
 .watchlist-table th {
   text-align: left;
   padding: 12px 16px;
-  background: #22262f;
-  color: #999;
+  background: var(--color-bg);
+  color: var(--color-text-muted);
   font-size: 0.8rem;
   text-transform: uppercase;
   letter-spacing: 0.05em;
   font-weight: 600;
 }
 
+/* Numeric columns right-align (header and cells alike) -- standard
+   financial-table convention, and makes a column of tabular-nums
+   actually scannable at a glance instead of ragged-left. */
+.watchlist-table th.col-price,
+.watchlist-table th.col-percent,
+.watchlist-table th.col-volume {
+  text-align: right;
+}
+
 .watchlist-table td {
-  padding: 14px 16px;
-  border-top: 1px solid #2a2e38;
-  vertical-align: top;
+  padding: 13px 16px;
+  border-top: 1px solid var(--color-border);
+  vertical-align: middle;
+  color: var(--color-text-primary);
+}
+
+/* Hover is purely visual (CSS-only, no state/JS) -- a quiet cue that a
+   row corresponds to one instrument, not a new interaction. */
+.watchlist-table tbody tr:hover {
+  background: var(--color-bg);
 }
 
 .col-symbol {
@@ -308,56 +654,76 @@ body {
   font-size: 1rem;
 }
 
+.symbol-primary {
+  display: block;
+}
+
+/* Same field/treatment as .attention-exchange on the attention cards --
+   already-available data (GET /watchlist's `exchange`), shown quietly. */
+.symbol-exchange {
+  display: block;
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-top: 2px;
+}
+
 .col-price {
   font-variant-numeric: tabular-nums;
-  font-size: 1rem;
+  font-size: 1.05rem;
+  font-weight: 600;
+  text-align: right;
 }
 
 .col-percent {
   font-variant-numeric: tabular-nums;
   font-weight: 600;
+  text-align: right;
 }
 
 .percent-up {
-  color: #4ade80;
+  color: var(--color-positive);
 }
 
 .percent-down {
-  color: #f87171;
+  color: var(--color-negative);
 }
 
 .col-volume {
-  color: #ccc;
+  color: var(--color-text-secondary);
   font-variant-numeric: tabular-nums;
+  text-align: right;
 }
 
 .col-freshness {
   font-size: 0.85rem;
-  color: #aaa;
+  color: var(--color-text-secondary);
 }
 
 .status-badge {
   display: inline-block;
   padding: 2px 8px;
-  border-radius: 10px;
+  border-radius: var(--radius-pill);
   font-size: 0.7rem;
   font-weight: 600;
   margin-top: 4px;
 }
 
 .status-ok {
-  background: #143d24;
-  color: #4ade80;
+  background: var(--color-fresh-bg);
+  color: var(--color-fresh);
 }
 
 .status-stale {
-  background: #3d3414;
-  color: #facc15;
+  background: var(--color-stale-bg);
+  color: var(--color-stale);
 }
 
 .status-unavailable {
-  background: #3a1f1f;
-  color: #f87171;
+  background: var(--color-unavailable-bg);
+  color: var(--color-unavailable);
 }
 
 .col-change {
@@ -366,57 +732,61 @@ body {
 }
 
 .change-baseline {
-  color: #999;
+  color: var(--color-text-muted);
   font-style: italic;
 }
 
 .change-none {
-  color: #777;
+  color: var(--color-text-muted);
 }
 
 .change-meaningful {
   /* Deliberately muted -- the Attention section above is the primary
      "look here" surface for this same fact; this is a secondary,
-     in-row confirmation, not a second alarm competing for attention. */
-  color: #d4a94a;
+     in-row confirmation, not a second alarm competing for attention.
+     Weight (not saturation/size) is what makes it scannable in a dense
+     table row. */
+  font-weight: 600;
+  color: var(--color-attention-medium);
 }
 
 .col-action button {
-  background: #2563eb;
-  color: white;
+  background: var(--color-primary);
+  color: var(--color-text-on-primary);
   border: none;
   padding: 8px 14px;
-  border-radius: 6px;
+  border-radius: var(--radius);
   font-size: 0.85rem;
   cursor: pointer;
   white-space: nowrap;
 }
 
 .col-action button:hover:not(:disabled) {
-  background: #1d4ed8;
+  background: var(--color-primary-hover);
 }
 
 .col-action button:disabled {
-  background: #444;
+  background: var(--color-disabled-bg);
+  color: var(--color-disabled-text);
   cursor: not-allowed;
 }
 
 .saved-message {
   margin-top: 6px;
   font-size: 0.78rem;
-  color: #4ade80;
+  color: var(--color-positive);
 }
 
 .action-error {
   margin-top: 6px;
   font-size: 0.78rem;
-  color: #f87171;
+  color: var(--color-negative);
 }
 
 .app-footer {
   margin-top: 20px;
   font-size: 0.75rem;
-  color: #666;
+  color: var(--color-text-muted);
   text-align: center;
 }
 

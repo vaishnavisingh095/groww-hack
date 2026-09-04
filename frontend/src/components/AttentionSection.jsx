@@ -1,4 +1,4 @@
-import { formatPrice, formatPercentChange } from '../format'
+import { formatPrice, formatPercentChange, formatRelativeTime } from '../format'
 
 // Mirrors app/services/attention_engine.py's AttentionLevel enum values
 // exactly (already serialized lowercase by the API via `.value`).
@@ -23,37 +23,65 @@ const WHY_IT_MATTERS = {
 }
 
 function AttentionCard({ item, watchlistEntry, onMarkAsSeen, inFlight, actionError }) {
-  // GET /watchlist/attention does not include current price or
-  // freshness/status -- those live on GET /watchlist. Both responses
-  // share instrument_id, so the card looks up the matching watchlist
-  // row to show them; this is real data from a real endpoint, joined
-  // client-side, not invented. If the two responses are ever
-  // momentarily out of sync (e.g. a poll landed between the two
-  // fetches), the fields below degrade to "—" rather than guessing.
+  // GET /watchlist/attention does not include current price, day-over-
+  // day change, exchange, or freshness/status -- those live on GET
+  // /watchlist. Both responses share instrument_id, so the card looks
+  // up the matching watchlist row to show them; this is real data from
+  // a real endpoint, joined client-side, not invented. If the two
+  // responses are ever momentarily out of sync (e.g. a poll landed
+  // between the two fetches), the fields below degrade to "—"/absence
+  // rather than guessing.
   const price = watchlistEntry ? watchlistEntry.price : null
   const freshnessLabel = watchlistEntry ? watchlistEntry.freshness_label : null
+  const exchange = watchlistEntry ? watchlistEntry.exchange : null
+  // Day-over-day change, from GET /watchlist's percent_change --
+  // deliberately a DIFFERENT field from item.price_change_pct
+  // (since-checkpoint). Rendered separately, smaller, and explicitly
+  // captioned so the two can never be mistaken for one another.
+  const dayChangePct = watchlistEntry ? watchlistEntry.percent_change : null
 
   const pctClass =
     item.price_change_pct > 0 ? 'percent-up' : item.price_change_pct < 0 ? 'percent-down' : ''
+  const dayPctClass =
+    dayChangePct > 0 ? 'percent-up' : dayChangePct < 0 ? 'percent-down' : ''
+
+  const detectedLabel = formatRelativeTime(item.detected_at)
 
   return (
     <li className={`attention-card attention-level-${item.attention_level}`}>
       <div className="attention-card-header">
         <span className="attention-rank">#{item.rank}</span>
         <span className="attention-symbol">{item.symbol}</span>
-        <span className={`attention-pct ${pctClass}`}>{formatPercentChange(item.price_change_pct)}</span>
+        {exchange && <span className="attention-exchange">{exchange}</span>}
         <span className={`attention-badge attention-badge-${item.attention_level}`}>
           {LEVEL_LABELS[item.attention_level] || item.attention_level}
         </span>
       </div>
 
-      {/* WHAT CHANGED -- the observed movement since the checkpoint.
-          price_change_pct is the since-checkpoint delta, deliberately
-          NOT watchlistEntry.percent_change (day-over-day) -- these are
-          different numbers and must not be confused. freshness_label
-          stays attached to the current price so a stale price is never
-          presented as live, even though the ChangeEvent itself was
-          detected while the data was fresh. */}
+      {/* PRICE AREA -- current price is the strongest numerical element
+          on the card; since-checkpoint movement (item.price_change_pct)
+          stays prominent next to it. Day-over-day (dayChangePct) is a
+          different number from a different source and is deliberately
+          smaller, separately captioned, and never merged with the
+          since-checkpoint figure. Neither value is recalculated here --
+          both are rendered exactly as the API returned them. */}
+      <div className="attention-price-area">
+        <span className="attention-price-large">{formatPrice(price)}</span>
+        <span className={`attention-pct-large ${pctClass}`}>
+          {formatPercentChange(item.price_change_pct)}
+          <span className="attention-pct-caption">since checkpoint</span>
+        </span>
+        {dayChangePct !== null && dayChangePct !== undefined && (
+          <span className={`attention-day-pct ${dayPctClass}`}>
+            {formatPercentChange(dayChangePct)}
+            <span className="attention-pct-caption">today</span>
+          </span>
+        )}
+      </div>
+
+      {/* WHAT CHANGED -- the observed movement since the checkpoint,
+          restated as a readable sentence (the price area above is the
+          quick-glance figure; this is the explanatory sentence). */}
       <div className="attention-block">
         <p className="attention-block-label">What changed</p>
         <p className="attention-block-body">
@@ -61,7 +89,6 @@ function AttentionCard({ item, watchlistEntry, onMarkAsSeen, inFlight, actionErr
           <span className={pctClass}>{formatPercentChange(item.price_change_pct)}</span> since your last
           check.
         </p>
-        {freshnessLabel && <p className="attention-freshness">{freshnessLabel}</p>}
       </div>
 
       {/* WHY IT MATTERS -- priority framing from the backend-computed
@@ -96,6 +123,20 @@ function AttentionCard({ item, watchlistEntry, onMarkAsSeen, inFlight, actionErr
           </li>
         </ul>
       </div>
+
+      {/* FOOTER / TRUST INFORMATION -- freshness (relocated from the
+          old "What changed" text) and the ChangeEvent's own detection
+          time, both quiet/small. Neither implies real-time data --
+          freshnessLabel is the same honest "Fresh/Delayed/Unavailable"
+          label used everywhere else in the app, and detectedLabel is
+          when this specific change was detected, not "now." */}
+      {(freshnessLabel || detectedLabel) && (
+        <div className="attention-footer">
+          {freshnessLabel && <span>{freshnessLabel}</span>}
+          {freshnessLabel && detectedLabel && <span aria-hidden="true"> · </span>}
+          {detectedLabel && <span>{detectedLabel}</span>}
+        </div>
+      )}
 
       <div className="attention-card-action">
         <button onClick={() => onMarkAsSeen(item.instrument_id)} disabled={inFlight}>
@@ -152,13 +193,21 @@ function summarizeRemaining(remaining) {
 // only to avoid maintaining two copies of the same AttentionCard
 // mapping/prop-wiring in sync with each other; it is not a separate
 // abstraction over new behavior.
-function AttentionGroup({ title, groupItems, instrumentsById, onMarkAsSeen, inFlightIds, actionErrors }) {
+function AttentionGroup({
+  title,
+  variant,
+  groupItems,
+  instrumentsById,
+  onMarkAsSeen,
+  inFlightIds,
+  actionErrors,
+}) {
   if (groupItems.length === 0) {
     return null
   }
 
   return (
-    <div className="attention-group">
+    <div className={`attention-group attention-group-${variant}`}>
       <h3 className="attention-group-heading">{title}</h3>
       <ul className="attention-list">
         {groupItems.map((item) => (
@@ -176,7 +225,17 @@ function AttentionGroup({ title, groupItems, instrumentsById, onMarkAsSeen, inFl
   )
 }
 
-export default function AttentionSection({ items, instruments, onMarkAsSeen, inFlightIds, actionErrors }) {
+export default function AttentionSection({
+  items,
+  instruments,
+  onMarkAsSeen,
+  inFlightIds,
+  actionErrors,
+  onMarkAllAsSeen,
+  markAllInFlight,
+  markAllError,
+  markAllPartialMessage,
+}) {
   const instrumentsById = new Map(instruments.map((inst) => [inst.instrument_id, inst]))
 
   const attentionIds = new Set(items.map((item) => item.instrument_id))
@@ -199,19 +258,67 @@ export default function AttentionSection({ items, instruments, onMarkAsSeen, inF
 
   return (
     <section className="attention-section">
-      <h2 className="attention-heading">Since You Last Checked</h2>
+      {/* The banner is purely a presentational wrapper around the same
+          heading/count this section already rendered -- the new
+          high/worth-checking breakdown line reads directly off
+          highItems.length / worthCheckingItems.length, the exact same
+          arrays (same filters, same source order) the groups below are
+          already built from. No new count logic, no new grouping rule. */}
+      <div className="attention-banner">
+        <h2 className="attention-heading">Since You Last Checked</h2>
 
-      {items.length === 0 ? (
-        <p className="attention-caught-up">
-          You're all caught up — nothing has meaningfully changed since you last checked.
-        </p>
-      ) : (
-        <>
-          <p className="attention-count">
-            {items.length} {items.length === 1 ? 'thing deserves' : 'things deserve'} your attention
+        {items.length === 0 ? (
+          <p className="attention-caught-up">
+            You're all caught up — nothing has meaningfully changed since you last checked.
           </p>
-          <AttentionGroup title="High Attention" groupItems={highItems} {...groupProps} />
-          <AttentionGroup title="Worth Checking" groupItems={worthCheckingItems} {...groupProps} />
+        ) : (
+          // Meta text (count/breakdown) and the Mark-all action sit as a
+          // horizontal row -- text on the left, the one primary action on
+          // the right -- rather than stacked, so the banner reads as an
+          // inbox header, not a vertical list of paragraphs. Same data,
+          // same button, same behavior; only the layout wrapper is new.
+          <div className="attention-banner-row">
+            <div className="attention-banner-meta">
+              <p className="attention-count">
+                {items.length} {items.length === 1 ? 'thing deserves' : 'things deserve'} your attention
+              </p>
+              <p className="attention-breakdown">
+                {highItems.length} high-priority {highItems.length === 1 ? 'change' : 'changes'}
+                {' • '}
+                {worthCheckingItems.length} worth checking
+              </p>
+            </div>
+            {/* Whole-watchlist acknowledgement. Only rendered when there
+                is at least one active attention item -- the caught-up
+                branch above never reaches this, so there is nothing to
+                mark as seen when the button would otherwise appear. */}
+            <div className="attention-banner-actions">
+              <button
+                type="button"
+                className="mark-all-button"
+                onClick={onMarkAllAsSeen}
+                disabled={markAllInFlight}
+              >
+                {markAllInFlight ? 'Marking…' : 'Mark all as seen'}
+              </button>
+              {markAllError && <div className="action-error">{markAllError}</div>}
+              {!markAllError && markAllPartialMessage && (
+                <div className="mark-all-partial-message">{markAllPartialMessage}</div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {items.length > 0 && (
+        <>
+          <AttentionGroup title="High Attention" variant="high" groupItems={highItems} {...groupProps} />
+          <AttentionGroup
+            title="Worth Checking"
+            variant="secondary"
+            groupItems={worthCheckingItems}
+            {...groupProps}
+          />
         </>
       )}
 

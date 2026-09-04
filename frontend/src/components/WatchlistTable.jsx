@@ -42,7 +42,10 @@ function WatchlistRow({ instrument, onMarkAsSeen, inFlight, actionError, savedMe
 
   return (
     <tr>
-      <td className="col-symbol">{instrument.symbol}</td>
+      <td className="col-symbol">
+        <span className="symbol-primary">{instrument.symbol}</span>
+        {instrument.exchange && <span className="symbol-exchange">{instrument.exchange}</span>}
+      </td>
       <td className="col-price">{formatPrice(instrument.price)}</td>
       <td
         className={
@@ -96,13 +99,13 @@ export default function WatchlistTable({
       <table className="watchlist-table">
         <thead>
           <tr>
-            <th>Symbol</th>
-            <th>Price</th>
-            <th>Day %</th>
-            <th>Volume</th>
-            <th>Freshness</th>
-            <th>Change</th>
-            <th>Action</th>
+            <th className="col-symbol">Symbol</th>
+            <th className="col-price">Price</th>
+            <th className="col-percent">Day %</th>
+            <th className="col-volume">Volume</th>
+            <th className="col-freshness">Freshness</th>
+            <th className="col-change">Change</th>
+            <th className="col-action">Action</th>
           </tr>
         </thead>
         <tbody>
