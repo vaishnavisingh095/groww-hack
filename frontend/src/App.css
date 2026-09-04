@@ -15,6 +15,15 @@ body {
   padding: 24px;
 }
 
+.section-title {
+  font-size: 0.85rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #999;
+  margin: 0 0 12px;
+}
+
 .app-header h1 {
   font-size: 1.5rem;
   font-weight: 600;
@@ -33,6 +42,160 @@ body {
 
 .loading {
   color: #999;
+}
+
+/* --- Attention section ("Since You Last Checked") --------------------- */
+/* This is the product's primary surface: the answer to "what deserves
+   my attention right now, and why" -- it appears above the plain
+   watchlist table, and its cards are visually distinct (colored left
+   border by attention_level) so they read as alerts, not as more rows
+   in a table. */
+
+.attention-section {
+  margin-bottom: 32px;
+}
+
+.attention-empty {
+  color: #777;
+  font-style: italic;
+  background: #1a1d24;
+  border-radius: 8px;
+  padding: 16px;
+  margin: 0;
+}
+
+.attention-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+}
+
+.attention-card {
+  background: #1a1d24;
+  border-radius: 8px;
+  padding: 16px;
+  border-left: 4px solid #555;
+}
+
+.attention-level-high {
+  border-left-color: #fb923c;
+}
+
+.attention-level-medium {
+  border-left-color: #facc15;
+}
+
+.attention-level-watch {
+  border-left-color: #60a5fa;
+}
+
+.attention-card-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.attention-rank {
+  color: #666;
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.attention-symbol {
+  font-weight: 700;
+  font-size: 1rem;
+  flex: 1;
+}
+
+.attention-pct {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+.attention-badge {
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.attention-badge-high {
+  background: #4a2a14;
+  color: #fb923c;
+}
+
+.attention-badge-medium {
+  background: #3d3414;
+  color: #facc15;
+}
+
+.attention-badge-watch {
+  background: #1e2f4a;
+  color: #60a5fa;
+}
+
+.attention-card-meta {
+  display: flex;
+  gap: 12px;
+  font-size: 0.85rem;
+  color: #aaa;
+  margin-bottom: 8px;
+}
+
+.attention-price {
+  font-variant-numeric: tabular-nums;
+  color: #e6e6e6;
+}
+
+.attention-explanation {
+  font-size: 0.85rem;
+  color: #ccc;
+  margin: 0 0 12px;
+  line-height: 1.4;
+}
+
+.attention-card-action button {
+  background: #2563eb;
+  color: white;
+  border: none;
+  padding: 8px 14px;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.attention-card-action button:hover:not(:disabled) {
+  background: #1d4ed8;
+}
+
+.attention-card-action button:disabled {
+  background: #444;
+  cursor: not-allowed;
+}
+
+/* --- Watchlist table ---------------------------------------------------- */
+
+.watchlist-section {
+  margin-top: 8px;
+}
+
+.empty-state {
+  color: #777;
+  font-style: italic;
+  background: #1a1d24;
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.table-scroll {
+  width: 100%;
+  overflow-x: auto;
 }
 
 .watchlist-table {
@@ -132,8 +295,10 @@ body {
 }
 
 .change-meaningful {
-  color: #fbbf24;
-  font-weight: 600;
+  /* Deliberately muted -- the Attention section above is the primary
+     "look here" surface for this same fact; this is a secondary,
+     in-row confirmation, not a second alarm competing for attention. */
+  color: #d4a94a;
 }
 
 .col-action button {
@@ -162,9 +327,30 @@ body {
   color: #4ade80;
 }
 
+.action-error {
+  margin-top: 6px;
+  font-size: 0.78rem;
+  color: #f87171;
+}
+
 .app-footer {
   margin-top: 20px;
   font-size: 0.75rem;
   color: #666;
   text-align: center;
+}
+
+@media (max-width: 640px) {
+  .app {
+    padding: 16px;
+  }
+
+  .attention-list {
+    grid-template-columns: 1fr;
+  }
+
+  .watchlist-table th,
+  .watchlist-table td {
+    padding: 10px 12px;
+  }
 }

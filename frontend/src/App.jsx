@@ -1,164 +1,110 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import './App.css'
+import { fetchAttention, fetchWatchlist, markInstrumentAsSeen } from './api'
+import AttentionSection from './components/AttentionSection'
+import WatchlistTable from './components/WatchlistTable'
 
-// Backend base URL. The frontend NEVER calls yfinance directly -- every
-// request goes through our own FastAPI backend, which is the only thing
-// that talks to the market data provider.
-const API_BASE = 'http://127.0.0.1:8000'
-
-// Simple polling interval per the approved design: no WebSockets, just
-// a periodic re-fetch. 60s matches the backend's own documented target
-// freshness window.
+// Simple polling per the approved design: no WebSockets, one shared
+// timer for both endpoints. 60s matches the backend's own documented
+// target freshness window (see decisions.md's Freshness Policy).
 const POLL_INTERVAL_MS = 60_000
-
-function formatPrice(price) {
-  if (price === null || price === undefined) return '—'
-  return `₹${price.toFixed(2)}`
-}
-
-function formatVolume(volume) {
-  if (volume === null || volume === undefined) return '—'
-  if (volume >= 1_000_000) return `${(volume / 1_000_000).toFixed(1)}M`
-  if (volume >= 1_000) return `${(volume / 1_000).toFixed(1)}K`
-  return String(volume)
-}
-
-function formatPercentChange(pct) {
-  if (pct === null || pct === undefined) return '—'
-  const sign = pct >= 0 ? '+' : ''
-  return `${sign}${pct.toFixed(2)}%`
-}
-
-function StatusBadge({ status }) {
-  const labels = {
-    ok: { text: 'Fresh', className: 'status-ok' },
-    stale: { text: 'Delayed', className: 'status-stale' },
-    unavailable: { text: 'Unavailable', className: 'status-unavailable' },
-    invalid: { text: 'Invalid', className: 'status-unavailable' },
-  }
-  const info = labels[status] || { text: status, className: '' }
-  return <span className={`status-badge ${info.className}`}>{info.text}</span>
-}
-
-function ChangeIndicator({ change }) {
-  if (!change.has_baseline) {
-    return <span className="change-baseline">{change.reason}</span>
-  }
-  if (change.meaningful_change) {
-    return (
-      <span className="change-meaningful">
-        ⚠ Meaningfully changed — {change.reason}
-      </span>
-    )
-  }
-  return <span className="change-none">No meaningful change</span>
-}
-
-function WatchlistRow({ instrument, onMarkAsSeen, markingInFlight }) {
-  const [savedMessage, setSavedMessage] = useState(null)
-
-  const handleMarkAsSeen = async () => {
-    setSavedMessage(null)
-    const result = await onMarkAsSeen(instrument.instrument_id)
-    if (result?.message) {
-      setSavedMessage(result.message)
-    }
-  }
-
-  return (
-    <tr>
-      <td className="col-symbol">{instrument.symbol}</td>
-      <td className="col-price">{formatPrice(instrument.price)}</td>
-      <td
-        className={
-          'col-percent ' +
-          (instrument.percent_change > 0
-            ? 'percent-up'
-            : instrument.percent_change < 0
-              ? 'percent-down'
-              : '')
-        }
-      >
-        {formatPercentChange(instrument.percent_change)}
-      </td>
-      <td className="col-volume">{formatVolume(instrument.cumulative_volume)}</td>
-      <td className="col-freshness">
-        {instrument.freshness_label}
-        <br />
-        <StatusBadge status={instrument.status} />
-      </td>
-      <td className="col-change">
-        <ChangeIndicator change={instrument.change} />
-      </td>
-      <td className="col-action">
-        <button
-          onClick={handleMarkAsSeen}
-          disabled={markingInFlight || instrument.status === 'unavailable'}
-        >
-          Mark as seen
-        </button>
-        {savedMessage && <div className="saved-message">{savedMessage}</div>}
-      </td>
-    </tr>
-  )
-}
 
 export default function App() {
   const [instruments, setInstruments] = useState([])
+  const [attentionItems, setAttentionItems] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
-  const [markingInFlight, setMarkingInFlight] = useState(false)
 
-  const fetchWatchlist = useCallback(async () => {
-    try {
-      const response = await fetch(`${API_BASE}/watchlist`)
-      if (!response.ok) {
-        throw new Error(`Server returned ${response.status}`)
-      }
-      const data = await response.json()
-      setInstruments(data.instruments)
-      setError(null)
-    } catch (err) {
-      // The backend itself never crashes on provider failure (per
-      // architecture.md); this catch is for the case where the
-      // backend/network is unreachable from the frontend's perspective,
-      // which is a different, rarer failure mode worth showing
-      // distinctly rather than silently leaving stale UI state.
-      setError('Could not reach the backend. Is it running?')
-    } finally {
-      setLoading(false)
+  // Per-instrument action state, not global -- an instrument can now be
+  // acted on from two places (its watchlist row AND, if active, its
+  // attention card), and marking one instrument must never disable or
+  // report errors for an unrelated one.
+  const [inFlightIds, setInFlightIds] = useState(() => new Set())
+  const [actionErrors, setActionErrors] = useState({})
+  const [savedMessages, setSavedMessages] = useState({})
+
+  // Both endpoints are fetched together, on the SAME timer -- still
+  // exactly one polling interval, not two. They are independent reads,
+  // though: Promise.allSettled (not Promise.all) is used deliberately,
+  // so a failure in EITHER request never discards the other's
+  // successfully-fetched data. GET /watchlist and GET /watchlist/attention
+  // have genuinely different reliability profiles (the former makes a
+  // live, documented-as-unreliable provider call per request; the
+  // latter is a pure Mongo read), so treating "one failed" as "the
+  // backend is unreachable" was itself untruthful -- it discarded real
+  // data and blamed the whole backend for a single route's problem.
+  const loadAll = useCallback(async () => {
+    const [watchlistResult, attentionResult] = await Promise.allSettled([
+      fetchWatchlist(),
+      fetchAttention(),
+    ])
+
+    // Each dataset is only ever replaced by a REAL, successful
+    // response -- a failed request leaves whatever was already
+    // displayed in place rather than fabricating an empty/missing
+    // state for data we simply couldn't refresh this cycle.
+    if (watchlistResult.status === 'fulfilled') {
+      setInstruments(watchlistResult.value)
     }
+    if (attentionResult.status === 'fulfilled') {
+      setAttentionItems(attentionResult.value)
+    }
+
+    const watchlistFailed = watchlistResult.status === 'rejected'
+    const attentionFailed = attentionResult.status === 'rejected'
+
+    if (watchlistFailed && attentionFailed) {
+      // Both independent reads failed on the same backend in the same
+      // cycle -- this IS real evidence the backend/network itself is
+      // unreachable, not just one route having a transient problem.
+      setError('Could not reach the backend. Is it running?')
+    } else if (watchlistFailed) {
+      // Attention succeeded -- the backend is demonstrably reachable,
+      // only the watchlist read failed this cycle. Never blame the
+      // whole backend for one route's problem.
+      setError('Could not load your watchlist right now — attention data is up to date.')
+    } else if (attentionFailed) {
+      setError('Could not load attention items right now — watchlist data is up to date.')
+    } else {
+      setError(null)
+    }
+
+    setLoading(false)
   }, [])
 
   useEffect(() => {
-    fetchWatchlist()
-    const interval = setInterval(fetchWatchlist, POLL_INTERVAL_MS)
+    loadAll()
+    const interval = setInterval(loadAll, POLL_INTERVAL_MS)
     return () => clearInterval(interval)
-  }, [fetchWatchlist])
+  }, [loadAll])
 
-  const handleMarkAsSeen = async (instrumentId) => {
-    setMarkingInFlight(true)
-    try {
-      const response = await fetch(
-        `${API_BASE}/watchlist/${instrumentId}/checkpoint`,
-        { method: 'POST' }
-      )
-      if (!response.ok) {
-        const body = await response.json().catch(() => ({}))
-        throw new Error(body.detail || `Server returned ${response.status}`)
+  const handleMarkAsSeen = useCallback(
+    async (instrumentId) => {
+      setInFlightIds((prev) => new Set(prev).add(instrumentId))
+      setActionErrors((prev) => ({ ...prev, [instrumentId]: null }))
+
+      try {
+        const result = await markInstrumentAsSeen(instrumentId)
+        setSavedMessages((prev) => ({ ...prev, [instrumentId]: result.message }))
+        // Re-fetch both endpoints so the UI reflects real, current
+        // server state -- the acknowledged instrument's row and its
+        // (now superseded) attention item update from that response,
+        // never from a locally-guessed optimistic update.
+        await loadAll()
+      } catch (err) {
+        // Explicit failure: do NOT touch instruments/attentionItems --
+        // an unacknowledged item must never look acknowledged.
+        setActionErrors((prev) => ({ ...prev, [instrumentId]: err.message }))
+      } finally {
+        setInFlightIds((prev) => {
+          const next = new Set(prev)
+          next.delete(instrumentId)
+          return next
+        })
       }
-      const result = await response.json()
-      // Immediately re-fetch so the row's change-state reflects the new
-      // checkpoint right away, rather than waiting for the next poll.
-      await fetchWatchlist()
-      return result
-    } catch (err) {
-      setError(err.message)
-      return null
-    } finally {
-      setMarkingInFlight(false)
-    }
-  }
+    },
+    [loadAll]
+  )
 
   return (
     <div className="app">
@@ -171,29 +117,26 @@ export default function App() {
       {loading ? (
         <p className="loading">Loading watchlist...</p>
       ) : (
-        <table className="watchlist-table">
-          <thead>
-            <tr>
-              <th>Symbol</th>
-              <th>Price</th>
-              <th>Day %</th>
-              <th>Volume</th>
-              <th>Freshness</th>
-              <th>Change</th>
-              <th>Action</th>
-            </tr>
-          </thead>
-          <tbody>
-            {instruments.map((instrument) => (
-              <WatchlistRow
-                key={instrument.instrument_id || instrument.symbol}
-                instrument={instrument}
-                onMarkAsSeen={handleMarkAsSeen}
-                markingInFlight={markingInFlight}
-              />
-            ))}
-          </tbody>
-        </table>
+        <>
+          <AttentionSection
+            items={attentionItems}
+            instruments={instruments}
+            onMarkAsSeen={handleMarkAsSeen}
+            inFlightIds={inFlightIds}
+            actionErrors={actionErrors}
+          />
+
+          <section className="watchlist-section">
+            <h2 className="section-title">Watchlist</h2>
+            <WatchlistTable
+              instruments={instruments}
+              onMarkAsSeen={handleMarkAsSeen}
+              inFlightIds={inFlightIds}
+              actionErrors={actionErrors}
+              savedMessages={savedMessages}
+            />
+          </section>
+        </>
       )}
 
       <footer className="app-footer">
