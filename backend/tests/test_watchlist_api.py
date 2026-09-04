@@ -136,7 +136,7 @@ def test_first_time_has_no_baseline_and_is_not_a_meaningful_change(client):
     reliance = next(i for i in body["instruments"] if i["symbol"] == "RELIANCE")
     assert reliance["change"]["has_baseline"] is False
     assert reliance["change"]["meaningful_change"] is False
-    assert "Baseline created" in reliance["change"]["reason"]
+    assert "Baseline pending" in reliance["change"]["reason"]
 
 
 def test_mark_as_seen_persists_checkpoint_and_read_reflects_it(client):
@@ -447,3 +447,42 @@ def test_implicit_checkpoint_resolves_on_next_request_not_the_current_one(client
     second = test_client.get("/watchlist").json()
     reliance_second = next(i for i in second["instruments"] if i["symbol"] == "RELIANCE")
     assert reliance_second["change"]["has_baseline"] is True
+
+
+def test_watchlist_response_exposes_price_change_pct_and_volume_fields(client):
+    """Phase 5 integration: GET /watchlist must expose the richer
+    change-engine result -- price_change_pct, volume_acceleration_ratio,
+    and volume_signal_available -- not just the old has_baseline/
+    meaningful_change/reason trio."""
+    test_client, mock_db = client
+
+    first = test_client.get("/watchlist").json()
+    reliance = next(i for i in first["instruments"] if i["symbol"] == "RELIANCE")
+    change = reliance["change"]
+
+    assert "price_change_pct" in change
+    assert "volume_acceleration_ratio" in change
+    assert "volume_signal_available" in change
+    # First-time baseline: no signal values yet.
+    assert change["price_change_pct"] is None
+    assert change["volume_acceleration_ratio"] is None
+
+
+def test_watchlist_response_price_change_pct_populated_after_checkpoint(client):
+    """Once a real checkpoint exists and price differs, price_change_pct
+    must be a real, non-null number in the GET /watchlist response."""
+    test_client, mock_db = client
+
+    first = test_client.get("/watchlist").json()
+    reliance = next(i for i in first["instruments"] if i["symbol"] == "RELIANCE")
+    instrument_id = reliance["instrument_id"]
+
+    # Advance to an EXPLICIT checkpoint at the current (fake) price.
+    test_client.post(f"/watchlist/instruments/{instrument_id}/checkpoint")
+
+    # Same fake price on next GET -> 0.0% change, but the field must be
+    # present and numeric, not null, now that a real checkpoint exists.
+    second = test_client.get("/watchlist").json()
+    reliance_second = next(i for i in second["instruments"] if i["symbol"] == "RELIANCE")
+    assert reliance_second["change"]["has_baseline"] is True
+    assert reliance_second["change"]["price_change_pct"] == 0.0

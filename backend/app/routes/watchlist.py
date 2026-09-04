@@ -16,7 +16,7 @@ from pymongo.database import Database
 from app.db.connection import get_database
 from app.models.market_snapshot import SnapshotStatus
 from app.providers.yfinance_provider import YFinanceProvider
-from app.services.change_engine import evaluate_price_change
+from app.services.change_engine import evaluate_change
 from app.services.checkpoint_service import CheckpointService
 from app.services.market_data_service import MarketDataService
 from app.services.watchlist_service import (
@@ -116,7 +116,9 @@ def get_watchlist() -> dict:
                     "change": {
                         "has_baseline": False,
                         "meaningful_change": False,
-                        "percent_difference": None,
+                        "price_change_pct": None,
+                        "volume_acceleration_ratio": None,
+                        "volume_signal_available": False,
                         "reason": "Data unavailable — cannot compare.",
                     },
                 }
@@ -128,8 +130,25 @@ def get_watchlist() -> dict:
         # what the user actually saw last time, not a baseline we are
         # establishing this very request.
         checkpoint = checkpoint_service.get_checkpoint(DEMO_USER_ID, instrument_id)
-        checkpoint_price = checkpoint.baseline_snapshot.last_price if checkpoint else None
-        change_result = evaluate_price_change(checkpoint_price, snapshot.last_price)
+
+        if checkpoint is not None:
+            change_result = evaluate_change(
+                checkpoint_price=checkpoint.baseline_snapshot.last_price,
+                checkpoint_volume=checkpoint.baseline_snapshot.volume,
+                checkpoint_at=checkpoint.checkpoint_at,
+                checkpoint_session_date=checkpoint.session_date,
+                current_price=snapshot.last_price,
+                current_volume=snapshot.volume,
+                current_fetched_at=snapshot.fetched_at,
+                current_session_date=snapshot.session_date,
+            )
+        else:
+            # No checkpoint at all yet -- price-only call correctly
+            # reports has_baseline=False without needing volume/timing
+            # args that don't apply to a nonexistent baseline.
+            change_result = evaluate_change(
+                checkpoint_price=None, current_price=snapshot.last_price
+            )
 
         if checkpoint is None:
             # No prior checkpoint existed -- establish the implicit
@@ -156,11 +175,17 @@ def get_watchlist() -> dict:
                 "change": {
                     "has_baseline": change_result.has_baseline,
                     "meaningful_change": change_result.meaningful_change,
-                    "percent_difference": (
-                        round(change_result.percent_difference, 4)
-                        if change_result.percent_difference is not None
+                    "price_change_pct": (
+                        round(change_result.price_change_pct, 4)
+                        if change_result.price_change_pct is not None
                         else None
                     ),
+                    "volume_acceleration_ratio": (
+                        round(change_result.volume_acceleration_ratio, 4)
+                        if change_result.volume_acceleration_ratio is not None
+                        else None
+                    ),
+                    "volume_signal_available": change_result.volume_signal.available,
                     "reason": change_result.reason,
                 },
             }
