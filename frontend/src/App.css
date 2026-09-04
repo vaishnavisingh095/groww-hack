@@ -45,23 +45,47 @@ body {
 }
 
 /* --- Attention section ("Since You Last Checked") --------------------- */
-/* This is the product's primary surface: the answer to "what deserves
-   my attention right now, and why" -- it appears above the plain
-   watchlist table, and its cards are visually distinct (colored left
-   border by attention_level) so they read as alerts, not as more rows
-   in a table. */
+/* This is the product's PRIMARY surface -- the whole point of the app
+   is "what deserves my attention right now, and why." Its heading is
+   deliberately larger/bolder/higher-contrast than the watchlist's own
+   (which keeps the existing muted .section-title treatment below), so
+   the two sections read as "hero + supporting detail," not two equal
+   lists. Cards remain visually distinct by attention_level (colored
+   left border) so they read as alerts, not as more rows in a table. */
 
 .attention-section {
   margin-bottom: 32px;
 }
 
-.attention-empty {
-  color: #777;
-  font-style: italic;
-  background: #1a1d24;
+.attention-heading {
+  font-size: 1.6rem;
+  font-weight: 800;
+  color: #ffffff;
+  margin: 0 0 8px;
+  letter-spacing: -0.01em;
+}
+
+.attention-count {
+  font-size: 1.05rem;
+  font-weight: 600;
+  color: #fb923c;
+  margin: 0 0 16px;
+}
+
+.attention-caught-up {
+  font-size: 1rem;
+  font-weight: 500;
+  color: #4ade80;
+  background: #143d24;
   border-radius: 8px;
   padding: 16px;
-  margin: 0;
+  margin: 0 0 12px;
+}
+
+.attention-remaining-summary {
+  font-size: 0.85rem;
+  color: #888;
+  margin: 12px 0 0;
 }
 
 .attention-list {

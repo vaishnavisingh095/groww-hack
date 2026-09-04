@@ -127,7 +127,7 @@ export default function App() {
           />
 
           <section className="watchlist-section">
-            <h2 className="section-title">Watchlist</h2>
+            <h2 className="section-title">Your Watchlist</h2>
             <WatchlistTable
               instruments={instruments}
               onMarkAsSeen={handleMarkAsSeen}

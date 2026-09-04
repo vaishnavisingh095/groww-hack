@@ -50,28 +50,81 @@ function AttentionCard({ item, watchlistEntry, onMarkAsSeen, inFlight, actionErr
   )
 }
 
+/**
+ * Truthful summary of the instruments NOT currently in the attention
+ * list. Deliberately does not use `instruments.length - items.length`
+ * and call the result "unchanged" -- an instrument can be missing from
+ * the attention list for several different real reasons (no baseline
+ * yet, unavailable data, or genuinely no meaningful change), and a
+ * stale snapshot can even report meaningful_change=true in GET
+ * /watchlist without ever producing a persisted ChangeEvent (see
+ * decisions.md), so "not in the attention list" alone does not by
+ * itself mean "unchanged."
+ *
+ * Only every field already computed by the backend
+ * (`status`, `change.has_baseline`, `change.meaningful_change`) is
+ * used here -- nothing is re-derived from raw price/volume numbers.
+ * The stronger claim ("no significant changes") is only made when
+ * EVERY remaining instrument is cleanly available, has a real
+ * baseline, and was not flagged meaningful; otherwise neutral wording
+ * is used, exactly per the approved scope.
+ */
+function summarizeRemaining(remaining) {
+  if (remaining.length === 0) {
+    return null
+  }
+
+  const allCleanlyUnchanged = remaining.every(
+    (inst) => inst.status !== 'unavailable' && inst.change.has_baseline && !inst.change.meaningful_change
+  )
+
+  const noun = remaining.length === 1 ? 'stock' : 'stocks'
+
+  if (allCleanlyUnchanged) {
+    const verb = remaining.length === 1 ? 'has' : 'have'
+    return `${remaining.length} other ${noun} ${verb} had no significant changes.`
+  }
+
+  const verb = remaining.length === 1 ? 'is' : 'are'
+  return `${remaining.length} other ${noun} ${verb} in your watchlist.`
+}
+
 export default function AttentionSection({ items, instruments, onMarkAsSeen, inFlightIds, actionErrors }) {
   const instrumentsById = new Map(instruments.map((inst) => [inst.instrument_id, inst]))
 
+  const attentionIds = new Set(items.map((item) => item.instrument_id))
+  const remaining = instruments.filter((inst) => !attentionIds.has(inst.instrument_id))
+  const remainingSummary = summarizeRemaining(remaining)
+
   return (
     <section className="attention-section">
-      <h2 className="section-title">Since You Last Checked</h2>
+      <h2 className="attention-heading">Since You Last Checked</h2>
+
       {items.length === 0 ? (
-        <p className="attention-empty">Nothing has meaningfully changed since you last checked.</p>
+        <p className="attention-caught-up">
+          You're all caught up — nothing has meaningfully changed since you last checked.
+        </p>
       ) : (
-        <ul className="attention-list">
-          {items.map((item) => (
-            <AttentionCard
-              key={item.instrument_id}
-              item={item}
-              watchlistEntry={instrumentsById.get(item.instrument_id)}
-              onMarkAsSeen={onMarkAsSeen}
-              inFlight={inFlightIds.has(item.instrument_id)}
-              actionError={actionErrors[item.instrument_id]}
-            />
-          ))}
-        </ul>
+        <>
+          <p className="attention-count">
+            {items.length} {items.length === 1 ? 'thing deserves' : 'things deserve'} your attention
+          </p>
+          <ul className="attention-list">
+            {items.map((item) => (
+              <AttentionCard
+                key={item.instrument_id}
+                item={item}
+                watchlistEntry={instrumentsById.get(item.instrument_id)}
+                onMarkAsSeen={onMarkAsSeen}
+                inFlight={inFlightIds.has(item.instrument_id)}
+                actionError={actionErrors[item.instrument_id]}
+              />
+            ))}
+          </ul>
+        </>
       )}
+
+      {remainingSummary && <p className="attention-remaining-summary">{remainingSummary}</p>}
     </section>
   )
 }
