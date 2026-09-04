@@ -17,6 +17,7 @@ from app.db.connection import get_database
 from app.models.market_snapshot import SnapshotStatus
 from app.providers.yfinance_provider import YFinanceProvider
 from app.services.change_engine import evaluate_change
+from app.services.change_event_service import ChangeEventService
 from app.services.checkpoint_service import CheckpointService
 from app.services.market_data_service import MarketDataService
 from app.services.watchlist_service import (
@@ -74,10 +75,23 @@ def get_watchlist() -> dict:
       this on a later request -- only an explicit acknowledgement
       (POST /watchlist/checkpoint or
       POST /watchlist/instruments/{id}/checkpoint) can do that.
+
+    ChangeEvent persistence (this is the one write this endpoint DOES
+    make): when an explicit checkpoint exists, the snapshot's status is
+    OK, and the Change Engine reports a meaningful change, the
+    corresponding ChangeEvent is persisted (or reused if one already
+    exists for this exact checkpoint version) via ChangeEventService.
+    This is intentionally still a GET-triggered write -- it persists a
+    market-observed FACT ("this checkpoint's baseline was meaningfully
+    exceeded"), not user acknowledgement, so it does not conflict with
+    the checkpoint semantics contract above. A stale/invalid/unavailable
+    snapshot, or the absence of a checkpoint, never creates one -- see
+    ChangeEventService.get_or_create_active.
     """
     db = get_database()
     instruments = ensure_seed_instruments(db)
     checkpoint_service = CheckpointService(db)
+    change_event_service = ChangeEventService(db)
     market_service = MarketDataService(_provider)
 
     symbol_to_instrument_id = {
@@ -150,6 +164,18 @@ def get_watchlist() -> dict:
                 checkpoint_price=None, current_price=snapshot.last_price
             )
 
+        # Persist/reuse the ChangeEvent for this checkpoint version, if
+        # eligible. No-ops (returns None) unless checkpoint is explicit,
+        # snapshot.status is OK, and change_result.meaningful_change is
+        # True -- see ChangeEventService.get_or_create_active.
+        change_event_service.get_or_create_active(
+            user_id=DEMO_USER_ID,
+            instrument_id=instrument_id,
+            checkpoint=checkpoint,
+            snapshot_status=snapshot.status,
+            change_result=change_result,
+        )
+
         label, age_seconds = _status_label(snapshot.status, snapshot.fetched_at)
 
         results.append(
@@ -195,6 +221,12 @@ def mark_as_seen(instrument_id: str) -> dict:
 
     Path matches architecture.md's documented API contract exactly:
     POST /watchlist/instruments/{id}/checkpoint.
+
+    Ordering note: the checkpoint write happens BEFORE the ChangeEvent
+    acknowledgement below, and only unconditionally-successful code runs
+    in between -- if the checkpoint write itself were ever to raise, the
+    acknowledgement call is never reached, so a failed checkpoint
+    advance can never falsely acknowledge an active ChangeEvent.
     """
     db = get_database()
     instrument_doc = db.instruments.find_one({"_id": _to_object_id(instrument_id)})
@@ -208,7 +240,8 @@ def mark_as_seen(instrument_id: str) -> dict:
     if not snapshots:
         # Missing/invalid/unavailable current data must never become a
         # valid baseline -- fail the request instead of fabricating a
-        # checkpoint from stale or absent data.
+        # checkpoint from stale or absent data. Nothing is acknowledged
+        # either, since we never reach the checkpoint write below.
         raise HTTPException(
             status_code=503,
             detail="Could not fetch current market data — checkpoint not saved.",
@@ -219,6 +252,10 @@ def mark_as_seen(instrument_id: str) -> dict:
     checkpoint = checkpoint_service.create_checkpoint_from_snapshot(
         DEMO_USER_ID, instrument_id, snapshot
     )
+    # The checkpoint write above succeeded -- this instrument's prior
+    # baseline is now genuinely superseded, so its active ChangeEvent(s)
+    # (if any) are acknowledged.
+    ChangeEventService(db).acknowledge_active(DEMO_USER_ID, instrument_id)
 
     return {
         "instrument_id": instrument_id,
@@ -241,11 +278,18 @@ def mark_all_as_seen() -> dict:
 
     Path matches architecture.md's documented API contract exactly:
     POST /watchlist/checkpoint.
+
+    Ordering note: per instrument, the checkpoint write happens BEFORE
+    that instrument's ChangeEvent acknowledgement, and a skipped
+    instrument (no valid snapshot) never reaches either call -- so a
+    skipped/failed instrument's active ChangeEvent(s), if any, are left
+    untouched, never falsely acknowledged.
     """
     db = get_database()
     instruments = ensure_seed_instruments(db)
     market_service = MarketDataService(_provider)
     checkpoint_service = CheckpointService(db)
+    change_event_service = ChangeEventService(db)
 
     symbol_to_instrument_id = {
         yfinance_ticker_for(inst["symbol"], inst["exchange"]): str(inst["_id"])
@@ -270,6 +314,10 @@ def mark_all_as_seen() -> dict:
         checkpoint = checkpoint_service.create_checkpoint_from_snapshot(
             DEMO_USER_ID, instrument_id, snapshot
         )
+        # This instrument's checkpoint write succeeded -- acknowledge
+        # its active ChangeEvent(s), if any. Instruments that hit the
+        # `continue` above (no valid snapshot) never reach this line.
+        change_event_service.acknowledge_active(DEMO_USER_ID, instrument_id)
         updated.append(
             {
                 "instrument_id": instrument_id,

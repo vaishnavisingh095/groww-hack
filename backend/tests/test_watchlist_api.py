@@ -12,7 +12,7 @@ separately via manual end-to-end testing (see implementation report),
 which is the appropriate place for that kind of check, not the
 automated suite that runs on every commit.
 """
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import mongomock
 import pytest
@@ -511,3 +511,215 @@ def test_watchlist_response_price_change_pct_populated_after_checkpoint(client):
     reliance_second = next(i for i in second["instruments"] if i["symbol"] == "RELIANCE")
     assert reliance_second["change"]["has_baseline"] is True
     assert reliance_second["change"]["price_change_pct"] == 0.0
+
+
+# --- ChangeEvent persistence/lifecycle (API-level wiring) ------------------
+
+
+def _quotes_with_reliance_price(price: float) -> dict:
+    """All 5 default fake quotes, with RELIANCE's price overridden --
+    used to simulate a price move between a checkpoint and a later GET."""
+    return {
+        "RELIANCE.NS": make_quote("RELIANCE.NS", price, 1302.6, 9122871),
+        "TCS.NS": make_quote("TCS.NS", 2312.8, 2320.0, 1722049),
+        "HDFCBANK.NS": make_quote("HDFCBANK.NS", 715.6, 706.6, 9937354),
+        "INFY.NS": make_quote("INFY.NS", 1129.0, 1130.3, 3875864),
+        "ICICIBANK.NS": make_quote("ICICIBANK.NS", 1432.5, 1430.0, 4072353),
+    }
+
+
+def test_get_watchlist_creates_change_event_for_meaningful_change_against_explicit_checkpoint(
+    client, monkeypatch
+):
+    """Edge case B (API level): explicit checkpoint + a real, meaningful
+    price move on a status-OK snapshot must persist exactly one
+    ChangeEvent, tied to the checkpoint's id."""
+    test_client, mock_db = client
+
+    first = test_client.get("/watchlist").json()
+    reliance = next(i for i in first["instruments"] if i["symbol"] == "RELIANCE")
+    instrument_id = reliance["instrument_id"]
+
+    test_client.post(f"/watchlist/instruments/{instrument_id}/checkpoint")
+    checkpoint = mock_db.checkpoints.find_one({"instrument_id": instrument_id})
+
+    # Simulate a >2% price move since the checkpoint.
+    monkeypatch.setattr(
+        watchlist_routes, "_provider", FakeProvider(_quotes_with_reliance_price(1400.0))
+    )
+
+    body = test_client.get("/watchlist").json()
+    reliance = next(i for i in body["instruments"] if i["symbol"] == "RELIANCE")
+    assert reliance["change"]["meaningful_change"] is True
+
+    assert mock_db.change_events.count_documents({}) == 1
+    event = mock_db.change_events.find_one({"instrument_id": instrument_id})
+    assert event["checkpoint_id"] == checkpoint["id"]
+    assert event["acknowledged"] is False
+
+
+def test_repeated_get_with_same_meaningful_change_does_not_duplicate_change_event(
+    client, monkeypatch
+):
+    """Edge case C (API level): repeated GET/refresh while the same
+    checkpoint stays active and the same meaningful change persists must
+    not create additional ChangeEvent documents."""
+    test_client, mock_db = client
+
+    first = test_client.get("/watchlist").json()
+    reliance = next(i for i in first["instruments"] if i["symbol"] == "RELIANCE")
+    instrument_id = reliance["instrument_id"]
+
+    test_client.post(f"/watchlist/instruments/{instrument_id}/checkpoint")
+    monkeypatch.setattr(
+        watchlist_routes, "_provider", FakeProvider(_quotes_with_reliance_price(1400.0))
+    )
+
+    test_client.get("/watchlist")
+    test_client.get("/watchlist")
+    test_client.get("/watchlist")
+
+    assert mock_db.change_events.count_documents({"instrument_id": instrument_id}) == 1
+
+
+def test_mark_as_seen_acknowledges_active_change_event(client, monkeypatch):
+    """Edge case E: explicitly marking an instrument as seen must
+    acknowledge its currently active ChangeEvent(s), tied to the
+    checkpoint version being superseded."""
+    test_client, mock_db = client
+
+    first = test_client.get("/watchlist").json()
+    reliance = next(i for i in first["instruments"] if i["symbol"] == "RELIANCE")
+    instrument_id = reliance["instrument_id"]
+
+    test_client.post(f"/watchlist/instruments/{instrument_id}/checkpoint")
+    old_checkpoint = mock_db.checkpoints.find_one({"instrument_id": instrument_id})
+
+    monkeypatch.setattr(
+        watchlist_routes, "_provider", FakeProvider(_quotes_with_reliance_price(1400.0))
+    )
+    test_client.get("/watchlist")  # creates the active ChangeEvent
+
+    active_event = mock_db.change_events.find_one({"instrument_id": instrument_id})
+    assert active_event["acknowledged"] is False
+    assert active_event["checkpoint_id"] == old_checkpoint["id"]
+
+    # Explicit re-acknowledgement at the new (now-current) price.
+    test_client.post(f"/watchlist/instruments/{instrument_id}/checkpoint")
+
+    acknowledged_event = mock_db.change_events.find_one({"_id": active_event["_id"]})
+    assert acknowledged_event["acknowledged"] is True
+    # Still tied to the OLD checkpoint version -- history is not rewritten.
+    assert acknowledged_event["checkpoint_id"] == old_checkpoint["id"]
+
+    new_checkpoint = mock_db.checkpoints.find_one({"instrument_id": instrument_id})
+    assert new_checkpoint["id"] != old_checkpoint["id"]
+
+
+def test_mark_all_as_seen_acknowledges_only_successful_instruments_active_events(
+    client, monkeypatch
+):
+    """Edge case K: mark-all-as-seen must acknowledge active ChangeEvents
+    only for instruments whose checkpoint actually advanced this call --
+    an instrument skipped for lack of valid data must keep its active
+    event untouched."""
+    test_client, mock_db = client
+
+    first = test_client.get("/watchlist").json()
+    reliance = next(i for i in first["instruments"] if i["symbol"] == "RELIANCE")
+    tcs = next(i for i in first["instruments"] if i["symbol"] == "TCS")
+    reliance_id = reliance["instrument_id"]
+    tcs_id = tcs["instrument_id"]
+
+    # Give both RELIANCE and TCS an explicit checkpoint, then a
+    # meaningful price move each, so both have an active ChangeEvent
+    # before the mark-all call.
+    test_client.post(f"/watchlist/instruments/{reliance_id}/checkpoint")
+    test_client.post(f"/watchlist/instruments/{tcs_id}/checkpoint")
+
+    monkeypatch.setattr(
+        watchlist_routes,
+        "_provider",
+        FakeProvider(
+            {
+                **_quotes_with_reliance_price(1400.0),
+                "TCS.NS": make_quote("TCS.NS", 2500.0, 2320.0, 1722049),  # >2% move
+            }
+        ),
+    )
+    test_client.get("/watchlist")  # creates both active ChangeEvents
+
+    assert mock_db.change_events.count_documents({"acknowledged": False}) == 2
+
+    # Now mark-all, but with TCS's data unavailable this cycle -- TCS
+    # must be skipped, not advanced, and its active event left alone.
+    partial_provider = FakeProvider(
+        {
+            "RELIANCE.NS": make_quote("RELIANCE.NS", 1400.0, 1302.6, 9122871),
+            # TCS deliberately omitted -> unavailable this cycle
+            "HDFCBANK.NS": make_quote("HDFCBANK.NS", 715.6, 706.6, 9937354),
+            "INFY.NS": make_quote("INFY.NS", 1129.0, 1130.3, 3875864),
+            "ICICIBANK.NS": make_quote("ICICIBANK.NS", 1432.5, 1430.0, 4072353),
+        }
+    )
+    monkeypatch.setattr(watchlist_routes, "_provider", partial_provider)
+
+    response = test_client.post("/watchlist/checkpoint")
+    body = response.json()
+    assert {u["instrument_id"] for u in body["updated"]} >= {reliance_id}
+    assert any(s["instrument_id"] == tcs_id for s in body["skipped"])
+
+    reliance_event = mock_db.change_events.find_one({"instrument_id": reliance_id})
+    tcs_event = mock_db.change_events.find_one({"instrument_id": tcs_id})
+    assert reliance_event["acknowledged"] is True  # advanced -> acknowledged
+    assert tcs_event["acknowledged"] is False  # skipped -> untouched
+
+
+def test_get_watchlist_with_stale_snapshot_creates_no_change_event(client, monkeypatch):
+    """Edge case I (API level): a snapshot old enough to be classified
+    stale must never create a ChangeEvent, even if the price move looks
+    meaningful -- staleness is still safe to DISPLAY, just never
+    eligible for change detection persistence."""
+    test_client, mock_db = client
+
+    first = test_client.get("/watchlist").json()
+    reliance = next(i for i in first["instruments"] if i["symbol"] == "RELIANCE")
+    instrument_id = reliance["instrument_id"]
+
+    test_client.post(f"/watchlist/instruments/{instrument_id}/checkpoint")
+
+    stale_quotes = _quotes_with_reliance_price(1400.0)
+    stale_quotes["RELIANCE.NS"] = RawQuote(
+        symbol="RELIANCE.NS",
+        last_price=1400.0,
+        previous_close=1302.6,
+        volume=9122871,
+        provider_timestamp=1788509522,
+        fetched_at=datetime.now(timezone.utc) - timedelta(seconds=300),
+        fetch_succeeded=True,
+    )
+    monkeypatch.setattr(watchlist_routes, "_provider", FakeProvider(stale_quotes))
+
+    body = test_client.get("/watchlist").json()
+    reliance = next(i for i in body["instruments"] if i["symbol"] == "RELIANCE")
+    assert reliance["status"] == "stale"  # still displayed, correctly labeled
+    assert reliance["price"] == 1400.0  # still shown
+
+    assert mock_db.change_events.count_documents({}) == 0
+
+
+def test_get_watchlist_with_unavailable_snapshot_creates_no_change_event(client, monkeypatch):
+    """Edge case J (API level): no snapshot at all must never create a
+    ChangeEvent, regardless of any prior checkpoint."""
+    test_client, mock_db = client
+
+    first = test_client.get("/watchlist").json()
+    reliance = next(i for i in first["instruments"] if i["symbol"] == "RELIANCE")
+    instrument_id = reliance["instrument_id"]
+
+    test_client.post(f"/watchlist/instruments/{instrument_id}/checkpoint")
+
+    monkeypatch.setattr(watchlist_routes, "_provider", FakeProvider({}))
+    test_client.get("/watchlist")
+
+    assert mock_db.change_events.count_documents({}) == 0

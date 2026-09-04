@@ -58,12 +58,31 @@ def ensure_indexes(db: Database) -> None:
         name="uniq_user_instrument_checkpoint",
     )
 
-    # ChangeEvent: not unique (multiple change events can exist over
-    # time for the same user/instrument, tied to different checkpoints),
-    # but queried constantly by (user_id, acknowledged) for the Attention
-    # Engine's "active changes for this user" query (a later phase, but
-    # the query shape is already fixed by architecture.md's design).
+    # ChangeEvent: queried constantly by (user_id, acknowledged) for the
+    # Attention Engine's "active changes for this user" query (a later
+    # phase, but the query shape is already fixed by architecture.md's
+    # design). Not unique -- multiple change events legitimately exist
+    # over time for the same user/instrument, tied to different
+    # checkpoints.
     db.change_events.create_index(
         [("user_id", ASCENDING), ("acknowledged", ASCENDING)],
         name="user_acknowledged_lookup",
+    )
+
+    # ChangeEvent uniqueness invariant (ChangeEvent persistence
+    # milestone): exactly one ChangeEvent per
+    # (user_id, instrument_id, checkpoint_id) -- a given checkpoint
+    # VERSION may be evaluated as "meaningfully changed" many times
+    # (every GET/refresh while it stays the active checkpoint), but must
+    # never produce more than one persisted event for it.
+    # `acknowledged` is deliberately excluded from this identity: an
+    # event transitions from unacknowledged to acknowledged in place, it
+    # is never duplicated because of that transition. This is the real
+    # source of truth for the invariant under concurrent requests --
+    # ChangeEventService's find-before-insert check is only the
+    # common-case fast path.
+    db.change_events.create_index(
+        [("user_id", ASCENDING), ("instrument_id", ASCENDING), ("checkpoint_id", ASCENDING)],
+        unique=True,
+        name="uniq_user_instrument_checkpoint_change_event",
     )

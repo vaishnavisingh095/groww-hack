@@ -79,3 +79,17 @@ def test_missing_session_date_is_rejected():
     del data["session_date"]
     with pytest.raises(ValidationError):
         Checkpoint(**data)
+
+
+def test_id_defaults_to_a_unique_value_per_instance():
+    """Checkpoint.id is the durable, app-assigned identity a ChangeEvent
+    references (checkpoint_id) -- distinct from MongoDB's own `_id`,
+    which is preserved unchanged across a replace_one advance and so
+    cannot serve this purpose. Two independently-constructed checkpoints
+    must never collide."""
+    first = Checkpoint(**base_checkpoint())
+    second = Checkpoint(**base_checkpoint())
+
+    assert isinstance(first.id, str)
+    assert first.id != ""
+    assert first.id != second.id

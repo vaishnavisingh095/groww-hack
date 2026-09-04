@@ -24,6 +24,7 @@ def test_ensure_indexes_creates_all_expected_indexes(mock_db):
     assert "uniq_instrument_id" in index_names_by_collection["market_snapshots"]
     assert "uniq_user_instrument_checkpoint" in index_names_by_collection["checkpoints"]
     assert "user_acknowledged_lookup" in index_names_by_collection["change_events"]
+    assert "uniq_user_instrument_checkpoint_change_event" in index_names_by_collection["change_events"]
 
 
 def test_ensure_indexes_is_idempotent(mock_db):
@@ -95,3 +96,30 @@ def test_checkpoint_for_different_instrument_same_user_is_allowed(mock_db):
     mock_db.checkpoints.insert_one({"user_id": "u1", "instrument_id": "i1"})
     mock_db.checkpoints.insert_one({"user_id": "u1", "instrument_id": "i2"})
     assert mock_db.checkpoints.count_documents({"user_id": "u1"}) == 2
+
+
+def test_duplicate_change_event_for_same_user_instrument_checkpoint_is_rejected(mock_db):
+    """Directly exercises the ChangeEvent uniqueness invariant: exactly
+    one ChangeEvent per (user_id, instrument_id, checkpoint_id) --
+    `acknowledged` is deliberately not part of this identity, so a
+    second insert with a different acknowledged value must still fail."""
+    mock_db.change_events.insert_one(
+        {"user_id": "u1", "instrument_id": "i1", "checkpoint_id": "cp1", "acknowledged": False}
+    )
+    with pytest.raises(pymongo.errors.DuplicateKeyError):
+        mock_db.change_events.insert_one(
+            {"user_id": "u1", "instrument_id": "i1", "checkpoint_id": "cp1", "acknowledged": True}
+        )
+
+
+def test_change_event_for_a_different_checkpoint_id_is_allowed(mock_db):
+    """A new checkpoint VERSION (new checkpoint_id) for the same
+    (user, instrument) must be able to have its own ChangeEvent -- this
+    is exactly the 'new checkpoint + later meaningful change' case."""
+    mock_db.change_events.insert_one(
+        {"user_id": "u1", "instrument_id": "i1", "checkpoint_id": "cp1", "acknowledged": False}
+    )
+    mock_db.change_events.insert_one(
+        {"user_id": "u1", "instrument_id": "i1", "checkpoint_id": "cp2", "acknowledged": False}
+    )
+    assert mock_db.change_events.count_documents({"user_id": "u1", "instrument_id": "i1"}) == 2

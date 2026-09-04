@@ -11,9 +11,20 @@ what it represented at checkpoint time.
 `session_date` is copied from the baseline snapshot at checkpoint
 creation time, and is required later for the same-session volume
 acceleration rule (a Change Engine concern, not implemented in Phase 1).
+
+`id` is a durable, application-assigned identity for this specific
+checkpoint VERSION -- deliberately not MongoDB's own `_id`. Checkpoints
+are stored via replace_one keyed on (user_id, instrument_id), so Mongo's
+`_id` is preserved unchanged across every advance and cannot distinguish
+"the baseline before this mark-as-seen" from "the baseline after it."
+`id` gets a fresh value on every write (see CheckpointService), so a
+ChangeEvent.checkpoint_id can durably reference the exact checkpoint
+version it was detected against, even after that (user, instrument)
+pair's checkpoint is later replaced.
 """
 from datetime import date, datetime, timezone
 from enum import Enum
+from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
@@ -32,6 +43,7 @@ class BaselineSnapshot(BaseModel):
 
 
 class Checkpoint(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
     user_id: str = Field(..., min_length=1)
     instrument_id: str = Field(..., min_length=1)
     checkpoint_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

@@ -193,6 +193,28 @@ def test_ensure_initial_checkpoint_does_not_advance_existing_implicit_checkpoint
     client.close()
 
 
+def test_advancing_a_checkpoint_assigns_a_new_id(db):
+    """Regression for the ChangeEvent milestone: MongoDB's own `_id` is
+    preserved unchanged across replace_one, so it cannot distinguish
+    'the baseline before this mark-as-seen' from 'the baseline after
+    it'. Checkpoint.id must therefore be a genuinely new value on every
+    advance -- this is what lets a ChangeEvent durably reference the
+    exact checkpoint version it was detected against."""
+    service = CheckpointService(db)
+
+    first = service.create_checkpoint_from_snapshot(
+        "user1", "inst123", make_snapshot(last_price=1300.0)
+    )
+    second = service.create_checkpoint_from_snapshot(
+        "user1", "inst123", make_snapshot(last_price=1350.0)
+    )
+
+    assert first.id != second.id
+
+    fetched = service.get_checkpoint("user1", "inst123")
+    assert fetched.id == second.id  # the currently-stored checkpoint is the latest version
+
+
 def test_explicit_checkpoint_always_advances_even_after_implicit_one_exists(db):
     """The other direction: an EXPLICIT "mark as seen" must always
     advance/replace, even if the existing checkpoint was implicit. This

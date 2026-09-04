@@ -950,3 +950,213 @@ No change to what `previous_close` ultimately resolves to in the cases
 already tested (both sources still checked, in the same conditions as
 before) — only the order in which they are tried changed, based on
 which one is now known to be more reliable.
+
+---
+
+## Decision: Checkpoint gets a durable, application-assigned `id`, distinct from MongoDB's own `_id`
+
+### Problem
+The ChangeEvent persistence milestone requires `ChangeEvent.checkpoint_id`
+to durably identify the exact checkpoint VERSION a change was detected
+against (per architecture.md's own field description). `Checkpoint`
+documents are advanced via `replace_one` keyed on
+`(user_id, instrument_id)` (see the earlier "frozen copy" decision) —
+MongoDB preserves a document's original `_id` across a `replace_one`
+match. Using Mongo's `_id` as `checkpoint_id` would mean a `ChangeEvent`
+created against checkpoint version N would, after the user's next
+explicit acknowledgement, silently reference the *same* id now held by
+checkpoint version N+1 — an incorrect, misleading history.
+
+### Options
+- Use MongoDB's `_id` as `ChangeEvent.checkpoint_id`.
+- Add a new, application-assigned `Checkpoint.id` field (e.g. a UUID),
+  regenerated on every write, and use that as `checkpoint_id`.
+
+### Decision
+Add `Checkpoint.id: str`, defaulted to a fresh UUID on every
+construction. `CheckpointService._write_checkpoint` already constructs a
+new `Checkpoint(...)` object on every explicit advance, so this field's
+default factory gives each checkpoint version a new, correct identity
+with no other logic change.
+
+### Why
+This is the smallest schema change that makes the existing, already-
+documented `ChangeEvent.checkpoint_id` field actually correct. It does
+not change the storage pattern (still one document per
+`(user_id, instrument_id)`, replaced in place) — it only adds the one
+piece of identity that pattern was missing.
+
+### Trade-off
+None material: one additional string field per `Checkpoint` document.
+
+### Consequence
+A `ChangeEvent`'s `checkpoint_id` now durably and correctly identifies
+"the specific baseline this was detected against," immune to the
+checkpoint later being replaced. See `test_checkpoint_service.py`'s
+`test_advancing_a_checkpoint_assigns_a_new_id`.
+
+---
+
+## Decision: ChangeEvent persistence and lifecycle (get-or-create + acknowledge)
+
+### Problem
+`ChangeEvent` has been a fully-specified, unit-tested Pydantic model and
+a declared MongoDB index since Phase 1, but was never actually written
+to the database anywhere — `evaluate_change()`'s result was computed
+fresh on every `GET /watchlist` and discarded after the response was
+sent. This meant the same meaningful change was recalculated (but never
+remembered) on every refresh, and an explicit "mark as seen" had nothing
+to acknowledge.
+
+### Options
+- Persist a `ChangeEvent` unconditionally whenever `evaluate_change()`
+  reports `meaningful_change=True`.
+- Persist a `ChangeEvent` only when a real acknowledged (explicit)
+  baseline exists and the underlying data is trustworthy, with a
+  find-before-insert dedup check keyed on the checkpoint version.
+
+### Decision
+The latter: a new `ChangeEventService` with two operations —
+`get_or_create_active` (called from `GET /watchlist`, per-instrument,
+after the existing Change Engine evaluation) and `acknowledge_active`
+(called from both explicit checkpoint-advancement endpoints, after that
+instrument's checkpoint write succeeds). `get_or_create_active` only
+creates a document when an explicit `Checkpoint` exists, the current
+snapshot's `status` is `ok`, and `meaningful_change` is `True`; if a
+`ChangeEvent` already exists for that exact
+`(user_id, instrument_id, checkpoint_id)`, it is returned unchanged —
+never re-created, never overwritten with a newer recalculation's
+values.
+
+### Why
+`GET /watchlist` remains the only place `evaluate_change()` runs (no new
+trigger path, no background poller, no queue), so persisting its result
+there — gated correctly — is the smallest change that gives ChangeEvent
+real persistence. Keying reuse on `checkpoint_id` rather than, e.g., a
+time window means "the same logical change" is defined precisely as
+"the same checkpoint version," which is exactly what the checkpoint
+semantics milestone already established as the unit of "what changed
+since the user last acknowledged."
+
+Acknowledging is deliberately triggered only from the explicit
+mark-as-seen endpoints, and only after that instrument's checkpoint
+write has already succeeded — never from `GET /watchlist` (opening or
+refreshing the page is not acknowledgement, per the checkpoint semantics
+contract), and never before the checkpoint write it depends on, so a
+failed checkpoint write can never falsely acknowledge an active event.
+Acknowledgement is scoped to "all currently-active events for this
+`(user_id, instrument_id)`," not to a specific `checkpoint_id`, because
+at most one checkpoint is ever active per `(user, instrument)` — there
+is nothing else it could mean to acknowledge.
+
+### Trade-off
+`GET /watchlist` now performs a conditional database write in addition
+to reads — a deliberate, approved exception to the checkpoint semantics
+contract's "reads don't write" framing, because a `ChangeEvent` records
+an observed market FACT ("this checkpoint's baseline was meaningfully
+exceeded"), not user acknowledgement. The two remain conceptually and
+mechanically distinct: `GET` may write facts, only explicit action may
+write acknowledgement.
+
+### Consequence
+The Attention Engine (not built yet) will have real, persisted,
+deduplicated `ChangeEvent`s to read from once it exists, rather than
+needing its own recomputation or persistence logic.
+
+---
+
+## Decision: A stale MarketSnapshot may be displayed but never creates a ChangeEvent
+
+### Problem
+The Freshness Model already forbids presenting stale data as if it were
+fresh, but it does not say whether a `stale`-but-present snapshot should
+be *eligible for change detection persistence* — i.e., whether a
+seemingly-large move measured against old data should be allowed to
+create a permanent `ChangeEvent` record.
+
+### Options
+- Allow `ChangeEvent` creation from any present snapshot regardless of
+  `status` (`ok` or `stale`), since the underlying value is real, not
+  fabricated.
+- Restrict `ChangeEvent` creation to `status == ok` snapshots only;
+  `stale` may still be displayed, but never creates or reuses a
+  persisted event.
+
+### Decision
+The latter. `ChangeEventService.get_or_create_active` checks
+`snapshot_status != SnapshotStatus.OK` and returns `None` (no
+persistence) for `stale`, in addition to the pre-existing structural
+exclusion of `invalid`/`unavailable` (which never even produce a
+`MarketSnapshot` or reach this code path at all).
+
+### Why
+A persisted `ChangeEvent` is a durable claim ("this specific move was
+detected and is worth the user's attention"), not just a display value —
+it is stronger than "here is the last number we have, marked old." A
+`stale` snapshot may be old enough that the "meaningful" comparison it
+produces no longer reflects anything the user should trust as a
+detected event, even though it is still honest to *show* the number with
+its age. This does not change how staleness is displayed anywhere in
+the existing freshness UI/response fields.
+
+### Trade-off
+A genuinely large, real move that happens to be measured against a
+`stale` snapshot will not create a `ChangeEvent` on that particular
+request — it will be picked up on a later request once a fresh snapshot
+is available and the same checkpoint is still active (the dedup key is
+per checkpoint version, not per request, so this is not lost, only
+delayed).
+
+### Consequence
+`ChangeEventService` takes `snapshot_status` as an explicit, required
+input rather than inferring eligibility from `change_result` alone —
+the Change Engine's `ChangeResult` has no concept of snapshot freshness
+and is not the right place to add one.
+
+---
+
+## Decision: ChangeEvent uniqueness is (user_id, instrument_id, checkpoint_id), excluding `acknowledged`
+
+### Problem
+Nothing previously enforced "at most one ChangeEvent per checkpoint
+version" at the database level — the only existing `change_events` index
+was a non-unique lookup shape `(user_id, acknowledged)`. Without a real
+constraint, a bug in application-level dedup logic (or a genuine
+concurrent request race) could silently produce duplicate events for
+the same detected change.
+
+### Options
+- No database-level constraint; rely entirely on the service's
+  find-before-insert check.
+- A unique compound index on `(user_id, instrument_id, checkpoint_id)`.
+- The same index, but including `acknowledged` in the key (so an
+  acknowledged and an unacknowledged event for the same checkpoint could
+  coexist).
+
+### Decision
+A unique compound index on `(user_id, instrument_id, checkpoint_id)`,
+explicitly excluding `acknowledged`.
+
+### Why
+The business invariant is "one ChangeEvent per checkpoint version,"
+full stop — not "one active one and separately one acknowledged one."
+An event transitions from unacknowledged to acknowledged in place; that
+transition must never be modeled as a second document. Enforcing this
+at the database level (not just in application code) is what makes it
+a real constraint rather than a convention that could be silently
+violated by a future code path that forgets to check first —
+`ChangeEventService`'s own find-before-insert check remains only the
+common-case fast path; the index is the actual source of truth under
+concurrency, with a `DuplicateKeyError` fallback in the service that
+re-fetches and reuses instead of raising.
+
+### Trade-off
+None material — no legitimate use case requires more than one
+ChangeEvent per checkpoint version to exist simultaneously.
+
+### Consequence
+`ensure_indexes` now creates `uniq_user_instrument_checkpoint_change_event`
+alongside the pre-existing `user_acknowledged_lookup` index (kept,
+unchanged — still the correct shape for a future Attention Engine's
+"active events for this user" query). See
+`test_db_indexes.py`'s new duplicate-rejection tests.
