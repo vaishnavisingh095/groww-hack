@@ -9,11 +9,31 @@ import WatchlistTable from './components/WatchlistTable'
 // target freshness window (see decisions.md's Freshness Policy).
 const POLL_INTERVAL_MS = 60_000
 
+// Case-insensitive match against an instrument's symbol or exchange --
+// the only fields GET /watchlist already returns that a "search your
+// watchlist" query could sensibly mean (no company name, no other
+// metadata). Pure/stateless and defined once here so the watchlist
+// table and the attention cards apply the exact same rule, rather than
+// two slightly-different reimplementations.
+function matchesSearch(symbol, exchange, query) {
+  if (!query) return true
+  const q = query.toLowerCase()
+  return (
+    (symbol && symbol.toLowerCase().includes(q)) ||
+    (exchange && exchange.toLowerCase().includes(q))
+  )
+}
+
 export default function App() {
   const [instruments, setInstruments] = useState([])
   const [attentionItems, setAttentionItems] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
+
+  // Pure presentation filter -- never touches instruments/attentionItems
+  // themselves, never affects loadAll(), polling, or any acknowledgement
+  // handler below.
+  const [searchQuery, setSearchQuery] = useState('')
 
   // Per-instrument action state, not global -- an instrument can now be
   // acted on from two places (its watchlist row AND, if active, its
@@ -143,6 +163,14 @@ export default function App() {
     }
   }, [loadAll])
 
+  // Small, simple filter -- the dataset is 5 instruments, not large
+  // enough to warrant useMemo. instruments itself is never reassigned or
+  // mutated here; this is a new derived array passed only to
+  // WatchlistTable below.
+  const filteredInstruments = instruments.filter((inst) =>
+    matchesSearch(inst.symbol, inst.exchange, searchQuery)
+  )
+
   return (
     <div className="app">
       <header className="app-header">
@@ -151,6 +179,16 @@ export default function App() {
         <p className="app-subtitle">
           See what meaningfully changed in your watchlist while you were away.
         </p>
+        <div className="search-control">
+          <input
+            type="search"
+            className="search-input"
+            placeholder="Search your watchlist..."
+            aria-label="Search your watchlist"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+          />
+        </div>
       </header>
 
       {error && <div className="error-banner">{error}</div>}
@@ -169,6 +207,8 @@ export default function App() {
             markAllInFlight={markAllInFlight}
             markAllError={markAllError}
             markAllPartialMessage={markAllPartialMessage}
+            searchQuery={searchQuery}
+            matchesSearch={matchesSearch}
           />
 
           <section className="watchlist-section">
@@ -179,7 +219,7 @@ export default function App() {
               </p>
             </div>
             <WatchlistTable
-              instruments={instruments}
+              instruments={filteredInstruments}
               onMarkAsSeen={handleMarkAsSeen}
               inFlightIds={inFlightIds}
               actionErrors={actionErrors}

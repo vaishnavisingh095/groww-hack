@@ -235,6 +235,8 @@ export default function AttentionSection({
   markAllInFlight,
   markAllError,
   markAllPartialMessage,
+  searchQuery,
+  matchesSearch,
 }) {
   const instrumentsById = new Map(instruments.map((inst) => [inst.instrument_id, inst]))
 
@@ -253,6 +255,28 @@ export default function AttentionSection({
   // -- its card still renders with its own real (unmodified) badge.
   const highItems = items.filter((item) => item.attention_level === 'high')
   const worthCheckingItems = items.filter((item) => item.attention_level !== 'high')
+
+  // Search is applied ONLY here, after highItems/worthCheckingItems (and
+  // therefore the banner's count/breakdown text above, which reads off
+  // items.length/highItems.length/worthCheckingItems.length -- the FULL,
+  // unfiltered arrays) are already computed. remaining/remainingSummary
+  // above are also computed from the full `instruments` prop, not this
+  // filter -- the global summary never changes because of a search
+  // query. instrumentsById already carries `exchange`, which GET
+  // /watchlist/attention's own items don't include, so the same
+  // matchesSearch rule the watchlist table uses applies identically to
+  // an attention card's underlying instrument.
+  const visibleHighItems = highItems.filter((item) =>
+    matchesSearch(item.symbol, instrumentsById.get(item.instrument_id)?.exchange, searchQuery)
+  )
+  const visibleWorthCheckingItems = worthCheckingItems.filter((item) =>
+    matchesSearch(item.symbol, instrumentsById.get(item.instrument_id)?.exchange, searchQuery)
+  )
+  const noSearchMatches =
+    items.length > 0 &&
+    searchQuery &&
+    visibleHighItems.length === 0 &&
+    visibleWorthCheckingItems.length === 0
 
   const groupProps = { instrumentsById, onMarkAsSeen, inFlightIds, actionErrors }
 
@@ -312,13 +336,25 @@ export default function AttentionSection({
 
       {items.length > 0 && (
         <>
-          <AttentionGroup title="High Attention" variant="high" groupItems={highItems} {...groupProps} />
+          <AttentionGroup
+            title="High Attention"
+            variant="high"
+            groupItems={visibleHighItems}
+            {...groupProps}
+          />
           <AttentionGroup
             title="Worth Checking"
             variant="secondary"
-            groupItems={worthCheckingItems}
+            groupItems={visibleWorthCheckingItems}
             {...groupProps}
           />
+          {/* Truthful, search-scoped empty state -- only shown when real
+              attention items exist but none match the current query.
+              Never replaces or alters the "caught up" message above,
+              which is about there being no attention items at all. */}
+          {noSearchMatches && (
+            <p className="attention-search-empty">No attention items match "{searchQuery}".</p>
+          )}
         </>
       )}
 
