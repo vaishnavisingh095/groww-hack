@@ -1,0 +1,540 @@
+# Decisions Log: Smart Market Watchlist
+
+## Decision: Meaningful-change signals for the hackathon build
+
+### Problem
+"Meaningful change" needed a concrete, deterministic definition before any
+detection logic could be designed.
+
+### Options
+- Price movement only.
+- Price movement + volume anomaly.
+- Price movement + volume anomaly + volatility.
+
+### Decision
+Price movement + volume anomaly. Volatility deferred to Should-Have.
+
+### Why
+Two independent, well-understood, easily-explained signals are enough to
+demonstrate real engineering depth in the Change Engine without needing a
+volatility model (e.g., rolling standard deviation) that requires
+historical tick data we won't have time to properly source and validate
+in 72 hours.
+
+### Trade-off
+We won't catch "high volatility with no net price change" patterns
+(e.g., a stock whipsawing intraday but closing flat). Acceptable: this is
+a rarer and harder-to-explain pattern than the two we do cover.
+
+### Consequence
+The Change Engine's `signals` object and thresholds are built around
+exactly two named values; adding volatility later means adding a third
+named threshold and signal, not restructuring the engine.
+
+---
+
+## Decision: Market data provider — `yfinance` library (revised)
+
+### Problem
+Real Indian equity data requires either a broker API (Zerodha Kite, ICICI
+Breeze — both need account setup/KYC), a paid vendor (e.g., TrueData), or
+a free/open-source route to Yahoo Finance data. We needed a source usable
+within 72 hours with no paid signup friction, no mock data in the demo,
+and — per explicit direction — no invented or assumed rate limits.
+
+### Options considered
+- Broker API (requires existing trading account + app registration).
+- Paid market-data vendor.
+- A third-party hosted REST wrapper at a bare IP address (`0xramm`'s
+  "Indian-Stock-Market-API" on GitHub), investigated first.
+- `yfinance` — an open-source Python library calling Yahoo's own
+  undocumented internal endpoints directly.
+- Fully simulated/mocked data generator (explicitly excluded by
+  direction: no mock data in the actual demo).
+
+### Investigation performed
+The bare-IP REST wrapper was investigated first and its README claimed a
+self-stated "60 requests/minute" limit and a 30-second minimum cache
+recommendation. On review, this candidate was rejected before being
+locked in: it is a single-maintainer hosted service at a numeric IP with
+no domain, no HTTPS, no ownership verification, and no way to confirm the
+README's rate-limit claim is authoritative or current — using it would
+have meant *inventing* trust in a number we couldn't verify, which
+conflicts directly with the instruction not to assume rate limits.
+
+`yfinance` was then investigated as the alternative: confirmed via
+multiple current (2026-dated) sources to support NSE (`.NS`) and BSE
+(`.BO`) tickers, confirmed to support batched multi-ticker calls, and
+confirmed via its own GitHub issue tracker to have **no official
+published rate limit** — because it calls an undocumented, unofficial
+Yahoo endpoint, there is no rate-limit contract to read. Community
+reports on the issue tracker mention an unofficial, unconfirmed figure
+near 360 requests/hour, and separately document a case where a
+previously-stable high-volume workflow started receiving 429 errors with
+no warning — evidence that whatever limit exists is both undocumented
+and subject to change without notice.
+
+### Decision
+Use `yfinance`, accessed only through a `MarketDataProvider` abstraction,
+with no invented rate-limit number — the polling loop reacts to actual
+429/error responses via backoff rather than assuming a safe ceiling in
+advance (see `architecture.md` backoff policy).
+
+### Why
+`yfinance` calls Yahoo directly rather than through an unverifiable
+third-party intermediary, is open-source and inspectable, and is
+widely-used enough that its failure modes (429s, occasional NSE/BSE
+reliability issues) are documented by other users rather than unknown.
+None of this makes it *reliable* — it makes it *honestly uncertain*,
+which is the correct foundation for a system whose freshness/failure
+model is supposed to reflect reality rather than an assumed guarantee.
+
+### Trade-off
+We have no rate-limit number to design a safety margin against in
+advance — the system must be reactive (backoff on actual 429s) rather
+than proactive (staying under a known ceiling). We also don't yet know
+the true data latency for NSE/BSE specifically, or whether our exact
+target tickers behave reliably — these are named as explicit unresolved
+risks requiring a live test before implementation (see
+`architecture.md`, "What remains genuinely unknown").
+
+### Consequence
+The Market Data Service's poll loop must implement real backoff logic
+(not just a fixed retry), and a live-test script must run and its
+results reviewed before the Feature Design Checkpoint for the Market
+Data Service — this is now a required pre-implementation step, not
+optional due diligence.
+
+### Confirmation (live test performed, GO issued)
+A live test was run from an unrestricted network environment against all
+5 target NSE symbols (`RELIANCE.NS`, `TCS.NS`, `HDFCBANK.NS`, `INFY.NS`,
+`ICICIBANK.NS`) during active NSE market hours. All 5 succeeded on both
+of two fetch passes, with a batched multi-symbol call also succeeding in
+0.234 seconds. **GO is confirmed** for the hackathon MVP based on this
+evidence. This is one clean run under normal conditions, not a
+reliability guarantee — the reactive-backoff design, the "no assumed
+rate ceiling" stance, and the `MarketDataProvider` abstraction all remain
+unchanged, since none of them depended on the test succeeding to be the
+right design. See the architecture.md External Dependency section for
+the full confirmed field mapping and the unknowns that remain open even
+after this successful test (practical rate ceiling, true exchange
+latency, off-hours behavior).
+
+---
+
+## Decision: Shared poll loop instead of per-request or per-user fetching
+
+### Problem
+If N users each have a watchlist of M instruments, naively fetching data
+per-request or per-user would multiply API calls by N — risking
+rate-limiting on a provider with no documented ceiling to design against
+(see provider decision above), and wastefully re-fetching the same
+instrument multiple times per minute regardless of the actual limit.
+
+### Options
+- Fetch live from the provider on every `GET /watchlist` request.
+- Per-user background polling.
+- One shared backend poll loop over the union of all distinct instruments
+  across all watchlists, using `yfinance`'s batch call.
+
+### Decision
+One shared poll loop over distinct instruments, batched, every 60 seconds
+(target), with reactive backoff on actual rate-limit responses.
+
+### Why
+Whatever `yfinance`'s real, undocumented limit turns out to be, it is
+per-source, not per-user — so the number of calls must scale with the
+number of *distinct instruments being tracked platform-wide*, not with
+the number of users or requests. A watchlist app realistically tracks a
+small number of large-cap instruments in a hackathon demo; one batched
+call per minute is the smallest request volume the design can produce,
+which is the best available mitigation given that no safe ceiling can be
+confirmed in advance (see the unresolved provider unknowns).
+
+### Trade-off
+Data is only as fresh as the last successful poll cycle — targeted at
+60 seconds, but potentially older under backoff or provider delay (see
+Freshness Policy decision) — not truly real-time, and a burst of
+newly-added instruments has to wait for the next cycle to get their
+first snapshot. Accepted: this is explicitly not a real-time trading
+terminal, and the freshness model surfaces actual computed age rather
+than implying a guarantee.
+
+### Consequence
+`GET /watchlist` reads only ever hit MongoDB, never the external
+provider directly — this is what keeps read latency low and decouples
+user-facing performance from provider reliability entirely.
+
+---
+
+## Decision: Freshness is computed and displayed, never claimed as a guarantee
+
+### Problem
+A 60-second poll target could be misread — by us or by users — as a
+promise that data is never more than 60 seconds old. That would be false:
+`yfinance` has no documented latency guarantee, the poll loop can fall
+behind under backoff, and NSE/BSE data delay via Yahoo is itself an
+unverified unknown (see provider decision above).
+
+### Options
+- Present the poll interval as an implied freshness guarantee (say
+  nothing further, let users assume "60 seconds" means "≤60 seconds
+  old").
+- Compute and display actual freshness/age on every snapshot, explicitly
+  distinct from the polling target.
+
+### Decision
+Compute and display actual freshness always; never state or imply a
+guarantee tighter than what we can verify.
+
+### Why
+The product's core differentiator is trustworthy, explainable
+information — silently overstating freshness would undermine exactly the
+trust the rest of the system (deterministic change detection, persisted
+checkpoints) is built to earn. "Fresh · 42s ago" is a true statement we
+can defend; "updates every 60 seconds" alone would imply a guarantee we
+cannot verify, given the unresolved provider unknowns.
+
+### Trade-off
+Slightly more UI complexity (status word + computed age, not just a
+number) and slightly less "polished/simple" marketing framing. Accepted:
+an honest weaker claim is worth more than a confident false one, doubly
+so for a finance-adjacent product.
+
+### Consequence
+`status` and computed age are mandatory fields on every snapshot returned
+to the frontend — there is no code path that returns a bare price without
+them.
+
+### Confirmation and correction (live test performed)
+The live test decoded the provider's `regularMarketTime` field (the
+candidate for `provider_timestamp`) for every successful fetch. The
+precise, careful statement of what was observed is:
+- `regularMarketTime` was populated on every successful fetch.
+- Its decoded value was consistently very close to our own local fetch
+  time (within a few seconds).
+- It changed between our two fetch passes, 45 seconds apart, by an
+  amount consistent with the elapsed time between our requests.
+- **We have NOT independently verified the semantic meaning of this
+  field.** We do not claim it means "Yahoo response time" or any other
+  specific thing — only that its observed behavior (populated, close to
+  our fetch time, moves with our polling) makes it unsuitable as an
+  independent freshness signal or as an exchange trade timestamp.
+
+This confirms and sharpens the decision above: **our own `fetched_at` is
+the sole authoritative timestamp for all freshness/staleness
+calculations.** `provider_timestamp` is stored on `MarketSnapshot` for
+diagnostics only and must never be used to compute `status`, never
+displayed as data age, and never presented to the user as an exchange
+trade timestamp.
+
+---
+
+## Decision: Volume-anomaly signal — rate-based, not raw cumulative ratio, same-session only
+
+### Problem
+The originally-proposed `current_volume / checkpoint_volume` ratio was
+flagged for explicit review: NSE/BSE volume accumulates from market open,
+so this ratio conflates "time elapsed since checkpoint" with "unusual
+trading activity" — it would show a large, seemingly-meaningful number
+for every stock on every check simply because more of the trading day
+had passed, regardless of whether anything unusual occurred.
+
+### Options considered
+- **A. Checkpoint cumulative-volume ratio** (the original, flawed
+  proposal): `current_volume / checkpoint_volume`. Correctness: poor —
+  dominated by elapsed time, not anomalous activity. Data requirements:
+  none beyond existing snapshots. Complexity: trivial. Explainability:
+  superficially explainable but *incorrectly* so — the number would
+  imply something untrue. Hackathon suitability: fast to build, wrong to
+  ship.
+- **B. Volume acceleration/rate over comparable intervals**: compare
+  shares/minute before vs. after the checkpoint, both measured within the
+  same trading session, using market-open time as a fixed reference
+  point. Correctness: sound — cancels out the elapsed-time confound
+  entirely. Data requirements: only the existing two snapshots plus a
+  known constant (NSE/BSE open time). Complexity: low-moderate — more
+  arithmetic than A, no new data source. Explainability: genuinely
+  correct and verifiable ("trading 2x faster than earlier today").
+  Hackathon suitability: buildable in the available time with data we
+  already have.
+- **C. Historical/rolling volume baseline** (e.g., trailing 20-day
+  average volume-by-time-of-day): most statistically rigorous in
+  principle — accounts for instrument-specific normal patterns.
+  Correctness: best. Data requirements: a historical, time-bucketed
+  volume dataset we don't have and would need to backfill. Complexity:
+  high — new collection, backfill job, holiday/non-trading-day handling.
+  Explainability: correct but harder to verify by eye, since it depends
+  on a computation the user can't easily check against two visible
+  numbers. Hackathon suitability: disproportionate infrastructure for 72
+  hours; the "sophisticated-looking but unjustified" trap explicitly
+  flagged to avoid.
+
+### Decision
+Option B — same-session rate acceleration relative to market open.
+
+### Why
+It directly fixes the real correctness flaw in option A without
+requiring the new infrastructure option C would need. It uses only data
+already present in the system's design (two snapshots plus one known
+constant), stays inside the 72-hour budget, and produces an explanation
+that is actually true, not merely plausible-sounding — which matters more
+for a system whose stated differentiator is explainability.
+
+### Trade-off
+Doesn't capture instrument-specific "normal for this stock" patterns or
+cross-day effects (e.g., a stock that always trades heavily right after
+open would look "accelerating" relative to later hours even on an
+ordinary day). This is a real limitation, explicitly accepted rather than
+hidden — the threshold (`VOLUME_RATIO_THRESHOLD`) is documented as a
+starting assumption to validate against real intraday data, not a
+scientifically-derived constant.
+
+### Consequence
+No new collections or backfill jobs are needed for the volume signal.
+The Change Engine only needs the checkpoint's frozen baseline, the
+current snapshot, and a hardcoded NSE/BSE market-open constant (9:15 AM
+IST) — consistent with the plan's instruction not to add
+historical-data infrastructure just to look sophisticated.
+
+### Confirmation and required correction (live test performed)
+
+**Confirmed**: the live test verified `fast_info.last_volume` is
+cumulative and monotonically increasing within a session — all 5 target
+symbols showed a positive, realistic increase in this field across a
+45-second gap between two live fetches. This is exactly the behavior
+option B's formula assumes, so the formula's data inputs are validated.
+
+**Required correction surfaced during review — same-session boundary.**
+The formula as originally written did not explicitly guard against a
+checkpoint from a *previous* trading session being compared against
+today's cumulative volume. Cumulative volume resets at the start of each
+session; a checkpoint left over from a prior day would produce a
+`current.volume - baseline.volume` delta dominated entirely by the
+overnight reset, not by any real trading activity — reintroducing
+essentially the same category of false signal that option A was
+rejected for, just triggered by session boundaries instead of same-day
+elapsed time.
+
+**Correction adopted**: volume acceleration is computed only when
+`checkpoint.session_date == current_snapshot.session_date`. When they
+differ, `volume_acceleration_available = false` and
+`volume_acceleration_ratio = null` for that comparison — but price
+comparison (`price_change_pct`) is still computed normally, since price
+is meaningfully comparable across sessions in a way cumulative
+same-session volume is not. This is not a new option to weigh — it is a
+necessary completion of option B's own logic, not a design alternative.
+
+**Related, still-open guard**: the live test ran mid-session and did not
+exercise a checkpoint created very close to market open, where
+`minutes_since_open_to_checkpoint` could be near zero. The defensive
+floor on this denominator (documented in `architecture.md`) remains an
+implementation requirement not validated by this test.
+
+### Explanation wording (required, corrected)
+The explanation string must say `"Trading volume accelerated to
+{ratio}× the rate observed before you last checked."` — not "{ratio}x
+normal volume" or any phrasing implying a historical-normal baseline.
+The signal is a same-session, self-relative rate comparison; wording
+that implies "normal for this stock" would overstate what was actually
+measured and was not the definition we decided to build.
+
+---
+
+## Decision: Invalid-data rules kept conservative, not invented
+
+### Problem
+The original freshness/failure design listed example "implausible
+values" to reject (zero volume mid-session, circuit-limit-violating
+price jumps) without verifying either was actually a reliable failure
+signal. On review, both needed to be checked against evidence rather
+than kept as assumptions.
+
+### Options
+- Keep the original examples as written (zero volume → invalid,
+  circuit-limit-bound violations → invalid).
+- Review each against what we actually know and adjust to only what's
+  defensible.
+
+### Decision
+Adjusted validation to a conservative set with clear justification for
+each rule:
+- Missing/non-numeric/non-finite price → invalid (rejects the whole
+  snapshot).
+- Missing/non-numeric/non-finite volume → invalidates only the volume
+  signal, not the snapshot's price.
+- Negative volume → invalid (a real impossibility for cumulative
+  volume).
+- Zero volume → **not** automatically invalid.
+- Circuit-limit-bound violations → **not** used as a validity check at
+  all.
+
+### Why
+Zero volume was actually observed in the live test's `history()` 1-minute
+bar field under normal, successful conditions — not proof that zero is
+always benign, but clear evidence it is not reliably a failure signal
+either, so treating it as automatic grounds for invalidation would risk
+discarding legitimate data based on an untested assumption. Circuit-limit
+bounds require real per-instrument exchange data we do not have; inventing
+a plausible-sounding threshold to check against would itself be exactly
+the kind of fabricated exchange constraint this project is committed to
+avoiding. Negative volume, by contrast, is a real mathematical
+impossibility for a cumulative counter and can be rejected with full
+confidence. Missing/non-numeric price is rejected outright because a
+usable price is the minimum viable output of the whole system; the same
+class of problem in volume only removes one derived signal, not the
+entire snapshot.
+
+### Trade-off
+Some genuinely bad volume data might pass through as "just missing the
+volume signal" rather than being flagged more visibly as an error.
+Accepted: the alternative (guessing at invalidity rules not backed by
+evidence) risks the opposite and worse failure — silently discarding good
+data or fabricating exchange knowledge we don't have.
+
+### Consequence
+The Freshness Model's `invalid` status is reserved for price-level
+problems and the one real volume impossibility (negative); everything
+else degrades gracefully (missing volume → signal unavailable, provider
+timeout → stale) rather than being lumped into a single broad "invalid"
+bucket.
+
+---
+
+## Decision: No WebSockets / real-time push
+
+### Problem
+A "smart watchlist" could reasonably be built with live-updating prices
+via WebSocket/SSE push to the frontend.
+
+### Options
+- WebSocket/SSE push from backend to frontend.
+- Client polls the backend on an interval; backend serves from its own
+  cached snapshots.
+
+### Decision
+Client polls the backend (e.g., every 30–60s); no push infrastructure.
+
+### Why
+The underlying data itself only refreshes every 60 seconds server-side —
+push infrastructure would create the illusion of real-time updates on top
+of data that isn't real-time, which is misleading rather than valuable.
+Polling the already-cheap, already-cached `GET /watchlist` endpoint
+achieves the same practical freshness with far less engineering surface
+(no connection lifecycle management, no reconnect logic, no scaling
+concerns for concurrent open connections).
+
+### Trade-off
+Slightly less "alive-feeling" UI than push-based updates. Accepted: the
+product's differentiator is explainable change detection, not visual
+real-time-ness.
+
+### Consequence
+Frontend architecture stays simple — no socket library, no connection
+state to manage, one fewer category of failure mode.
+
+---
+
+## Decision: No LLM in the core meaningful-change or attention logic
+
+### Problem
+An LLM could plausibly generate "why this matters" explanations or even
+decide what counts as meaningful.
+
+### Options
+- LLM-generated change detection and/or explanations.
+- Fully deterministic, rule-based detection and templated explanations.
+
+### Decision
+Fully deterministic and rule-based, per explicit constraint.
+
+### Why
+"Explainable" for a financial product means a user (or judge) can verify
+the reasoning against the raw numbers without trusting an opaque model.
+A templated explanation built directly from the same numeric thresholds
+used for detection is fully auditable; an LLM-generated explanation is
+not, and introduces non-determinism into a system whose core value
+proposition is trustworthy, repeatable judgments about real money
+decisions.
+
+### Trade-off
+Explanations are less naturally-worded than an LLM could produce, and the
+detection logic can't flexibly handle novel patterns outside the two
+named signals. Accepted: this is the correct trade for a finance-adjacent
+tool where trust matters more than eloquence.
+
+### Consequence
+All explanation strings are template-based, sourced directly from
+`ChangeEvent.signals` — never freeform generated text.
+
+---
+
+## Decision: Checkpoint baseline stored as a frozen copy, not a live reference
+
+### Problem
+Should a `Checkpoint` store a reference (foreign key) to the
+`MarketSnapshot` it was created from, or copy the relevant values
+directly?
+
+### Options
+- Reference to a `MarketSnapshot._id`.
+- Frozen copy of the values at checkpoint time.
+
+### Decision
+Frozen copy.
+
+### Why
+`MarketSnapshot` is a single upserted document per instrument, overwritten
+every poll cycle — it has no history. A foreign-key reference would point
+at a document that no longer represents what it represented at checkpoint
+time, silently corrupting every future comparison. Copying the values is
+the only way to preserve an honest historical baseline given the
+upsert-only snapshot design.
+
+### Trade-off
+Some data duplication between `Checkpoint` and historical `MarketSnapshot`
+states. Accepted: the duplication is small (three numeric fields) and
+correctness here is the invariant that matters most in the whole system
+(see architecture.md invariant #2 and #3).
+
+### Consequence
+This decision is *why* `MarketSnapshot` can safely remain upsert-only
+(see architecture.md trade-off on no tick history) — the Checkpoint
+design absorbs the need for historical values, so the snapshot collection
+doesn't have to.
+
+---
+
+## Decision: No transaction/locking for concurrent checkpoint updates
+
+### Problem
+Could two near-simultaneous requests (e.g., duplicate button clicks) to
+advance the same user's checkpoint for the same instrument race?
+
+### Options
+- Add optimistic locking / versioning on `Checkpoint`.
+- Accept last-write-wins with no additional protection.
+
+### Decision
+Last-write-wins, no additional protection.
+
+### Why
+The only actor who can advance a given user's checkpoint is that same
+user, acting on their own watchlist. A race here (e.g., a double-click)
+produces at worst a slightly-earlier or slightly-later checkpoint time for
+the *same user's own action* — there's no cross-user data corruption risk
+and no financial consequence, unlike the rehearsal's SELL/holdings
+invariant. Adding locking here would be solving a race condition that
+carries no real risk for the actor who causes it.
+
+### Trade-off
+In a true multi-device-simultaneous-click edge case, one of the two
+"mark as seen" actions could theoretically be silently overwritten by the
+other's timestamp. Accepted as immaterial: both actions have the same
+intent (acknowledge current changes), so either outcome is correct from
+the user's perspective.
+
+### Consequence
+No added complexity for a failure mode with no meaningful downside —
+consistent with the protocol's guidance not to add concurrency handling
+without a concrete problem that requires it.
