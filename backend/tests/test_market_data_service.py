@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from app.models.market_snapshot import SnapshotStatus
 from app.providers.base import MarketDataProvider, RawQuote
@@ -27,6 +27,14 @@ def make_quote(**overrides) -> RawQuote:
         fetched_at=datetime.now(timezone.utc),
         fetch_succeeded=True,
         error_message=None,
+        # A real, provider-derived session_date -- required by
+        # MarketDataService as of the session_date correctness fix
+        # (see decisions.md). Matches fetched_at's date by default here
+        # since these tests aren't exercising the "bars are from a
+        # different day than our fetch time" scenario (that's
+        # test_yfinance_provider.py's job); tests that DO need a
+        # mismatch override this explicitly.
+        session_date=date(2026, 9, 4),
     )
     defaults.update(overrides)
     return RawQuote(**defaults)
@@ -89,6 +97,43 @@ def test_missing_previous_close_produces_no_snapshot():
     snapshots = service.fetch_snapshots({"RELIANCE.NS": "inst123"})
 
     assert snapshots == []
+
+
+def test_missing_session_date_produces_no_snapshot():
+    """session_date is required (used later for the same-session
+    volume-acceleration rule) -- a provider that could not determine it
+    (e.g. no valid bar found) must not produce a snapshot, same as a
+    missing price or previous_close."""
+    provider = FakeProvider([make_quote(session_date=None)])
+    service = MarketDataService(provider)
+
+    snapshots = service.fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    assert snapshots == []
+
+
+def test_session_date_comes_from_the_quote_not_from_fetched_at():
+    """REGRESSION for the P1-1 session_date bug: MarketDataService must
+    use quote.session_date (the actual bar's date, as determined by the
+    provider) directly -- never recompute it from fetched_at. This test
+    deliberately sets fetched_at to a LATER calendar day than
+    session_date, exactly the scenario a provider returning the most
+    recently completed session's bars (market closed) produces."""
+    provider = FakeProvider(
+        [
+            make_quote(
+                fetched_at=datetime(2026, 9, 5, 6, 0, tzinfo=timezone.utc),  # day X
+                session_date=date(2026, 9, 4),  # day X-1 -- the bars' real day
+            )
+        ]
+    )
+    service = MarketDataService(provider)
+
+    snapshots = service.fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    assert len(snapshots) == 1
+    assert snapshots[0].session_date == date(2026, 9, 4)
+    assert snapshots[0].fetched_at.date() == date(2026, 9, 5)  # unaffected, still "now"
 
 
 def test_real_world_valid_price_volume_and_previous_close_produces_snapshot():

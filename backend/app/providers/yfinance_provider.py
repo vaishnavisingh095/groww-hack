@@ -51,7 +51,7 @@ depends on the MarketDataProvider/RawQuote abstraction in base.py.
 """
 import logging
 import math
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import yfinance as yf
 
@@ -86,7 +86,9 @@ class YFinanceProvider(MarketDataProvider):
         try:
             ticker = yf.Ticker(symbol)
 
-            last_price, volume, intraday_error = self._get_intraday_price_and_volume(ticker)
+            last_price, volume, session_date, intraday_error = self._get_intraday_price_and_volume(
+                ticker
+            )
 
             previous_close, previous_close_error = self._get_previous_close(ticker)
 
@@ -124,6 +126,7 @@ class YFinanceProvider(MarketDataProvider):
                 provider_timestamp=provider_timestamp,
                 fetched_at=fetched_at,
                 fetch_succeeded=True,
+                session_date=session_date,
             )
 
         except Exception as e:
@@ -146,19 +149,26 @@ class YFinanceProvider(MarketDataProvider):
 
     def _get_intraday_price_and_volume(
         self, ticker: "yf.Ticker"
-    ) -> tuple[float | None, int | None, str | None]:
+    ) -> tuple[float | None, int | None, date | None, str | None]:
         """
-        Fetch today's 1-minute intraday bars and derive:
+        Fetch the most recent 1-minute intraday bars and derive:
           - last_price: the latest bar with a valid (finite, positive) Close.
           - volume: the sum of every valid (finite, non-negative) Volume
-            value across today's bars -- this reconstructs cumulative
+            value across those bars -- this reconstructs cumulative
             session volume from the intraday series, since we no longer
             rely on fast_info/info's own cumulative volume field for this.
+          - session_date: the exchange-local calendar date of that SAME
+            bar (see _latest_valid_close) -- NOT derived from our own
+            fetch clock. yfinance's history(period="1d") can return the
+            most recently COMPLETED session's bars when the market is
+            closed, so the bars' own date is not guaranteed to be
+            "today."
 
-        Returns (last_price, volume, error_message). Never raises;
-        empty/malformed data results in (None, None, <reason>), which
-        the caller treats as a failed fetch for this symbol -- never a
-        fabricated price or volume.
+        Returns (last_price, volume, session_date, error_message). Never
+        raises; empty/malformed data results in
+        (None, None, None, <reason>), which the caller treats as a
+        failed fetch for this symbol -- never a fabricated price,
+        volume, or session date.
 
         Conservative handling of malformed bars: a bar with a
         NaN/inf/non-positive Close is skipped when searching for the
@@ -173,17 +183,18 @@ class YFinanceProvider(MarketDataProvider):
         try:
             bars = ticker.history(period="1d", interval="1m")
         except Exception as e:
-            return None, None, f"history() fetch failed: {type(e).__name__}: {e}"
+            return None, None, None, f"history() fetch failed: {type(e).__name__}: {e}"
 
         if bars is None or bars.empty:
-            return None, None, "history() returned no intraday bars"
+            return None, None, None, "history() returned no intraday bars"
 
         if "Close" not in bars.columns or "Volume" not in bars.columns:
-            return None, None, "history() response missing Close/Volume columns"
+            return None, None, None, "history() response missing Close/Volume columns"
 
-        last_price = self._latest_valid_close(bars)
-        if last_price is None:
-            return None, None, "no bar had a valid (finite, positive) Close"
+        latest_valid = self._latest_valid_close(bars)
+        if latest_valid is None:
+            return None, None, None, "no bar had a valid (finite, positive) Close"
+        last_price, session_date = latest_valid
 
         volume = self._sum_valid_volume(bars)
         # Note: volume can legitimately be 0 (e.g., very start of
@@ -192,20 +203,34 @@ class YFinanceProvider(MarketDataProvider):
         # the whole fetch, per the existing "missing/invalid PRICE
         # invalidates the update; volume degrades gracefully" rule
         # preserved from market_data_service.py's Invalid Data Rules.
-        return last_price, volume, None
+        return last_price, volume, session_date, None
 
     @staticmethod
-    def _latest_valid_close(bars) -> float | None:
+    def _latest_valid_close(bars) -> tuple[float, date] | None:
         """Search from the most recent bar backwards for the latest
         bar with a finite, positive Close -- does not assume the very
-        last row is automatically valid."""
-        for close in reversed(bars["Close"].tolist()):
+        last row is automatically valid.
+
+        Returns (price, session_date) from that SAME bar, not two
+        independently-sourced values: session_date must always reflect
+        the actual bar last_price came from, never a separate clock
+        reading (that decoupling was the P1-1 bug -- session_date used
+        to come from our own fetched_at instead of the data itself).
+        yfinance's intraday DatetimeIndex is already timezone-aware and
+        localized to the exchange (Asia/Kolkata for NSE), so `.date()`
+        on the bar's own timestamp gives the correct exchange-local
+        trading-session date directly -- no manual UTC/IST conversion
+        needed here.
+        """
+        closes = bars["Close"].tolist()
+        timestamps = bars.index.tolist()
+        for i in range(len(closes) - 1, -1, -1):
             try:
-                f = float(close)
+                f = float(closes[i])
             except (TypeError, ValueError):
                 continue
             if math.isfinite(f) and f > 0:
-                return f
+                return f, timestamps[i].date()
         return None
 
     @staticmethod

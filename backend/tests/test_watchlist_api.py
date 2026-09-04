@@ -47,14 +47,22 @@ class FakeProvider(MarketDataProvider):
 
 
 def make_quote(symbol: str, last_price: float, previous_close: float, volume: int = 1000) -> RawQuote:
+    now = datetime.now(timezone.utc)
     return RawQuote(
         symbol=symbol,
         last_price=last_price,
         previous_close=previous_close,
         volume=volume,
         provider_timestamp=1788509522,
-        fetched_at=datetime.now(timezone.utc),
+        fetched_at=now,
         fetch_succeeded=True,
+        # A real, provider-derived session_date is required by
+        # MarketDataService as of the session_date correctness fix (see
+        # decisions.md) -- these API-level tests aren't exercising the
+        # "bars are from a different day than our fetch time" scenario
+        # (that's covered at the provider/service level), so this
+        # simply matches fetched_at's own date.
+        session_date=now.date(),
     )
 
 
@@ -698,6 +706,7 @@ def test_get_watchlist_with_stale_snapshot_creates_no_change_event(client, monke
         provider_timestamp=1788509522,
         fetched_at=datetime.now(timezone.utc) - timedelta(seconds=300),
         fetch_succeeded=True,
+        session_date=datetime.now(timezone.utc).date(),
     )
     monkeypatch.setattr(watchlist_routes, "_provider", FakeProvider(stale_quotes))
 

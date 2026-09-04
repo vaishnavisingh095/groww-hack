@@ -1215,3 +1215,66 @@ the same underlying `ChangeEvent` data — both endpoints remain
 correctly read-only (neither creates, advances, or acknowledges
 anything), and either can be called, polled, or omitted independently
 by the frontend without affecting the other's contract.
+
+---
+
+## Decision: session_date is derived from the actual intraday bar, not from fetched_at
+
+### Problem
+`session_date` (used by the same-session volume-acceleration check in
+the Change Engine, and copied into `Checkpoint.session_date` at
+acknowledgement time) was computed as `fetched_at.date()` — our own
+backend clock — rather than the calendar date the underlying
+price/volume data actually belongs to. `yfinance`'s
+`history(period="1d", interval="1m")` can return the most recently
+COMPLETED trading session's bars when the market is closed (before
+open, after close, non-trading days), meaning a snapshot fetched
+outside market hours could carry real data from a prior session while
+being stamped with today's calendar date. Because our own same-session
+comparison (`checkpoint_session_date != current_session_date`) trusts
+`session_date` completely, this risked exactly the failure `plan.md`'s
+Hardening Priority #5 names explicitly: a checkpoint's volume from a
+prior trading day being silently treated as same-session with a later
+observation, once both happened to be (mis)labeled with the same
+fetch-time date.
+
+### Options
+- Leave `session_date` derived from `fetched_at` (the original MVP rule
+  described in this document's "Session recognition" note).
+- Derive `session_date` from the actual intraday bar `last_price` came
+  from.
+
+### Decision
+Derive `session_date` from the same bar used for `last_price`, read
+directly from that bar's own index timestamp in `YFinanceProvider` —
+yfinance's intraday history index is already timezone-localized to the
+exchange (`Asia/Kolkata` for NSE), so no separate UTC/IST conversion is
+needed. `fetched_at` is unchanged and remains the sole authoritative
+timestamp for freshness/staleness; `provider_timestamp` remains
+diagnostics-only and is not used for this either.
+
+### Why
+`session_date`'s entire purpose is to answer "which trading session
+does this observation belong to" — that question can only be answered
+correctly by the data itself, not by when our backend happened to ask
+for it. yfinance's intraday index already carries the exchange-local
+timestamp for every bar, so this is a data-plumbing correction, not a
+new provider capability or a new data source.
+
+### Trade-off
+None material — this is strictly a correctness fix to an existing
+field; no formula, threshold, checkpoint semantic, or provider choice
+changed. Closed-market yfinance response behavior itself remains
+empirically unverified from this environment (an existing, unchanged
+limitation — see the "Price/volume sourced from intraday history bars"
+decision above — not resolved by this fix).
+
+### Consequence
+`RawQuote` gained one field (`session_date: date | None`), populated
+only by the provider and propagated unchanged by `MarketDataService`
+into `MarketSnapshot.session_date` and, from there, into
+`Checkpoint.session_date` exactly as before. The same-session
+comparison logic in `change_engine.py` is unchanged — only the
+correctness of the value being compared changed. See
+`architecture.md`'s "Session recognition" note, corrected alongside
+this entry.

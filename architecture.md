@@ -284,14 +284,23 @@ checkpoint and current snapshot belong to different trading sessions):
   claim rather than fabricating one.
 
 **Session recognition**: the system must establish which trading session
-a snapshot belongs to before using cumulative-volume deltas. For the
-hackathon MVP, `session_date` is derived from `fetched_at` converted to
-IST calendar date at write time — a snapshot fetched at any point during
-NSE's trading day (9:15 AM–3:30 PM IST) is stamped with that IST
-calendar date. This is a simple, defensible rule for the MVP; it does not
-attempt to model partial/special sessions, and non-trading-day detection
-beyond calendar-date comparison is explicitly not attempted (see
-Unresolved / Out of Scope below).
+a snapshot belongs to before using cumulative-volume deltas. `session_date`
+is derived from the actual intraday bar `last_price` came from — the same
+bar the Market Data Provider used to determine the current price — not
+from our own `fetched_at` clock. yfinance's intraday history index is
+already timezone-localized to the exchange (Asia/Kolkata for NSE), so
+that bar's own date is the trading-session date directly, with no
+separate UTC/IST conversion required. (An earlier MVP implementation
+derived `session_date` from `fetched_at` converted to IST calendar date
+at write time instead; this was corrected because `history(period="1d")`
+can return the most recently completed session's bars while the market
+is closed, which could mislabel that data's actual session under the
+fetch-time approach — see decisions.md.) This remains a simple rule that
+does not attempt to model partial/special sessions, and non-trading-day
+detection beyond calendar-date comparison is explicitly not attempted
+(see Unresolved / Out of Scope below); closed-market yfinance response
+behavior itself remains empirically unverified from this environment,
+independent of this fix.
 
 **Near-market-open guard (required, untested edge case).** The live
 investigation ran during mid-session hours and did not observe a

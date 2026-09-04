@@ -16,7 +16,7 @@ keeping the provider dumb is what makes it swappable.
 """
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 
 
 @dataclass
@@ -35,6 +35,14 @@ class RawQuote:
     fetched_at: datetime  # OUR timestamp, set the instant we received this
     fetch_succeeded: bool
     error_message: str | None = None
+    # The calendar date of the actual intraday bar last_price came from
+    # (exchange-local, per the provider) -- NOT derived from fetched_at.
+    # yfinance's history(period="1d") can return the most recent
+    # COMPLETED session's bars when the market is closed, so "our fetch
+    # time" and "the trading day this data belongs to" are not
+    # guaranteed to be the same date. None only when no valid bar/price
+    # was found (fetch_succeeded=False).
+    session_date: date | None = None
 
 
 class MarketDataProvider(ABC):

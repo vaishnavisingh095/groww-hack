@@ -65,7 +65,12 @@ class MarketDataService:
         return snapshots
 
     def _assemble_snapshot(self, quote: RawQuote, instrument_id: str) -> MarketSnapshot | None:
-        if not quote.fetch_succeeded or quote.last_price is None or quote.previous_close is None:
+        if (
+            not quote.fetch_succeeded
+            or quote.last_price is None
+            or quote.previous_close is None
+            or quote.session_date is None
+        ):
             # No usable price -> no snapshot at all. Per architecture.md,
             # a missing/invalid PRICE invalidates the whole update; there
             # is nothing to persist as "invalid" here in the sense of a
@@ -83,6 +88,13 @@ class MarketDataService:
             # require either fabricating a percent_change or silently
             # treating a genuinely-unavailable value as valid, both
             # explicitly disallowed.
+            #
+            # session_date is included for the same reason: MarketSnapshot
+            # requires a real session_date (used later for the
+            # same-session volume-acceleration rule), and it is only ever
+            # populated by the provider from the actual bar last_price
+            # came from -- never fabricated here from our own clock (see
+            # decisions.md's session_date correctness fix).
             return None
 
         percent_change = MarketSnapshot.compute_percent_change(
@@ -108,7 +120,7 @@ class MarketDataService:
             previous_close=quote.previous_close,
             percent_change=percent_change,
             volume=volume,
-            session_date=quote.fetched_at.date(),
+            session_date=quote.session_date,
             fetched_at=quote.fetched_at,
             provider_timestamp=quote.provider_timestamp,
             status=status,

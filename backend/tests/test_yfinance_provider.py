@@ -20,7 +20,7 @@ Real-network verification against actual yfinance happens separately via
 manual end-to-end testing, not here.
 """
 import math
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -154,6 +154,67 @@ def test_latest_price_skips_a_zero_or_negative_trailing_close():
     assert quotes[0].last_price == 1310.0
 
 
+# ---------- 1b. session_date comes from the bar, never from our own clock ----------
+
+
+def test_session_date_comes_from_the_bar_not_from_fetched_at():
+    """REGRESSION for the P1-1 session_date bug: session_date must
+    reflect the actual intraday bar's own (exchange-local) date, never
+    our own fetch clock. make_intraday_bars fixes its index at
+    2026-09-04 regardless of when this test actually runs -- if
+    session_date were still (incorrectly) derived from fetched_at
+    (today, whatever "today" is when the suite runs), this assertion
+    would fail on any day other than 2026-09-04."""
+    bars = make_intraday_bars([(1300.0, 1000), (1310.0, 1500), (1322.0, 800)])
+    fake_ticker = make_fake_ticker(bars=bars, info={"regularMarketPreviousClose": 1302.5})
+
+    before = datetime.now(timezone.utc)
+    with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
+        quotes = YFinanceProvider().get_quotes(["RELIANCE.NS"])
+    after = datetime.now(timezone.utc)
+
+    q = quotes[0]
+    assert q.session_date == date(2026, 9, 4)  # the bars' own date
+    # fetched_at is untouched by this fix -- still our own real clock
+    # reading, independent of session_date entirely.
+    assert before <= q.fetched_at <= after
+
+
+def test_session_date_reflects_the_same_bar_used_for_last_price_across_a_day_boundary():
+    """session_date and last_price must always come from the SAME bar --
+    when trailing bars on a later calendar day are all invalid and the
+    search falls back to a valid bar on an EARLIER day, session_date
+    must reflect that earlier day, not the later (invalid) one. This is
+    the scenario a provider returning the most recently completed
+    session's bars (market closed, no new valid bars yet today) would
+    produce."""
+    earlier_day_index = pd.date_range(
+        "2026-09-04 15:28", periods=2, freq="1min", tz="Asia/Kolkata"
+    )
+    later_day_index = pd.date_range(
+        "2026-09-05 09:15", periods=2, freq="1min", tz="Asia/Kolkata"
+    )
+    index = earlier_day_index.append(later_day_index)
+    bars = pd.DataFrame(
+        {
+            "Open": [1300.0, 1310.0, float("nan"), float("nan")],
+            "High": [1300.0, 1310.0, float("nan"), float("nan")],
+            "Low": [1300.0, 1310.0, float("nan"), float("nan")],
+            "Close": [1300.0, 1310.0, float("nan"), float("nan")],  # last two bars invalid
+            "Volume": [1000, 1500, 0, 0],
+        },
+        index=index,
+    )
+    fake_ticker = make_fake_ticker(bars=bars, info={"regularMarketPreviousClose": 1290.0})
+
+    with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
+        quotes = YFinanceProvider().get_quotes(["RELIANCE.NS"])
+
+    q = quotes[0]
+    assert q.last_price == 1310.0  # the last VALID close (earlier day's second bar)
+    assert q.session_date == date(2026, 9, 4)  # the SAME bar's date, not 2026-09-05
+
+
 # ---------- 2. Cumulative volume is derived correctly ----------
 
 
@@ -212,6 +273,7 @@ def test_empty_intraday_history_produces_fetch_failed_not_exception():
     assert q.fetch_succeeded is False
     assert q.last_price is None
     assert q.volume is None
+    assert q.session_date is None
     assert "no intraday bars" in q.error_message
 
 
@@ -239,6 +301,7 @@ def test_all_bars_invalid_produces_fetch_failed_no_fabricated_price():
     q = quotes[0]
     assert q.fetch_succeeded is False
     assert q.last_price is None
+    assert q.session_date is None
     assert "no bar had a valid" in q.error_message
 
 
