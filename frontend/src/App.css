@@ -164,24 +164,60 @@ body {
   color: #60a5fa;
 }
 
-.attention-card-meta {
-  display: flex;
-  gap: 12px;
-  font-size: 0.85rem;
-  color: #aaa;
-  margin-bottom: 8px;
-}
-
 .attention-price {
   font-variant-numeric: tabular-nums;
   color: #e6e6e6;
 }
 
-.attention-explanation {
+.attention-freshness {
+  font-size: 0.78rem;
+  color: #888;
+  margin: 2px 0 0;
+}
+
+/* What changed / Why it matters / Signals -- three small, consistently
+   labeled blocks inside each card. Sized well below the card header so
+   they read as supporting detail for the (already prominent) rank/
+   symbol/pct/level badge above them, not as a second competing header. */
+.attention-block {
+  margin-bottom: 10px;
+}
+
+.attention-block-label {
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #777;
+  margin: 0 0 3px;
+}
+
+.attention-block-body {
   font-size: 0.85rem;
   color: #ccc;
-  margin: 0 0 12px;
   line-height: 1.4;
+  margin: 0;
+}
+
+.attention-signals {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  gap: 16px;
+}
+
+.attention-signal-name {
+  font-size: 0.78rem;
+  color: #888;
+  margin-right: 6px;
+}
+
+.attention-signal-value {
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: #e6e6e6;
 }
 
 .attention-card-action button {

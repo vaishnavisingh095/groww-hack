@@ -8,6 +8,20 @@ const LEVEL_LABELS = {
   watch: 'Watch',
 }
 
+// "Why it matters" copy is keyed ONLY off the backend-computed
+// attention_level bucket -- never the raw attention_score (an
+// implementation detail with no established user-facing meaning) and
+// never a specific signal (the persisted data doesn't prove which
+// signal, if only one, actually drove the classification -- see
+// decisions.md / the Change #2 inspection report). The three tiers
+// already encode "how far past meaningful" ordinally without exposing
+// the underlying number.
+const WHY_IT_MATTERS = {
+  high: 'One of the strongest moves in your watchlist right now.',
+  medium: 'A clear, meaningful move in your watchlist.',
+  watch: 'Just crossed into meaningful-change territory.',
+}
+
 function AttentionCard({ item, watchlistEntry, onMarkAsSeen, inFlight, actionError }) {
   // GET /watchlist/attention does not include current price or
   // freshness/status -- those live on GET /watchlist. Both responses
@@ -33,12 +47,55 @@ function AttentionCard({ item, watchlistEntry, onMarkAsSeen, inFlight, actionErr
         </span>
       </div>
 
-      <div className="attention-card-meta">
-        <span className="attention-price">{formatPrice(price)}</span>
-        {freshnessLabel && <span className="attention-freshness">{freshnessLabel}</span>}
+      {/* WHAT CHANGED -- the observed movement since the checkpoint.
+          price_change_pct is the since-checkpoint delta, deliberately
+          NOT watchlistEntry.percent_change (day-over-day) -- these are
+          different numbers and must not be confused. freshness_label
+          stays attached to the current price so a stale price is never
+          presented as live, even though the ChangeEvent itself was
+          detected while the data was fresh. */}
+      <div className="attention-block">
+        <p className="attention-block-label">What changed</p>
+        <p className="attention-block-body">
+          Now <span className="attention-price">{formatPrice(price)}</span> —{' '}
+          <span className={pctClass}>{formatPercentChange(item.price_change_pct)}</span> since your last
+          check.
+        </p>
+        {freshnessLabel && <p className="attention-freshness">{freshnessLabel}</p>}
       </div>
 
-      <p className="attention-explanation">{item.explanation}</p>
+      {/* WHY IT MATTERS -- priority framing from the backend-computed
+          attention_level only. No raw score, no signal attribution. */}
+      <div className="attention-block">
+        <p className="attention-block-label">Why it matters</p>
+        <p className="attention-block-body">
+          {WHY_IT_MATTERS[item.attention_level] || 'This crossed the meaningful-change threshold.'}
+        </p>
+      </div>
+
+      {/* SIGNALS -- the raw measured values only, never a per-signal
+          verdict (the persisted data doesn't prove which one, if only
+          one, actually triggered). Volume is explicit text, never a
+          fabricated 0x, when unavailable. */}
+      <div className="attention-block">
+        <p className="attention-block-label">Signals</p>
+        <ul className="attention-signals">
+          <li>
+            <span className="attention-signal-name">Price</span>
+            <span className={`attention-signal-value ${pctClass}`}>
+              {formatPercentChange(item.price_change_pct)}
+            </span>
+          </li>
+          <li>
+            <span className="attention-signal-name">Volume</span>
+            <span className="attention-signal-value">
+              {item.volume_acceleration_available
+                ? `${item.volume_acceleration_ratio.toFixed(1)}×`
+                : 'Not available'}
+            </span>
+          </li>
+        </ul>
+      </div>
 
       <div className="attention-card-action">
         <button onClick={() => onMarkAsSeen(item.instrument_id)} disabled={inFlight}>
