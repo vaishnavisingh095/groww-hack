@@ -538,3 +538,415 @@ the user's perspective.
 No added complexity for a failure mode with no meaningful downside —
 consistent with the protocol's guidance not to add concurrency handling
 without a concrete problem that requires it.
+
+---
+
+# Additional Decisions (Documentation Pass)
+
+The entries above use the original template
+(Problem/Options/Decision/Why/Trade-off/Consequence). The entries below
+document decisions already established in earlier phases but not yet
+logged here, using the template requested for this documentation pass
+(Decision/Why/Alternatives considered/Why rejected/Consequence). Both
+templates coexist in this document intentionally — this section adds
+missing coverage, it does not replace or restructure the entries above.
+
+Nothing below is a new decision being made now; each entry describes a
+decision already reflected in `plan.md`, `architecture.md`, or the
+current codebase, being captured here for the first time.
+
+## Decision: Product thesis
+
+### Decision
+The watchlist's job is to monitor meaningful changes on the user's
+behalf, so the user does not have to continuously watch prices
+themselves. The product surfaces "what changed since you last checked,"
+not a live ticking price feed.
+
+### Why
+A plain price table requires the user to supply their own attention and
+judgment about what matters. The differentiator this project is built
+around — persistent checkpoints, deterministic change detection,
+explainable reasons — only makes sense if the product's actual job is
+answering "did anything worth my attention happen," not just displaying
+numbers. This framing is stated in `plan.md`'s Problem section but had
+not been captured as its own decision entry until now.
+
+### Alternatives considered
+- A live/real-time price ticker (the user does the monitoring).
+- A portfolio tracker focused on P&L rather than change detection.
+
+### Why rejected
+A live ticker puts the burden of noticing back on the user, which is
+exactly what this project is trying to remove — it would also imply a
+real-time guarantee the provider (see below) cannot support. A P&L-focused
+tracker answers a different question ("am I up or down") than the one
+this product targets ("did something meaningful just happen").
+
+### Consequence
+Every other design choice in this log — frozen checkpoints, deterministic
+thresholds, explicit "mark as seen," honest freshness labeling — exists
+in service of this thesis. Feature requests that reintroduce
+continuous-monitoring burden on the user (e.g., a live-updating chart)
+should be checked against this thesis before being added.
+
+---
+
+## Decision: `MarketDataProvider` as a dedicated abstraction boundary
+
+### Decision
+All application code (services, routes) depends only on the
+`MarketDataProvider` interface (`get_quotes(symbols) -> list[RawQuote]`).
+No module outside `app/providers/yfinance_provider.py` imports `yfinance`
+directly.
+
+### Why
+`yfinance` is an unofficial, undocumented-endpoint wrapper (see the
+provider decision above) — a dependency with this level of uncertainty
+should not leak into business logic. Isolating it behind one interface
+means the Checkpoint Service, Change Engine, and routes never know or
+care that the data came from `yfinance` specifically; they only see
+`RawQuote` objects with clearly-defined fields (`last_price`,
+`previous_close`, `volume`, `fetched_at`, `fetch_succeeded`,
+`error_message`).
+
+### Alternatives considered
+- Call `yfinance` directly from the route handlers or services that need
+  data.
+- Wrap `yfinance` in a thin helper function without a formal interface
+  (`ABC`) contract.
+
+### Why rejected
+Direct calls would scatter `yfinance`-specific error handling and field
+names throughout the codebase, and would make swapping to a broker/paid
+provider later a multi-file rewrite instead of a single new class. A
+helper function without a formal interface would work initially but
+provides no enforced contract that a future alternative implementation
+(e.g., a broker-backed provider) must satisfy the same shape.
+
+### Consequence
+Swapping providers later means writing one new class implementing
+`MarketDataProvider` and changing one instantiation site
+(`app/routes/watchlist.py`'s `_provider = YFinanceProvider()`) — no other
+file needs to change. This was exercised in practice during testing: the
+whole test suite uses `FakeProvider` test doubles implementing the same
+interface, with zero test-specific branching in application code.
+
+---
+
+## Decision: On-demand fetch per request, not a separate background poll process (documented implementation deviation)
+
+### Decision
+The current implementation fetches live data from the provider
+synchronously inside the `GET /watchlist` request handler
+(`MarketDataService.fetch_snapshots`, called directly from
+`app/routes/watchlist.py`), rather than running a separate,
+always-on background poll loop that writes to MongoDB on a timer and
+serving reads purely from that cache.
+
+### Why
+This is flagged explicitly as a **documented deviation** from the
+"Shared poll loop" decision earlier in this log, which describes a
+background loop as the target design. The simpler on-demand approach was
+implemented first to reach a working end-to-end slice quickly (Phase 2's
+explicit goal), and has not yet been revisited.
+
+### Alternatives considered
+- The originally-decided background poll loop (a scheduled task
+  independent of any single request, writing `MarketSnapshot` documents
+  on a timer; `GET /watchlist` would only read from MongoDB).
+- The current on-demand approach (implemented).
+
+### Why the on-demand approach was used instead (not "rejected" — a
+scope/sequencing choice, not a reversal)
+Building the background loop first would have meant standing up
+scheduling infrastructure before proving the checkpoint/change-detection
+logic worked end-to-end at all. The on-demand approach reuses the exact
+same `MarketDataService`/`MarketDataProvider` abstraction the background
+loop would have used, so the eventual move to a real poll loop is an
+internal wiring change (what calls `fetch_snapshots` and when), not a
+redesign of the fetch/assembly logic itself.
+
+### Consequence — real, current trade-offs of the deviation
+- The "frontend never calls the provider directly" property still holds
+  (the frontend only ever calls our backend), but the "backend read path
+  never hits the provider directly" property from the original decision
+  does **not** currently hold — every `GET /watchlist` call makes a live
+  `yfinance` call.
+- No fan-out protection yet: N concurrent users would currently cause N
+  concurrent provider fetches for the same instruments, not one shared
+  fetch. This did not surface as a problem during single-user manual
+  testing but is a known, real gap against the original multi-user
+  design intent.
+- This should be revisited before any multi-user or higher-traffic use
+  — reintroducing the background poll loop (writing to MongoDB on a
+  timer, with `GET /watchlist` reading only from MongoDB) is the
+  documented target design to return to, not a new decision to make.
+
+---
+
+## Decision: Explicit checkpoints are never silently overwritten by implicit ones
+
+### Decision
+`CheckpointService.ensure_initial_checkpoint` only creates a checkpoint
+when none exists at all for a (user, instrument) pair. If any
+checkpoint already exists — explicit or implicit — calling it is a
+no-op. Only `CheckpointService.create_checkpoint_from_snapshot` (the
+explicit "mark as seen" primitive) ever replaces an existing checkpoint,
+and it always does so unconditionally when called.
+
+### Why
+An implicit checkpoint exists to give a first-time instrument a baseline
+without requiring the user to know a "mark as seen" action exists (see
+`plan.md`'s implicit-checkpoint scope note). It must never be allowed to
+quietly move a baseline the user (or the system, on their behalf) already
+established — doing so would violate the core invariant that a
+checkpoint represents "what the user saw at that point in time," per
+`architecture.md`'s Checkpoint design.
+
+### Alternatives considered
+- A single `create_or_update_checkpoint` method used by both explicit and
+  implicit call sites, distinguished only by a `source` parameter.
+- Always refresh the checkpoint to the latest snapshot on every
+  `GET /watchlist` call regardless of source (i.e., no distinction
+  between explicit and implicit at all).
+
+### Why rejected
+A single shared method with a `source` flag would still require the
+caller to remember never to pass `source=implicit` for an
+already-existing checkpoint — the invariant would depend on caller
+discipline rather than being structurally enforced. Always refreshing on
+every GET was rejected outright in an earlier decision in this log ("A
+checkpoint represents what the user saw... GET /watchlist must NOT
+silently advance an existing checkpoint on every request" — this
+requirement predates this specific implementation and is restated here
+because it's the direct reason `ensure_initial_checkpoint` exists as a
+structurally separate, no-op-if-exists method).
+
+### Consequence
+Two distinct methods exist specifically so the "never silently overwrite
+an existing checkpoint implicitly" rule is enforced by which method is
+called, not by a caller remembering a flag correctly. This is tested
+directly (`test_ensure_initial_checkpoint_does_not_advance_existing_checkpoint`
+and its implicit-source counterpart in `test_checkpoint_service.py`).
+
+---
+
+## Decision: Locked starting thresholds — 2.0% price / 2.0x volume acceleration
+
+### Decision
+`PRICE_CHANGE_THRESHOLD_PCT = 2.0` and `VOLUME_ACCELERATION_THRESHOLD =
+2.0` are the current, locked starting values for the two meaningful-change
+signals. Both thresholds are inclusive (`>=`, not `>`) — exactly 2.0% or
+exactly 2.0x counts as meaningful.
+
+### Why
+These were supplied as explicit, locked product decisions for the Phase
+5 Meaningful Change Engine implementation, not derived or chosen by
+engineering judgment. They are kept as named constants in
+`app/services/change_engine.py` rather than inline literals, so they are
+the first and only place to look if the demo data suggests they need
+tuning.
+
+### Alternatives considered
+None were offered as alternatives for this decision — the exact values
+were supplied as a locked decision. (The earlier decision in this log,
+"Meaningful-change signals for the hackathon build," did independently
+arrive at a 2% starting value with its own reasoning about typical
+large-cap volatility, before this value was later locked explicitly — the
+two are consistent, not in conflict.)
+
+### Consequence
+A `volume_acceleration_ratio` (or `price_change_pct`) can additionally be
+`None`/unavailable rather than simply "below threshold" — the engine
+distinguishes "evaluated and below 2.0x" from "could not be evaluated at
+all" (e.g., cross-session checkpoint, near-market-open guard, missing
+timing data). This distinction is what lets a price-only meaningful
+change be reported correctly even when the volume signal cannot be
+computed, per the Phase 5 requirement that price signal alone is
+sufficient.
+
+---
+
+## Decision: No microservices, queues, Redis, Kafka, WebSockets, Kubernetes, or LLM in the core detection path
+
+### Decision
+The system is one FastAPI backend, one MongoDB database, and a React
+frontend. The core meaningful-change detection path (Checkpoint Service,
+Market Data Service, Change Engine) contains no message queue, no cache
+layer, no container-orchestration dependency, no real-time push
+transport, and no LLM call.
+
+### Why
+None of these were ever required by a concrete, demonstrated problem —
+the actual scale (a handful of users, a handful of instruments, a
+60-second freshness target) does not need infrastructure sized for a
+much larger system. A composite/LLM-based change score was separately
+rejected because the product's explainability requirement depends on a
+score a user (or judge) can verify against the raw numbers, which an LLM
+call cannot guarantee (see "No LLM in the core meaningful-change or
+attention logic" above).
+
+### Alternatives considered
+- Redis for caching market snapshots between polls.
+- A message queue (Kafka or similar) between the poll/fetch step and
+  checkpoint/change-detection processing.
+- WebSockets/SSE for pushing live updates to the frontend instead of
+  polling.
+- Splitting the backend into separate services (e.g., a standalone
+  "market data service" and a "checkpoint service" as independent
+  deployables).
+
+### Why rejected
+Redis would cache data that MongoDB already persists at the same
+freshness granularity — no measured latency problem exists that a second
+storage layer would solve. A queue would decouple two steps
+(fetch, detect) that currently run in a single request/response cycle
+with no throughput problem to justify the added operational complexity.
+WebSockets/SSE were rejected in an earlier decision in this log because
+the underlying data only refreshes every ~60 seconds regardless of
+transport — push infrastructure on top of non-real-time data would be
+misleading, not just unnecessary. Splitting into separate deployable
+services would introduce network calls and deployment coordination for
+communication that is currently a single in-process Python function call.
+
+### Consequence
+Every added dependency in this project has to be justified against a
+concrete, demonstrated need (per the engineering protocol governing this
+project) rather than adopted because it is common practice elsewhere.
+Revisiting any of these (e.g., introducing a real background poll loop,
+per the on-demand-fetch deviation documented above) should be evaluated
+the same way — a specific, named problem first, then the smallest
+sufficient tool for it.
+
+---
+
+## Decision: Price/volume sourced from intraday history bars, not fast_info
+
+### Decision
+`YFinanceProvider` now derives `last_price` and `volume` from
+`ticker.history(period="1d", interval="1m")` — the latest bar with a
+valid Close for price, and the sum of all valid per-minute Volume values
+for cumulative session volume — instead of `fast_info.last_price` /
+`fast_info.last_volume`. `previous_close` is unaffected by this decision
+and continues to come from `info["regularMarketPreviousClose"]`, with
+`fast_info.previous_close` as a fallback (see the separate decision
+below on why that priority order is what it is).
+
+### Why
+Direct runtime evidence on the actual Mac execution environment (not
+this sandbox, which cannot reach Yahoo Finance) showed
+`fast_info.last_price` and `fast_info.last_volume` returning the exact
+same values across three reads taken ten seconds apart during live NSE
+market hours. `history(period="1d", interval="1m")` for the same symbol
+at the same time returned real, distinct bars with changing prices and
+per-minute volumes. `fast_info.last_price`'s own implementation confirms
+why: it derives from a 1-year DAILY-interval history call, not live
+intraday data, so it does not refresh on a timescale usable for
+intraday change detection. This is a genuine data-source limitation
+discovered empirically, not assumed in advance.
+
+### Alternatives considered
+- Keep `fast_info` for price/volume and accept its refresh cadence as a
+  known limitation.
+- Use `info["regularMarketPrice"]` / `info["regularMarketVolume"]`
+  instead of `fast_info` (these were already the existing fallback
+  fields).
+- Use `history(period="1d", interval="1m")`'s latest valid Close/summed
+  Volume (chosen).
+
+### Why rejected
+Accepting `fast_info`'s refresh cadence was rejected because it directly
+undermines the product's core mechanism — a checkpoint-vs-current
+comparison is meaningless if "current" can be identical to what was
+captured seconds or minutes earlier purely due to a caching/derivation
+artifact, not real market inactivity. `info["regularMarketPrice"]` /
+`info["regularMarketVolume"]` were not separately verified to refresh
+faster than `fast_info` in the same diagnostic and were not chosen
+without that verification, per the standing rule not to swap one
+unverified source for another.
+
+### Consequence
+`MarketDataProvider` and `RawQuote` (the abstraction boundary) are
+unchanged — this fix is entirely internal to `YFinanceProvider`. Bars
+with a non-finite or non-positive Close are skipped when searching for
+the latest valid price (never assuming the most recent bar is
+automatically usable); bars with a non-finite or negative Volume are
+excluded from the sum rather than zeroing out or aborting the whole
+calculation. An empty or malformed intraday response now fails the
+fetch for that symbol explicitly (`fetch_succeeded=False`, with the real
+reason in `error_message`) rather than falling through to a stale
+daily-derived value.
+
+### Verified session-boundary behavior (empirical, not assumed)
+A separate, standalone diagnostic script (not part of the provider or
+test suite) was run directly on the Mac execution environment against
+live RELIANCE.NS data:
+
+```
+timezone: Asia/Kolkata
+first timestamp: 2026-09-04 09:15:00+05:30
+last timestamp: 2026-09-04 15:15:00+05:30
+number of bars: 361
+Bars outside 09:15-15:30 IST: count: 0
+```
+
+This confirms, for this real run, that `history(period="1d",
+interval="1m")` returned bars starting exactly at NSE's regular-session
+open (09:15 IST) with zero bars outside the 09:15–15:30 IST regular
+session window — no pre-market or post-market bars were present.
+`yfinance`'s own source code contains an explicit post-fetch filtering
+step (`fix_Yahoo_returning_prepost_unrequested`) whose own comment states
+Yahoo's raw feed can return pre/post-market bars unrequested, which this
+filter is designed to remove using the exchange's own reported session
+boundaries. This one real run is consistent with that filter working
+correctly for RELIANCE.NS; it is evidence from a single symbol on a
+single day, not a guarantee validated across all instruments, dates, or
+market conditions (e.g., half-day sessions, which the filter's own
+source comment specifically calls out as a known trigger for the
+behavior it corrects).
+
+---
+
+## Decision: previous_close primary/fallback order — info first, fast_info second
+
+### Decision
+`previous_close` is sourced from `info["regularMarketPreviousClose"]` as
+the primary source, with `fast_info.previous_close` as a fallback only
+if `info` does not supply it. This is the reverse priority from an
+earlier revision, which tried `fast_info.previous_close` first with
+`info["regularMarketPreviousClose"]` as its fallback.
+
+### Why
+Real Mac runtime evidence (documented earlier in this log, under the
+initial `previous_close` bug) showed `fast_info.previous_close` can
+legitimately return `None` even when `fast_info.last_price` and
+`fast_info.last_volume` succeed, because it depends on a separate,
+independently-fragile weekly pre/post-market history lookup internally.
+The same evidence confirmed `info["regularMarketPreviousClose"]`
+correctly held the real prior session's close in that exact failing
+case. Once price/volume stopped depending on `fast_info` at all (the
+decision above), there was no remaining reason to keep `fast_info` as
+the primary source for this one field either — the source already
+confirmed more reliable was promoted to primary.
+
+### Alternatives considered
+- Keep the prior fast_info-first, info-second order unchanged.
+- Swap to info-first, fast_info-second (chosen).
+- Drop the `fast_info` fallback entirely now that price/volume no
+  longer depend on `fast_info` for anything.
+
+### Why rejected
+Keeping the prior order was rejected because it was never demonstrated
+to be the more reliable order — it was only ever the initial guess
+before `info`'s reliability was separately confirmed. Dropping the
+`fast_info` fallback entirely was not chosen because no evidence has
+shown `info["regularMarketPreviousClose"]` to be reliable in every
+case; keeping a real, working fallback costs nothing and preserves the
+existing degrade-gracefully behavior for previous_close specifically.
+
+### Consequence
+No change to what `previous_close` ultimately resolves to in the cases
+already tested (both sources still checked, in the same conditions as
+before) — only the order in which they are tried changed, based on
+which one is now known to be more reliable.

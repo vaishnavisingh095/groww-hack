@@ -436,7 +436,7 @@ def test_implicit_checkpoint_resolves_on_next_request_not_the_current_one(client
     first = test_client.get("/watchlist").json()
     reliance_first = next(i for i in first["instruments"] if i["symbol"] == "RELIANCE")
     assert reliance_first["change"]["has_baseline"] is False
-    assert "Baseline created" in reliance_first["change"]["reason"]
+    assert "Baseline pending" in reliance_first["change"]["reason"]
 
     # The implicit checkpoint now exists in the database...
     assert mock_db.checkpoints.count_documents({"instrument_id": reliance_first["instrument_id"]}) == 1
