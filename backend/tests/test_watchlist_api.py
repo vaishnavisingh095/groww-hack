@@ -22,6 +22,7 @@ import app.routes.watchlist as watchlist_routes
 from app.db.indexes import ensure_indexes
 from app.main import app
 from app.providers.base import MarketDataProvider, RawQuote
+from app.services.change_engine import PRICE_CHANGE_THRESHOLD_PCT
 
 
 class FakeProvider(MarketDataProvider):
@@ -723,3 +724,126 @@ def test_get_watchlist_with_unavailable_snapshot_creates_no_change_event(client,
     test_client.get("/watchlist")
 
     assert mock_db.change_events.count_documents({}) == 0
+
+
+# --- GET /watchlist/attention (Attention Engine API integration) -----------
+
+
+def test_get_attention_returns_empty_list_when_no_active_events(client):
+    """Empty state must be a normal 200, not an error."""
+    test_client, _ = client
+
+    response = test_client.get("/watchlist/attention")
+
+    assert response.status_code == 200
+    assert response.json() == {"attention_items": []}
+
+
+def test_get_attention_includes_item_for_meaningful_change_with_correct_fields(
+    client, monkeypatch
+):
+    """Covers: meaningful change appears, correct symbol, correct score,
+    correct level, correct explanation, null volume_acceleration_ratio
+    when unavailable, ISO-format detected_at, lowercase attention_level
+    string, end-to-end symbol resolution."""
+    test_client, mock_db = client
+
+    first = test_client.get("/watchlist").json()
+    reliance = next(i for i in first["instruments"] if i["symbol"] == "RELIANCE")
+    instrument_id = reliance["instrument_id"]
+
+    test_client.post(f"/watchlist/instruments/{instrument_id}/checkpoint")  # baseline @ 1326.4, volume 9122871
+    checkpoint = mock_db.checkpoints.find_one({"instrument_id": instrument_id})
+
+    # Volume LOWER than the checkpoint's baseline deterministically trips
+    # change_engine.py's non-monotonic/bad-data guard, marking the volume
+    # signal unavailable regardless of real wall-clock time (unlike a
+    # cross-session gap, which would depend on when the suite happens to
+    # run relative to market open/midnight IST).
+    quotes = _quotes_with_reliance_price(1400.0)
+    quotes["RELIANCE.NS"] = make_quote("RELIANCE.NS", 1400.0, 1302.6, 9000000)
+    monkeypatch.setattr(watchlist_routes, "_provider", FakeProvider(quotes))
+    test_client.get("/watchlist")  # creates the active ChangeEvent
+
+    response = test_client.get("/watchlist/attention")
+    assert response.status_code == 200
+    items = response.json()["attention_items"]
+    assert len(items) == 1
+    item = items[0]
+
+    assert item["instrument_id"] == instrument_id
+    assert item["symbol"] == "RELIANCE"
+    assert item["checkpoint_id"] == checkpoint["id"]
+
+    # ISO-format string, not a bare/epoch timestamp -- must round-trip.
+    assert isinstance(item["detected_at"], str)
+    datetime.fromisoformat(item["detected_at"])
+
+    expected_pct = (1400.0 - 1326.4) / 1326.4 * 100
+    assert item["price_change_pct"] == pytest.approx(expected_pct, abs=1e-3)
+
+    # No volume data was given -> must be null, not omitted, not 0.
+    assert item["volume_acceleration_ratio"] is None
+    assert item["volume_acceleration_available"] is False
+
+    expected_score = abs(expected_pct) / PRICE_CHANGE_THRESHOLD_PCT
+    assert item["attention_score"] == pytest.approx(expected_score, abs=1e-3)
+
+    # Lowercase string, never a Python Enum repr like "AttentionLevel.HIGH".
+    assert item["attention_level"] == "high"
+    assert isinstance(item["attention_level"], str)
+
+    assert item["explanation"] == "RELIANCE moved +5.5% since your last check."
+    assert item["rank"] == 1
+
+
+def test_get_attention_excludes_acknowledged_events(client, monkeypatch):
+    test_client, _ = client
+
+    first = test_client.get("/watchlist").json()
+    reliance = next(i for i in first["instruments"] if i["symbol"] == "RELIANCE")
+    instrument_id = reliance["instrument_id"]
+
+    test_client.post(f"/watchlist/instruments/{instrument_id}/checkpoint")
+    monkeypatch.setattr(
+        watchlist_routes, "_provider", FakeProvider(_quotes_with_reliance_price(1400.0))
+    )
+    test_client.get("/watchlist")  # creates the active ChangeEvent
+
+    assert test_client.get("/watchlist/attention").json()["attention_items"] != []
+
+    # Explicit re-acknowledgement at the new price supersedes it.
+    test_client.post(f"/watchlist/instruments/{instrument_id}/checkpoint")
+
+    assert test_client.get("/watchlist/attention").json() == {"attention_items": []}
+
+
+def test_get_attention_orders_multiple_instruments_by_descending_score(client, monkeypatch):
+    test_client, _ = client
+
+    first = test_client.get("/watchlist").json()
+    reliance = next(i for i in first["instruments"] if i["symbol"] == "RELIANCE")
+    tcs = next(i for i in first["instruments"] if i["symbol"] == "TCS")
+    reliance_id = reliance["instrument_id"]
+    tcs_id = tcs["instrument_id"]
+
+    test_client.post(f"/watchlist/instruments/{reliance_id}/checkpoint")  # baseline @ 1326.4
+    test_client.post(f"/watchlist/instruments/{tcs_id}/checkpoint")  # baseline @ 2312.8
+
+    monkeypatch.setattr(
+        watchlist_routes,
+        "_provider",
+        FakeProvider(
+            {
+                **_quotes_with_reliance_price(1360.0),  # ~2.5% -> weaker meaningful move
+                "TCS.NS": make_quote("TCS.NS", 2500.0, 2320.0, 1722049),  # ~8.1% -> stronger
+            }
+        ),
+    )
+    test_client.get("/watchlist")  # creates both active ChangeEvents
+
+    items = test_client.get("/watchlist/attention").json()["attention_items"]
+
+    assert [item["symbol"] for item in items] == ["TCS", "RELIANCE"]
+    assert [item["rank"] for item in items] == [1, 2]
+    assert items[0]["attention_score"] > items[1]["attention_score"]

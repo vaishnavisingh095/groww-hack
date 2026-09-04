@@ -1160,3 +1160,58 @@ alongside the pre-existing `user_acknowledged_lookup` index (kept,
 unchanged — still the correct shape for a future Attention Engine's
 "active events for this user" query). See
 `test_db_indexes.py`'s new duplicate-rejection tests.
+
+---
+
+## Decision: Attention Engine exposed as its own endpoint, not embedded in GET /watchlist
+
+### Problem
+`architecture.md`'s illustrative `GET /watchlist` response (written
+before either the ChangeEvent-persistence or Attention Engine
+milestones existed) embeds an `active_change` object with
+`attention_rank` inline, per instrument — implying attention ranking
+was originally envisioned as part of the same response. By the time the
+Attention Engine (`AttentionEngine.get_ranked_active_items`) was built
+and approved, the real question was whether to now retrofit that
+original inline shape into `GET /watchlist`, or expose it as a
+separate read.
+
+### Options
+- Extend `GET /watchlist`'s existing response with an embedded
+  `active_change`/`attention_rank` field per instrument, matching
+  `architecture.md`'s original illustration.
+- A new, separate endpoint (`GET /watchlist/attention`) that calls
+  `AttentionEngine` independently.
+
+### Decision
+A separate endpoint: `GET /watchlist/attention`, returning
+`{"attention_items": [...]}`.
+
+### Why
+Modifying `GET /watchlist`'s response shape would be a breaking change
+to an already-committed, already-tested contract (multiple existing
+tests assert its exact key set), with no corresponding frontend change
+in scope for this milestone. `AttentionEngine` does its own MongoDB
+round-trip per active event (symbol resolution) — running it
+unconditionally on every `GET /watchlist` call would add cost to the
+highest-traffic read path for a value nothing yet consumes there. This
+also keeps the API surface aligned with the same separation already
+established for the underlying logic ("Keep Change Detection separate
+from Attention Ranking... do not fold ranking logic into the Change
+Engine or vice versa") — extended here to mean their API surfaces stay
+separable too, until a concrete frontend requirement forces a merge.
+
+### Trade-off
+The actual `GET /watchlist` response no longer matches
+`architecture.md`'s original illustrative shape for this field (it
+never did carry `active_change`/`attention_rank` even before this
+decision — that illustration was always aspirational, not yet
+implemented). This is a known, disclosed documentation/implementation
+gap, not a new one introduced by this decision.
+
+### Consequence
+`GET /watchlist/attention` is a second, independent read endpoint over
+the same underlying `ChangeEvent` data — both endpoints remain
+correctly read-only (neither creates, advances, or acknowledges
+anything), and either can be called, polled, or omitted independently
+by the frontend without affecting the other's contract.

@@ -16,6 +16,7 @@ from pymongo.database import Database
 from app.db.connection import get_database
 from app.models.market_snapshot import SnapshotStatus
 from app.providers.yfinance_provider import YFinanceProvider
+from app.services.attention_engine import AttentionEngine
 from app.services.change_engine import evaluate_change
 from app.services.change_event_service import ChangeEventService
 from app.services.checkpoint_service import CheckpointService
@@ -209,6 +210,43 @@ def get_watchlist() -> dict:
         )
 
     return {"instruments": results}
+
+
+@router.get("/watchlist/attention")
+def get_attention() -> dict:
+    """
+    Ranked, active (unacknowledged) attention items for the demo user --
+    the Attention Engine (Phase 6) exposed read-only. Pure computation
+    over already-persisted ChangeEvents; like GET /watchlist, this
+    endpoint never creates, advances, or acknowledges anything -- it
+    only reads.
+
+    No query parameters: mirrors GET /watchlist, and per the approved
+    integration scope this endpoint deliberately does not add
+    pagination, caching, or auth beyond the existing DEMO_USER_ID
+    convention used everywhere else in this router.
+    """
+    db = get_database()
+    items = AttentionEngine(db).get_ranked_active_items(DEMO_USER_ID)
+
+    return {
+        "attention_items": [
+            {
+                "instrument_id": item.instrument_id,
+                "symbol": item.symbol,
+                "checkpoint_id": item.checkpoint_id,
+                "detected_at": item.detected_at.isoformat(),
+                "price_change_pct": item.price_change_pct,
+                "volume_acceleration_ratio": item.volume_acceleration_ratio,
+                "volume_acceleration_available": item.volume_acceleration_available,
+                "attention_score": item.attention_score,
+                "attention_level": item.attention_level.value,
+                "explanation": item.explanation,
+                "rank": item.rank,
+            }
+            for item in items
+        ]
+    }
 
 
 @router.post("/watchlist/instruments/{instrument_id}/checkpoint")
