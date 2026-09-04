@@ -60,19 +60,20 @@ def get_watchlist() -> dict:
     instrument against its checkpoint (if any), and return clean domain
     JSON for the frontend.
 
-    Checkpoint handling on this read path:
-    - An EXISTING checkpoint is NEVER advanced or replaced here -- only
-      read, for comparison. This is what "mark as seen" is for.
-    - If NO checkpoint exists yet for a (user, instrument) pair, an
-      IMPLICIT one is established from the current snapshot (per
-      architecture.md, hard question G), so the instrument has a
-      baseline for future comparisons. Per that same design note ("...
-      resolves this state on the instrument's next poll cycle"), THIS
-      request still reports has_baseline=False for that instrument --
-      the comparison below is evaluated against what existed BEFORE the
-      implicit checkpoint was created, not after. The next GET
-      /watchlist call will see the checkpoint and compare against it
-      normally.
+    Checkpoint handling on this read path (per the checkpoint semantics
+    contract): opening the app, rendering, or refreshing is NEVER
+    acknowledgement. This endpoint is READ-ONLY with respect to
+    checkpoint state -- it never creates, replaces, or otherwise writes
+    a Checkpoint document, implicitly or otherwise.
+    - An EXISTING checkpoint is read for comparison only, never
+      advanced or replaced here. This is what the explicit "mark as
+      seen" endpoints are for.
+    - If NO checkpoint exists yet for a (user, instrument) pair, the
+      instrument reports has_baseline=False ("baseline pending") and no
+      change comparison is run. No checkpoint is created to resolve
+      this on a later request -- only an explicit acknowledgement
+      (POST /watchlist/checkpoint or
+      POST /watchlist/instruments/{id}/checkpoint) can do that.
     """
     db = get_database()
     instruments = ensure_seed_instruments(db)
@@ -98,10 +99,10 @@ def get_watchlist() -> dict:
             # fabricate data, report unavailable. (This slice has no
             # "last known good" persistence for snapshots yet -- see
             # Known Limitations in the implementation report.) An
-            # invalid/unavailable snapshot must never become a baseline,
-            # implicit or otherwise -- there is nothing here to
-            # checkpoint against, so ensure_initial_checkpoint is
-            # correctly never called in this branch.
+            # invalid/unavailable snapshot must never create or advance
+            # checkpoint state -- there is nothing here to checkpoint
+            # against, and this read path never writes a checkpoint
+            # regardless.
             results.append(
                 {
                     "instrument_id": instrument_id,
@@ -125,10 +126,9 @@ def get_watchlist() -> dict:
             )
             continue
 
-        # Read the EXISTING checkpoint (if any) BEFORE potentially
-        # creating an implicit one -- the comparison below must reflect
-        # what the user actually saw last time, not a baseline we are
-        # establishing this very request.
+        # Read-only: this endpoint never creates or advances a
+        # checkpoint. If none exists, the comparison below correctly
+        # falls back to the no-baseline branch.
         checkpoint = checkpoint_service.get_checkpoint(DEMO_USER_ID, instrument_id)
 
         if checkpoint is not None:
@@ -148,15 +148,6 @@ def get_watchlist() -> dict:
             # args that don't apply to a nonexistent baseline.
             change_result = evaluate_change(
                 checkpoint_price=None, current_price=snapshot.last_price
-            )
-
-        if checkpoint is None:
-            # No prior checkpoint existed -- establish the implicit
-            # baseline now so the NEXT request has something to compare
-            # against. This does not affect change_result above, which
-            # was already computed against the absence of a checkpoint.
-            checkpoint_service.ensure_initial_checkpoint(
-                DEMO_USER_ID, instrument_id, snapshot
             )
 
         label, age_seconds = _status_label(snapshot.status, snapshot.fetched_at)

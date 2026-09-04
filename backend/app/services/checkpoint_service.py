@@ -1,17 +1,18 @@
 """
 Checkpoint Service.
 
-Owns reading/writing Checkpoint documents. Supports both advancement
-mechanisms from architecture.md:
-- EXPLICIT: the user's own "mark as seen" action (single instrument or
-  whole watchlist) -- always advances/replaces the existing checkpoint.
-- IMPLICIT: automatic initial baseline establishment the first time an
-  instrument has a valid snapshot but no checkpoint yet for this user
-  (architecture.md, hard question G: "creates an implicit checkpoint on
-  first sight, which resolves this state on the instrument's next poll
-  cycle"). This NEVER advances/replaces an existing checkpoint -- it
-  only fires when none exists at all. This is what keeps GET /watchlist
-  from silently moving a baseline the user has already seen.
+Owns reading/writing Checkpoint documents.
+
+Per the checkpoint semantics contract, a Checkpoint represents the
+user's ACKNOWLEDGED market state, and the only thing that may create or
+advance one is an explicit user action ("mark as seen" -- single
+instrument or whole watchlist), via create_checkpoint_from_snapshot.
+Opening the app, rendering, polling, or refreshing (GET /watchlist)
+must never create or advance a checkpoint -- see app/routes/watchlist.py.
+
+ensure_initial_checkpoint (IMPLICIT baseline creation) is intentionally
+retained below but is no longer called from any read path -- see its
+own docstring for why it still exists unused.
 """
 from datetime import datetime, timezone
 
@@ -48,7 +49,6 @@ class CheckpointService:
 
         Never call this from a read path (e.g. GET /watchlist) -- doing
         so would silently move the user's baseline without their action.
-        Use ensure_initial_checkpoint for the read-path/implicit case.
         """
         return self._write_checkpoint(
             user_id, instrument_id, snapshot, CheckpointSource.EXPLICIT
@@ -59,25 +59,27 @@ class CheckpointService:
     ) -> Checkpoint | None:
         """
         Establish an IMPLICIT baseline only if no checkpoint exists yet
-        for this (user, instrument) pair. Per architecture.md (hard
-        question G): "if no Checkpoint exists ... the Checkpoint Service
-        creates an implicit checkpoint on first sight, which resolves
-        this state on the instrument's next poll cycle."
+        for this (user, instrument) pair.
+
+        NOT CALLED from any production code path as of the checkpoint
+        semantics fix (see decisions.md): GET /watchlist previously
+        called this on first sight of an instrument, but doing so meant
+        a mere page load/refresh could establish state that the very
+        next read would then treat as an acknowledged comparison
+        baseline -- opening the app is not acknowledgement. The method
+        is kept, unused, rather than deleted: it is a correct, isolated,
+        well-tested primitive (create-if-absent, never advances an
+        existing checkpoint) with no incorrect behavior of its own -- the
+        bug was calling it from a read path, not the method itself.
+        Removing it would mean deleting tested behavior and the
+        CheckpointSource.IMPLICIT distinction it exists to exercise,
+        which is a separate cleanup decision from the read-path fix this
+        change makes.
 
         Returns the newly created Checkpoint if one was created, or None
         if a checkpoint already existed (in which case nothing is
         touched -- this method NEVER advances or replaces an existing
-        checkpoint, which is what distinguishes it from
-        create_checkpoint_from_snapshot and is exactly what makes it
-        safe to call from a read path like GET /watchlist).
-
-        Because this checkpoint is created using the CURRENT request's
-        snapshot, the comparison for THIS same request still correctly
-        shows "no baseline" (the caller should compare against whatever
-        get_checkpoint returned before this call, not after) -- the
-        newly-created checkpoint only takes effect starting from the
-        next request, matching "resolves this state on the instrument's
-        next poll cycle" precisely.
+        checkpoint).
         """
         existing = self.get_checkpoint(user_id, instrument_id)
         if existing is not None:
