@@ -70,6 +70,19 @@ class MarketDataService:
             # a missing/invalid PRICE invalidates the whole update; there
             # is nothing to persist as "invalid" here in the sense of a
             # bad-but-present value -- we simply have nothing new.
+            #
+            # previous_close is included in this check because
+            # MarketSnapshot requires a real previous_close to compute
+            # percent_change (see MarketSnapshot.compute_percent_change
+            # and decisions.md's "never trust a provider percent field"
+            # rule) -- there is no meaningful percent_change without it.
+            # A provider that cannot supply previous_close through any of
+            # its own supported fallbacks (see YFinanceProvider) results
+            # in no snapshot here, same as a missing price. This is NOT
+            # weakened to accept a None previous_close: doing so would
+            # require either fabricating a percent_change or silently
+            # treating a genuinely-unavailable value as valid, both
+            # explicitly disallowed.
             return None
 
         percent_change = MarketSnapshot.compute_percent_change(

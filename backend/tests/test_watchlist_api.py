@@ -147,7 +147,7 @@ def test_mark_as_seen_persists_checkpoint_and_read_reflects_it(client):
     reliance = next(i for i in response.json()["instruments"] if i["symbol"] == "RELIANCE")
     instrument_id = reliance["instrument_id"]
 
-    checkpoint_response = test_client.post(f"/watchlist/{instrument_id}/checkpoint")
+    checkpoint_response = test_client.post(f"/watchlist/instruments/{instrument_id}/checkpoint")
     assert checkpoint_response.status_code == 200
     body = checkpoint_response.json()
     assert body["symbol"] == "RELIANCE"
@@ -159,27 +159,56 @@ def test_mark_as_seen_persists_checkpoint_and_read_reflects_it(client):
     assert doc["baseline_snapshot"]["last_price"] == 1326.4
 
 
-def test_getting_watchlist_never_creates_a_checkpoint(client):
-    """CRITICAL: opening/refreshing the watchlist must NEVER silently
-    create or advance a checkpoint."""
+def test_getting_watchlist_creates_implicit_baseline_but_never_advances_it(client):
+    """
+    CRITICAL: opening/refreshing the watchlist correctly establishes an
+    IMPLICIT baseline the first time (per architecture.md, hard question
+    G), but must NEVER advance/replace an existing checkpoint on
+    subsequent requests. This test's earlier version asserted zero
+    checkpoints were ever created by GET -- that was correct for the
+    prior slice (which had not yet implemented implicit checkpoints) but
+    is now the wrong expectation: implicit checkpoint creation on first
+    sight is required behavior, not a bug. What must remain true is that
+    once a checkpoint exists, GET never touches it again.
+    """
     test_client, mock_db = client
 
+    # First GET: no checkpoints exist yet -> implicit baselines created
+    # for every instrument with a valid snapshot.
     test_client.get("/watchlist")
+    count_after_first = mock_db.checkpoints.count_documents({})
+    assert count_after_first == 5  # all 5 seed instruments have valid fake quotes
+
+    checkpoints_after_first = list(mock_db.checkpoints.find({}))
+    first_prices = {c["instrument_id"]: c["baseline_snapshot"]["last_price"] for c in checkpoints_after_first}
+    assert all(c["source"] == "implicit" for c in checkpoints_after_first)
+
+    # Second and third GET: checkpoints already exist -> must NOT be
+    # replaced, count must not change, and baseline prices must be
+    # untouched even though the (fake) provider always returns the same
+    # price here -- the real assertion is about count and source, since
+    # a same-price replace would be invisible by price alone.
     test_client.get("/watchlist")
     test_client.get("/watchlist")
 
-    assert mock_db.checkpoints.count_documents({}) == 0
+    count_after_more_gets = mock_db.checkpoints.count_documents({})
+    assert count_after_more_gets == 5  # unchanged -- no new or duplicate checkpoints
+
+    checkpoints_after_more = list(mock_db.checkpoints.find({}))
+    later_prices = {c["instrument_id"]: c["baseline_snapshot"]["last_price"] for c in checkpoints_after_more}
+    assert later_prices == first_prices  # untouched
+    assert all(c["source"] == "implicit" for c in checkpoints_after_more)  # still implicit, never overwritten by anything
 
 
 def test_mark_as_seen_on_nonexistent_instrument_returns_404(client):
     test_client, _ = client
-    response = test_client.post("/watchlist/000000000000000000000000/checkpoint")
+    response = test_client.post("/watchlist/instruments/000000000000000000000000/checkpoint")
     assert response.status_code == 404
 
 
 def test_mark_as_seen_with_malformed_instrument_id_returns_400(client):
     test_client, _ = client
-    response = test_client.post("/watchlist/not-a-valid-object-id/checkpoint")
+    response = test_client.post("/watchlist/instruments/not-a-valid-object-id/checkpoint")
     assert response.status_code == 400
 
 
@@ -236,7 +265,7 @@ def test_meaningful_change_flows_through_full_api_after_checkpoint(client):
     reliance = next(i for i in response.json()["instruments"] if i["symbol"] == "RELIANCE")
     instrument_id = reliance["instrument_id"]
 
-    test_client.post(f"/watchlist/{instrument_id}/checkpoint")
+    test_client.post(f"/watchlist/instruments/{instrument_id}/checkpoint")
 
     # Directly verify the persisted checkpoint price -- simulating "a
     # later refresh with a different real price" would require changing
@@ -245,3 +274,176 @@ def test_meaningful_change_flows_through_full_api_after_checkpoint(client):
     # confirms the API wiring itself: checkpoint -> stored -> readable.
     checkpoint_doc = mock_db.checkpoints.find_one({"instrument_id": instrument_id})
     assert checkpoint_doc["baseline_snapshot"]["last_price"] == 1326.4
+
+
+def test_mark_as_seen_stores_frozen_baseline_not_a_snapshot_reference(client):
+    """Per architecture.md: the checkpoint must store a FROZEN COPY of
+    the values, not merely a reference to a MarketSnapshot document
+    (which is overwritten on every poll cycle). Confirms the persisted
+    checkpoint document itself carries real price/volume/percent_change
+    values, not an id pointing elsewhere."""
+    test_client, mock_db = client
+
+    response = test_client.get("/watchlist")
+    reliance = next(i for i in response.json()["instruments"] if i["symbol"] == "RELIANCE")
+    instrument_id = reliance["instrument_id"]
+
+    test_client.post(f"/watchlist/instruments/{instrument_id}/checkpoint")
+
+    doc = mock_db.checkpoints.find_one({"instrument_id": instrument_id})
+    baseline = doc["baseline_snapshot"]
+    # These are real, frozen numeric values in the checkpoint document
+    # itself -- not a foreign key/reference to market_snapshots.
+    assert isinstance(baseline["last_price"], (int, float))
+    assert isinstance(baseline["volume"], int)
+    assert isinstance(baseline["percent_change"], (int, float))
+    assert "snapshot_id" not in doc  # no reference-style field exists
+
+
+def test_mark_as_seen_for_instrument_with_unavailable_data_returns_503(client, monkeypatch):
+    """FAILURE HANDLING: if the current market data is unavailable for
+    this instrument, mark-as-seen must fail explicitly (503) rather than
+    fabricate a checkpoint from missing/invalid data, and must leave any
+    existing checkpoint completely untouched."""
+    test_client, mock_db = client
+
+    response = test_client.get("/watchlist")
+    reliance = next(i for i in response.json()["instruments"] if i["symbol"] == "RELIANCE")
+    instrument_id = reliance["instrument_id"]
+
+    # The GET above already created an implicit checkpoint (working fake
+    # data) -- capture its state so we can confirm it's untouched below.
+    checkpoint_before = mock_db.checkpoints.find_one({"instrument_id": instrument_id})
+    assert checkpoint_before is not None
+    price_before = checkpoint_before["baseline_snapshot"]["last_price"]
+
+    # Now swap in a provider that has no data for anyone, and attempt an
+    # explicit mark-as-seen -- this must fail, not fabricate a new
+    # baseline and not touch the existing one.
+    monkeypatch.setattr(watchlist_routes, "_provider", FakeProvider({}))
+
+    checkpoint_response = test_client.post(
+        f"/watchlist/instruments/{instrument_id}/checkpoint"
+    )
+
+    assert checkpoint_response.status_code == 503
+    # Exactly one checkpoint still exists (the earlier implicit one),
+    # untouched -- the failed attempt did not fabricate or replace it.
+    assert mock_db.checkpoints.count_documents({"instrument_id": instrument_id}) == 1
+    checkpoint_after = mock_db.checkpoints.find_one({"instrument_id": instrument_id})
+    assert checkpoint_after["baseline_snapshot"]["last_price"] == price_before
+    assert checkpoint_after["source"] == "implicit"  # not overwritten to explicit
+
+
+def test_mark_as_seen_with_no_prior_checkpoint_and_unavailable_data_creates_nothing(
+    client, monkeypatch
+):
+    """The simpler failure case: no checkpoint has ever existed for this
+    instrument, and the provider has no data at all. Mark-as-seen must
+    fail (503) and create nothing."""
+    test_client, mock_db = client
+
+    # Seed the instrument WITHOUT ever calling GET /watchlist, so no
+    # implicit checkpoint exists yet.
+    from app.services.watchlist_service import ensure_seed_instruments
+
+    instruments = ensure_seed_instruments(mock_db)
+    reliance_doc = next(i for i in instruments if i["symbol"] == "RELIANCE")
+    instrument_id = str(reliance_doc["_id"])
+
+    monkeypatch.setattr(watchlist_routes, "_provider", FakeProvider({}))
+
+    checkpoint_response = test_client.post(
+        f"/watchlist/instruments/{instrument_id}/checkpoint"
+    )
+
+    assert checkpoint_response.status_code == 503
+    assert mock_db.checkpoints.count_documents({"instrument_id": instrument_id}) == 0
+
+
+def test_mark_all_as_seen_advances_all_instruments_with_valid_data(client):
+    """POST /watchlist/checkpoint (mark-all-as-seen) must advance every
+    eligible instrument's checkpoint in one call."""
+    test_client, mock_db = client
+
+    response = test_client.post("/watchlist/checkpoint")
+    assert response.status_code == 200
+    body = response.json()
+
+    assert len(body["updated"]) == 5
+    assert body["skipped"] == []
+    assert mock_db.checkpoints.count_documents({}) == 5
+
+    updated_symbols = {u["symbol"] for u in body["updated"]}
+    assert updated_symbols == {"RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK"}
+
+    # Confirm sources are explicit -- this IS the explicit mark-all action.
+    for doc in mock_db.checkpoints.find({}):
+        assert doc["source"] == "explicit"
+
+
+def test_mark_all_as_seen_skips_instruments_without_valid_snapshot(client, monkeypatch):
+    """FAILURE HANDLING: when some instruments have no valid current
+    data, mark-all-as-seen must skip them safely (not fail the whole
+    batch, not fabricate a checkpoint for them) and report them as
+    skipped."""
+    test_client, mock_db = client
+
+    partial_provider = FakeProvider(
+        {
+            "RELIANCE.NS": make_quote("RELIANCE.NS", 1326.4, 1302.6, 9122871),
+            "TCS.NS": make_quote("TCS.NS", 2312.8, 2320.0, 1722049),
+            # HDFCBANK, INFY, ICICIBANK deliberately have no data
+        }
+    )
+    monkeypatch.setattr(watchlist_routes, "_provider", partial_provider)
+
+    response = test_client.post("/watchlist/checkpoint")
+    assert response.status_code == 200
+    body = response.json()
+
+    assert len(body["updated"]) == 2
+    assert len(body["skipped"]) == 3
+    updated_symbols = {u["symbol"] for u in body["updated"]}
+    skipped_symbols = {s["symbol"] for s in body["skipped"]}
+    assert updated_symbols == {"RELIANCE", "TCS"}
+    assert skipped_symbols == {"HDFCBANK", "INFY", "ICICIBANK"}
+
+    # Only the 2 successful instruments got checkpoints -- nothing
+    # fabricated for the 3 skipped ones.
+    assert mock_db.checkpoints.count_documents({}) == 2
+
+
+def test_mark_all_as_seen_replaces_existing_checkpoints_not_duplicates(client):
+    """Calling mark-all-as-seen twice must advance/replace, never
+    duplicate, each instrument's checkpoint."""
+    test_client, mock_db = client
+
+    test_client.post("/watchlist/checkpoint")
+    test_client.post("/watchlist/checkpoint")
+
+    assert mock_db.checkpoints.count_documents({}) == 5  # still 5, not 10
+
+
+def test_implicit_checkpoint_resolves_on_next_request_not_the_current_one(client):
+    """Per architecture.md (hard question G): an implicit checkpoint
+    'resolves this state on the instrument's NEXT poll cycle' -- meaning
+    the request that CREATES the implicit checkpoint must still report
+    has_baseline=False, and only the following request sees has_baseline
+    reflecting the (now-existing) checkpoint."""
+    test_client, mock_db = client
+
+    first = test_client.get("/watchlist").json()
+    reliance_first = next(i for i in first["instruments"] if i["symbol"] == "RELIANCE")
+    assert reliance_first["change"]["has_baseline"] is False
+    assert "Baseline created" in reliance_first["change"]["reason"]
+
+    # The implicit checkpoint now exists in the database...
+    assert mock_db.checkpoints.count_documents({"instrument_id": reliance_first["instrument_id"]}) == 1
+
+    # ...and the NEXT request sees it and compares against it (same fake
+    # price every time in this test, so the comparison is "no meaningful
+    # change" rather than "no baseline").
+    second = test_client.get("/watchlist").json()
+    reliance_second = next(i for i in second["instruments"] if i["symbol"] == "RELIANCE")
+    assert reliance_second["change"]["has_baseline"] is True

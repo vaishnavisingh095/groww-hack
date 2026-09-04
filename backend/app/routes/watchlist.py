@@ -60,9 +60,19 @@ def get_watchlist() -> dict:
     instrument against its checkpoint (if any), and return clean domain
     JSON for the frontend.
 
-    This does NOT create or advance any checkpoint -- opening/refreshing
-    this endpoint must never silently move the baseline, per the
-    explicit instruction.
+    Checkpoint handling on this read path:
+    - An EXISTING checkpoint is NEVER advanced or replaced here -- only
+      read, for comparison. This is what "mark as seen" is for.
+    - If NO checkpoint exists yet for a (user, instrument) pair, an
+      IMPLICIT one is established from the current snapshot (per
+      architecture.md, hard question G), so the instrument has a
+      baseline for future comparisons. Per that same design note ("...
+      resolves this state on the instrument's next poll cycle"), THIS
+      request still reports has_baseline=False for that instrument --
+      the comparison below is evaluated against what existed BEFORE the
+      implicit checkpoint was created, not after. The next GET
+      /watchlist call will see the checkpoint and compare against it
+      normally.
     """
     db = get_database()
     instruments = ensure_seed_instruments(db)
@@ -87,7 +97,11 @@ def get_watchlist() -> dict:
             # instrument. Per architecture.md's failure table: do not
             # fabricate data, report unavailable. (This slice has no
             # "last known good" persistence for snapshots yet -- see
-            # Known Limitations in the implementation report.)
+            # Known Limitations in the implementation report.) An
+            # invalid/unavailable snapshot must never become a baseline,
+            # implicit or otherwise -- there is nothing here to
+            # checkpoint against, so ensure_initial_checkpoint is
+            # correctly never called in this branch.
             results.append(
                 {
                     "instrument_id": instrument_id,
@@ -109,9 +123,22 @@ def get_watchlist() -> dict:
             )
             continue
 
+        # Read the EXISTING checkpoint (if any) BEFORE potentially
+        # creating an implicit one -- the comparison below must reflect
+        # what the user actually saw last time, not a baseline we are
+        # establishing this very request.
         checkpoint = checkpoint_service.get_checkpoint(DEMO_USER_ID, instrument_id)
         checkpoint_price = checkpoint.baseline_snapshot.last_price if checkpoint else None
         change_result = evaluate_price_change(checkpoint_price, snapshot.last_price)
+
+        if checkpoint is None:
+            # No prior checkpoint existed -- establish the implicit
+            # baseline now so the NEXT request has something to compare
+            # against. This does not affect change_result above, which
+            # was already computed against the absence of a checkpoint.
+            checkpoint_service.ensure_initial_checkpoint(
+                DEMO_USER_ID, instrument_id, snapshot
+            )
 
         label, age_seconds = _status_label(snapshot.status, snapshot.fetched_at)
 
@@ -142,15 +169,16 @@ def get_watchlist() -> dict:
     return {"instruments": results}
 
 
-@router.post("/watchlist/{instrument_id}/checkpoint")
+@router.post("/watchlist/instruments/{instrument_id}/checkpoint")
 def mark_as_seen(instrument_id: str) -> dict:
     """
-    Explicit "mark as seen" action. Fetches the CURRENT market data for
-    this one instrument and persists it as the new checkpoint baseline.
+    Explicit "mark as seen" action for ONE instrument. Fetches the
+    CURRENT market data for this instrument and persists it as the new
+    checkpoint baseline, unconditionally advancing/replacing whatever
+    checkpoint existed before.
 
-    This is the ONLY code path in this slice that creates or advances a
-    checkpoint -- GET /watchlist never does this, per explicit
-    instruction.
+    Path matches architecture.md's documented API contract exactly:
+    POST /watchlist/instruments/{id}/checkpoint.
     """
     db = get_database()
     instrument_doc = db.instruments.find_one({"_id": _to_object_id(instrument_id)})
@@ -162,6 +190,9 @@ def mark_as_seen(instrument_id: str) -> dict:
     snapshots = market_service.fetch_snapshots({ticker: instrument_id})
 
     if not snapshots:
+        # Missing/invalid/unavailable current data must never become a
+        # valid baseline -- fail the request instead of fabricating a
+        # checkpoint from stale or absent data.
         raise HTTPException(
             status_code=503,
             detail="Could not fetch current market data — checkpoint not saved.",
@@ -180,6 +211,58 @@ def mark_as_seen(instrument_id: str) -> dict:
         "checkpoint_at": checkpoint.checkpoint_at.isoformat(),
         "message": f"Baseline saved at ₹{checkpoint.baseline_snapshot.last_price:.2f}",
     }
+
+
+@router.post("/watchlist/checkpoint")
+def mark_all_as_seen() -> dict:
+    """
+    Explicit "mark all as seen" for the whole watchlist. Advances the
+    checkpoint for every instrument that currently has a valid snapshot;
+    instruments without valid current data are skipped safely (not
+    fabricated, not treated as an error for the whole batch) and
+    reported separately in the response so the caller can see exactly
+    what happened.
+
+    Path matches architecture.md's documented API contract exactly:
+    POST /watchlist/checkpoint.
+    """
+    db = get_database()
+    instruments = ensure_seed_instruments(db)
+    market_service = MarketDataService(_provider)
+    checkpoint_service = CheckpointService(db)
+
+    symbol_to_instrument_id = {
+        yfinance_ticker_for(inst["symbol"], inst["exchange"]): str(inst["_id"])
+        for inst in instruments
+    }
+    snapshots = market_service.fetch_snapshots(symbol_to_instrument_id)
+    snapshots_by_instrument_id = {s.instrument_id: s for s in snapshots}
+
+    updated = []
+    skipped = []
+    for inst in instruments:
+        instrument_id = str(inst["_id"])
+        snapshot = snapshots_by_instrument_id.get(instrument_id)
+
+        if snapshot is None:
+            # No valid current snapshot for this instrument this cycle
+            # -- skip it rather than fabricating a checkpoint or failing
+            # the entire batch over one instrument's bad data.
+            skipped.append({"instrument_id": instrument_id, "symbol": inst["symbol"]})
+            continue
+
+        checkpoint = checkpoint_service.create_checkpoint_from_snapshot(
+            DEMO_USER_ID, instrument_id, snapshot
+        )
+        updated.append(
+            {
+                "instrument_id": instrument_id,
+                "symbol": inst["symbol"],
+                "checkpoint_price": checkpoint.baseline_snapshot.last_price,
+            }
+        )
+
+    return {"updated": updated, "skipped": skipped}
 
 
 def _to_object_id(instrument_id: str):

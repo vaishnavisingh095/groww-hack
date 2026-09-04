@@ -91,6 +91,40 @@ def test_missing_previous_close_produces_no_snapshot():
     assert snapshots == []
 
 
+def test_real_world_valid_price_volume_and_previous_close_produces_snapshot():
+    """
+    REGRESSION TEST reproducing the exact real Mac runtime scenario that
+    surfaced the bug: last_price=1322.0, volume=13022095, and (once the
+    provider's own previous_close fallback is correctly applied)
+    previous_close=1302.5. If the provider correctly supplies
+    previous_close, the service must produce a usable snapshot with a
+    correctly computed percent_change -- this must NOT return an empty
+    list for a case where all the real underlying data was actually
+    available.
+    """
+    provider = FakeProvider(
+        [
+            make_quote(
+                symbol="RELIANCE.NS",
+                last_price=1322.0,
+                previous_close=1302.5,
+                volume=13022095,
+            )
+        ]
+    )
+    service = MarketDataService(provider)
+
+    snapshots = service.fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    assert len(snapshots) == 1
+    snap = snapshots[0]
+    assert snap.last_price == 1322.0
+    assert snap.previous_close == 1302.5
+    assert snap.volume == 13022095
+    expected_pct = (1322.0 - 1302.5) / 1302.5 * 100
+    assert snap.percent_change == expected_pct
+
+
 def test_missing_volume_degrades_gracefully_price_still_usable():
     """Per architecture.md's Invalid Data Rules: missing volume must NOT
     discard an otherwise-valid price."""
