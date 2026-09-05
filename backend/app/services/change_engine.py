@@ -58,6 +58,30 @@ _MARKET_OPEN_TIME_IST = time(9, 15)
 # expressed as a named constant rather than a bare number.
 _MIN_MINUTES_SINCE_OPEN_FOR_RATE = 2.0
 
+# Separate near-market-open guard for the ADAPTIVE PRICE THRESHOLD --
+# deliberately NOT the same constant as _MIN_MINUTES_SINCE_OPEN_FOR_RATE
+# above, because it answers a different question. The volume guard
+# protects a RATE denominator from numerical instability near zero (2
+# minutes is enough for that). This guard protects day_high/day_low
+# from being treated as a representative sample of the stock's real
+# intraday range -- a few minutes past open is nowhere near enough
+# time for that, regardless of whether the rate math above is already
+# numerically stable by then. Coupling the two would mean a future
+# tune of one silently changes the other for an unrelated reason.
+_MIN_MINUTES_SINCE_OPEN_FOR_PRICE_THRESHOLD = 15.0
+
+# Used whenever a checkpoint is established before
+# _MIN_MINUTES_SINCE_OPEN_FOR_PRICE_THRESHOLD has elapsed since market
+# open -- the observed day_high/day_low at that point is real data, not
+# missing/invalid, but is known to be biased toward an artificially
+# narrow range simply because trading has not had time to establish
+# one yet. This is a distinct constant from
+# ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT (same value today, deliberately
+# separate name) so the two can be tuned independently later without
+# first having to work out which scenario a given checkpoint's fallback
+# value actually came from.
+EARLY_SESSION_PRICE_THRESHOLD_FALLBACK_PCT = 1.0
+
 
 @dataclass
 class PriceSignal:
@@ -119,21 +143,44 @@ def _is_finite(value: float | None) -> bool:
 
 
 def _compute_adaptive_price_threshold(
-    day_high: float | None, day_low: float | None, previous_close: float | None
+    day_high: float | None,
+    day_low: float | None,
+    previous_close: float | None,
+    *,
+    checkpoint_at: datetime,
+    session_date: date,
 ) -> float:
     """
     adaptive_threshold = clamp(0.25 * range_percent, 0.5, 3.0)
     range_percent = (day_high - day_low) / previous_close * 100
 
     Pure, deterministic, full-precision (no rounding until display).
-    Returns ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT (1.0) whenever the
-    inputs cannot support a defensible range calculation -- missing,
-    non-finite, non-positive day_high/day_low/previous_close, or
-    day_low > day_high (a real impossibility, like negative volume
+    checkpoint_at/session_date are required (not defaulted) -- this
+    function does not trust its caller blindly, same philosophy as
+    evaluate_change below, and a default that silently assumed "enough
+    time has passed" would just reintroduce the exact bug this guard
+    exists to close for any caller that forgot to pass them.
+
+    Returns EARLY_SESSION_PRICE_THRESHOLD_FALLBACK_PCT whenever fewer
+    than _MIN_MINUTES_SINCE_OPEN_FOR_PRICE_THRESHOLD minutes have
+    elapsed since this session's market open -- day_high/day_low ARE
+    real, valid data at that point, just not yet a representative
+    sample of the stock's actual intraday range (see decisions.md's
+    "Minimum observation-time guard for the adaptive price threshold").
+    A negative or implausibly large elapsed time (e.g. a session_date
+    that doesn't match checkpoint_at at all) also falls below the
+    guard and is treated the same conservative way -- never a reason to
+    trust the range more.
+
+    Otherwise, returns ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT (1.0)
+    whenever the inputs cannot support a defensible range calculation
+    -- missing, non-finite, non-positive day_high/day_low/previous_close,
+    or day_low > day_high (a real impossibility, like negative volume
     elsewhere in this module) -- never a fabricated adaptive value.
     day_high == day_low (a genuinely zero observed range, e.g. very
     early in a session) is valid, not an error: range_percent is 0 and
-    the result correctly clamps to the 0.5% floor.
+    the result correctly clamps to the 0.5% floor -- once past the
+    near-open guard above, that is.
 
     Deliberately called from checkpoint_service.py at checkpoint-
     creation time (not from evaluate_change below) -- the resulting
@@ -141,6 +188,10 @@ def _compute_adaptive_price_threshold(
     recomputed from a later, wider intraday range. See this module's
     own docstring and decisions.md for why.
     """
+    minutes_since_open = (checkpoint_at - _market_open_at(session_date)).total_seconds() / 60.0
+    if minutes_since_open < _MIN_MINUTES_SINCE_OPEN_FOR_PRICE_THRESHOLD:
+        return EARLY_SESSION_PRICE_THRESHOLD_FALLBACK_PCT
+
     if (
         not _is_finite_positive(day_high)
         or not _is_finite_positive(day_low)

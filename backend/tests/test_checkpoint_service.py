@@ -64,6 +64,37 @@ def test_create_checkpoint_with_missing_range_falls_back_to_default_threshold(db
     assert checkpoint.baseline_snapshot.price_threshold_applied == ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT
 
 
+def test_create_checkpoint_before_session_open_uses_early_session_fallback(db):
+    """Wiring proof that _write_checkpoint actually passes its own
+    checkpoint_at/session_date through to
+    _compute_adaptive_price_threshold (not just day_high/day_low/
+    previous_close as before). checkpoint_at is always real wall-clock
+    "now" here (this test does not control it) -- so instead the
+    snapshot's session_date is set to TOMORROW, meaning that session's
+    market open is still in the future relative to "now," making
+    elapsed-time-since-open negative and therefore always below the
+    guard, deterministically, regardless of what real time the suite
+    happens to run at. A WIDE range that would otherwise clamp to the
+    3.0% ceiling must still resolve to the early-session fallback."""
+    from datetime import timedelta
+
+    from app.services.change_engine import EARLY_SESSION_PRICE_THRESHOLD_FALLBACK_PCT
+
+    service = CheckpointService(db)
+    future_session_date = date.today() + timedelta(days=1)
+    snapshot = make_snapshot(
+        day_high=150.0, day_low=100.0, previous_close=100.0,
+        session_date=future_session_date,
+    )
+
+    checkpoint = service.create_checkpoint_from_snapshot("user1", "inst123", snapshot)
+
+    assert (
+        checkpoint.baseline_snapshot.price_threshold_applied
+        == EARLY_SESSION_PRICE_THRESHOLD_FALLBACK_PCT
+    )
+
+
 def test_checkpoint_threshold_does_not_drift_when_replaced_with_wider_range(db):
     """CRITICAL invariant (explicit product requirement): re-establishing
     a checkpoint with a DIFFERENT observed range produces a NEW, distinct

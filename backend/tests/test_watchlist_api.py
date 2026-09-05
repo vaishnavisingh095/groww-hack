@@ -66,6 +66,29 @@ def make_quote(symbol: str, last_price: float, previous_close: float, volume: in
     )
 
 
+def _expire_persisted_snapshots(mock_db):
+    """Force every persisted market_snapshots document far enough into
+    the past to fall outside MarketDataService.get_snapshots' freshness
+    window (STALE_THRESHOLD_SECONDS). GET /watchlist now serves an
+    already-persisted, still-fresh snapshot directly WITHOUT calling the
+    provider again -- see market_data_service.py's get_snapshots, added
+    to avoid a live yfinance call on every request. Many of the tests
+    below simulate "the price moved since the last GET" by monkeypatching
+    the provider and then calling GET /watchlist again; without this
+    helper, that second GET would just replay the value already cached
+    by the first GET and never reach the newly-monkeypatched provider at
+    all. Calling this between the monkeypatch and the next GET/POST
+    forces exactly the live re-fetch each of those tests actually means
+    to exercise -- the same thing that happens for real once
+    STALE_THRESHOLD_SECONDS elapses."""
+    from app.services.market_data_service import STALE_THRESHOLD_SECONDS
+
+    old = (
+        datetime.now(timezone.utc) - timedelta(seconds=STALE_THRESHOLD_SECONDS + 1)
+    ).isoformat()
+    mock_db.market_snapshots.update_many({}, {"$set": {"fetched_at": old}})
+
+
 @pytest.fixture
 def client(monkeypatch):
     """
@@ -110,6 +133,37 @@ def test_get_watchlist_returns_five_instruments(client):
     body = response.json()
     assert "instruments" in body
     assert len(body["instruments"]) == 5
+
+
+def test_repeated_get_within_freshness_window_does_not_recall_provider(client, monkeypatch):
+    """The whole point of MarketDataService.get_snapshots: a second GET
+    /watchlist within STALE_THRESHOLD_SECONDS of the first must be
+    served entirely from the persisted market_snapshots documents, with
+    zero additional provider calls."""
+    test_client, mock_db = client
+
+    class CountingProvider(MarketDataProvider):
+        def __init__(self, inner):
+            self._inner = inner
+            self.call_count = 0
+
+        def get_quotes(self, symbols):
+            self.call_count += 1
+            return self._inner.get_quotes(symbols)
+
+    counting_provider = CountingProvider(watchlist_routes._provider)
+    monkeypatch.setattr(watchlist_routes, "_provider", counting_provider)
+
+    first = test_client.get("/watchlist").json()
+    assert counting_provider.call_count == 1
+
+    second = test_client.get("/watchlist").json()
+    assert counting_provider.call_count == 1  # no new provider call
+
+    first_reliance = next(i for i in first["instruments"] if i["symbol"] == "RELIANCE")
+    second_reliance = next(i for i in second["instruments"] if i["symbol"] == "RELIANCE")
+    assert second_reliance["price"] == first_reliance["price"]
+    assert second_reliance["status"] == "ok"
 
 
 def test_get_watchlist_response_shape(client):
@@ -320,6 +374,7 @@ def test_malformed_quote_after_checkpoint_exists_does_not_corrupt_or_advance_it(
         }
     )
     monkeypatch.setattr(watchlist_routes, "_provider", malformed_provider)
+    _expire_persisted_snapshots(mock_db)  # force this GET to actually re-fetch
 
     response = test_client.get("/watchlist")
     assert response.status_code == 200
@@ -537,6 +592,7 @@ def test_get_watchlist_stale_fallback_shows_truthful_freshness(client, monkeypat
     test_client.get("/watchlist")  # persists all five instruments
 
     monkeypatch.setattr(watchlist_routes, "_provider", FakeProvider({}))
+    _expire_persisted_snapshots(mock_db)  # force this GET to actually re-fetch
     response = test_client.get("/watchlist")
     assert response.status_code == 200
     body = response.json()
@@ -734,6 +790,7 @@ def test_get_watchlist_creates_change_event_for_meaningful_change_against_explic
     monkeypatch.setattr(
         watchlist_routes, "_provider", FakeProvider(_quotes_with_reliance_price(1400.0))
     )
+    _expire_persisted_snapshots(mock_db)  # force this GET to actually re-fetch
 
     body = test_client.get("/watchlist").json()
     reliance = next(i for i in body["instruments"] if i["symbol"] == "RELIANCE")
@@ -761,6 +818,7 @@ def test_repeated_get_with_same_meaningful_change_does_not_duplicate_change_even
     monkeypatch.setattr(
         watchlist_routes, "_provider", FakeProvider(_quotes_with_reliance_price(1400.0))
     )
+    _expire_persisted_snapshots(mock_db)  # force the first of these GETs to re-fetch
 
     test_client.get("/watchlist")
     test_client.get("/watchlist")
@@ -785,6 +843,7 @@ def test_mark_as_seen_acknowledges_active_change_event(client, monkeypatch):
     monkeypatch.setattr(
         watchlist_routes, "_provider", FakeProvider(_quotes_with_reliance_price(1400.0))
     )
+    _expire_persisted_snapshots(mock_db)  # force this GET to actually re-fetch
     test_client.get("/watchlist")  # creates the active ChangeEvent
 
     active_event = mock_db.change_events.find_one({"instrument_id": instrument_id})
@@ -834,6 +893,7 @@ def test_mark_all_as_seen_acknowledges_only_successful_instruments_active_events
             }
         ),
     )
+    _expire_persisted_snapshots(mock_db)  # force this GET to actually re-fetch
     test_client.get("/watchlist")  # creates both active ChangeEvents
 
     assert mock_db.change_events.count_documents({"acknowledged": False}) == 2
@@ -887,6 +947,7 @@ def test_get_watchlist_with_stale_snapshot_creates_no_change_event(client, monke
         session_date=datetime.now(timezone.utc).date(),
     )
     monkeypatch.setattr(watchlist_routes, "_provider", FakeProvider(stale_quotes))
+    _expire_persisted_snapshots(mock_db)  # force this GET to actually re-fetch
 
     body = test_client.get("/watchlist").json()
     reliance = next(i for i in body["instruments"] if i["symbol"] == "RELIANCE")
@@ -950,6 +1011,7 @@ def test_get_attention_includes_item_for_meaningful_change_with_correct_fields(
     quotes = _quotes_with_reliance_price(1400.0)
     quotes["RELIANCE.NS"] = make_quote("RELIANCE.NS", 1400.0, 1302.6, 9000000)
     monkeypatch.setattr(watchlist_routes, "_provider", FakeProvider(quotes))
+    _expire_persisted_snapshots(mock_db)  # force this GET to actually re-fetch
     test_client.get("/watchlist")  # creates the active ChangeEvent
 
     response = test_client.get("/watchlist/attention")
@@ -990,7 +1052,7 @@ def test_get_attention_includes_item_for_meaningful_change_with_correct_fields(
 
 
 def test_get_attention_excludes_acknowledged_events(client, monkeypatch):
-    test_client, _ = client
+    test_client, mock_db = client
 
     first = test_client.get("/watchlist").json()
     reliance = next(i for i in first["instruments"] if i["symbol"] == "RELIANCE")
@@ -1000,6 +1062,7 @@ def test_get_attention_excludes_acknowledged_events(client, monkeypatch):
     monkeypatch.setattr(
         watchlist_routes, "_provider", FakeProvider(_quotes_with_reliance_price(1400.0))
     )
+    _expire_persisted_snapshots(mock_db)  # force this GET to actually re-fetch
     test_client.get("/watchlist")  # creates the active ChangeEvent
 
     assert test_client.get("/watchlist/attention").json()["attention_items"] != []
@@ -1011,7 +1074,7 @@ def test_get_attention_excludes_acknowledged_events(client, monkeypatch):
 
 
 def test_get_attention_orders_multiple_instruments_by_descending_score(client, monkeypatch):
-    test_client, _ = client
+    test_client, mock_db = client
 
     first = test_client.get("/watchlist").json()
     reliance = next(i for i in first["instruments"] if i["symbol"] == "RELIANCE")
@@ -1032,6 +1095,7 @@ def test_get_attention_orders_multiple_instruments_by_descending_score(client, m
             }
         ),
     )
+    _expire_persisted_snapshots(mock_db)  # force this GET to actually re-fetch
     test_client.get("/watchlist")  # creates both active ChangeEvents
 
     items = test_client.get("/watchlist/attention").json()["attention_items"]
@@ -1204,6 +1268,7 @@ def test_newly_added_instrument_can_progress_through_checkpoint_and_attention_li
     moved_quotes = _quotes_with_wipro_added()
     moved_quotes["WIPRO.NS"] = make_quote("WIPRO.NS", 520.0, 475.0, 5000000)
     monkeypatch.setattr(watchlist_routes, "_provider", FakeProvider(moved_quotes))
+    _expire_persisted_snapshots(mock_db)  # force this GET to actually re-fetch
 
     watchlist_body = test_client.get("/watchlist").json()
     wipro = next(i for i in watchlist_body["instruments"] if i["symbol"] == "WIPRO")
@@ -1341,6 +1406,7 @@ def test_attention_is_isolated_between_owners(client, monkeypatch):
     monkeypatch.setattr(
         watchlist_routes, "_provider", FakeProvider(_quotes_with_reliance_price(1400.0))
     )
+    _expire_persisted_snapshots(mock_db)  # force this GET to actually re-fetch
     test_client.get("/watchlist", cookies={"watchlist_owner": "owner-a"})  # creates owner-a's ChangeEvent
 
     owner_a_attention = test_client.get(
@@ -1774,6 +1840,7 @@ def test_checkpoint_remains_unchanged_when_get_detects_a_meaningful_change(clien
     monkeypatch.setattr(
         watchlist_routes, "_provider", FakeProvider(_quotes_with_reliance_price(1400.0))
     )
+    _expire_persisted_snapshots(mock_db)  # force this GET to actually re-fetch
 
     # The GET that actually detects and persists the ChangeEvent.
     body = test_client.get("/watchlist").json()
@@ -1814,6 +1881,7 @@ def test_simulated_frontend_polling_sequence_never_acknowledges_or_advances(clie
     monkeypatch.setattr(
         watchlist_routes, "_provider", FakeProvider(_quotes_with_reliance_price(1400.0))
     )
+    _expire_persisted_snapshots(mock_db)  # force the first of these GETs to re-fetch
 
     for _ in range(4):
         test_client.get("/watchlist")
@@ -1892,6 +1960,7 @@ def test_mark_all_as_seen_does_not_touch_another_owners_state(client, monkeypatc
     monkeypatch.setattr(
         watchlist_routes, "_provider", FakeProvider(_quotes_with_reliance_price(1400.0))
     )
+    _expire_persisted_snapshots(mock_db)  # force this GET to actually re-fetch
     test_client.get("/watchlist", cookies={"watchlist_owner": "owner-b"})
 
     owner_b_checkpoint_before = mock_db.checkpoints.find_one(
@@ -1962,6 +2031,7 @@ def test_provider_failure_for_one_instrument_does_not_affect_a_siblings_existing
         }
     )
     monkeypatch.setattr(watchlist_routes, "_provider", partial_provider)
+    _expire_persisted_snapshots(mock_db)  # force this GET to actually re-fetch
 
     body = test_client.get("/watchlist").json()
     reliance = next(i for i in body["instruments"] if i["symbol"] == "RELIANCE")
@@ -2047,6 +2117,7 @@ def test_owner_as_get_requests_cannot_touch_owner_bs_active_event_or_checkpoint(
     monkeypatch.setattr(
         watchlist_routes, "_provider", FakeProvider(_quotes_with_reliance_price(1400.0))
     )
+    _expire_persisted_snapshots(mock_db)  # force this GET to actually re-fetch
     test_client.get("/watchlist", cookies={"watchlist_owner": "owner-b"})
 
     owner_b_checkpoint_before = mock_db.checkpoints.find_one({"user_id": "owner-b"})

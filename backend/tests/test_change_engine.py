@@ -29,7 +29,9 @@ from app.services.change_engine import (
     ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT,
     ADAPTIVE_PRICE_THRESHOLD_FLOOR_PCT,
     ADAPTIVE_PRICE_THRESHOLD_RANGE_MULTIPLIER,
+    EARLY_SESSION_PRICE_THRESHOLD_FALLBACK_PCT,
     VOLUME_ACCELERATION_THRESHOLD,
+    _MIN_MINUTES_SINCE_OPEN_FOR_PRICE_THRESHOLD,
     _compute_adaptive_price_threshold,
     evaluate_change,
 )
@@ -105,21 +107,30 @@ def with_volume(
 def test_adaptive_threshold_normal_calculation():
     """day_high=110, day_low=100, previous_close=100 -> range_percent =
     (10/100)*100 = 10.0 -> 0.25*10.0 = 2.5, within [0.5, 3.0] -> 2.5."""
-    result = _compute_adaptive_price_threshold(day_high=110.0, day_low=100.0, previous_close=100.0)
+    result = _compute_adaptive_price_threshold(
+        day_high=110.0, day_low=100.0, previous_close=100.0,
+        checkpoint_at=CHECKPOINT_AT, session_date=SESSION_DATE,
+    )
     assert result == pytest.approx(2.5, abs=1e-9)
 
 
 def test_adaptive_threshold_exactly_at_floor():
     """A very narrow range should clamp UP to exactly 0.5%, inclusive."""
     # range_percent = (100.4 - 100.0)/100 * 100 = 0.4 -> 0.25*0.4 = 0.1 -> clamps to 0.5
-    result = _compute_adaptive_price_threshold(day_high=100.4, day_low=100.0, previous_close=100.0)
+    result = _compute_adaptive_price_threshold(
+        day_high=100.4, day_low=100.0, previous_close=100.0,
+        checkpoint_at=CHECKPOINT_AT, session_date=SESSION_DATE,
+    )
     assert result == pytest.approx(ADAPTIVE_PRICE_THRESHOLD_FLOOR_PCT, abs=1e-9)
 
 
 def test_adaptive_threshold_exactly_at_ceiling():
     """A wide range should clamp DOWN to exactly 3.0%, inclusive."""
     # range_percent = (150 - 100)/100 * 100 = 50 -> 0.25*50 = 12.5 -> clamps to 3.0
-    result = _compute_adaptive_price_threshold(day_high=150.0, day_low=100.0, previous_close=100.0)
+    result = _compute_adaptive_price_threshold(
+        day_high=150.0, day_low=100.0, previous_close=100.0,
+        checkpoint_at=CHECKPOINT_AT, session_date=SESSION_DATE,
+    )
     assert result == pytest.approx(ADAPTIVE_PRICE_THRESHOLD_CEILING_PCT, abs=1e-9)
 
 
@@ -127,7 +138,10 @@ def test_adaptive_threshold_computed_value_below_floor_clamps_up():
     """0.25 * range_percent landing below 0.5 must clamp UP, never be
     returned as-is."""
     # range_percent = 1.0 -> 0.25*1.0 = 0.25 < 0.5 floor
-    result = _compute_adaptive_price_threshold(day_high=101.0, day_low=100.0, previous_close=100.0)
+    result = _compute_adaptive_price_threshold(
+        day_high=101.0, day_low=100.0, previous_close=100.0,
+        checkpoint_at=CHECKPOINT_AT, session_date=SESSION_DATE,
+    )
     assert result == pytest.approx(ADAPTIVE_PRICE_THRESHOLD_FLOOR_PCT, abs=1e-9)
 
 
@@ -135,7 +149,10 @@ def test_adaptive_threshold_computed_value_above_ceiling_clamps_down():
     """0.25 * range_percent landing above 3.0 must clamp DOWN, never be
     returned as-is."""
     # range_percent = 20 -> 0.25*20 = 5.0 > 3.0 ceiling
-    result = _compute_adaptive_price_threshold(day_high=120.0, day_low=100.0, previous_close=100.0)
+    result = _compute_adaptive_price_threshold(
+        day_high=120.0, day_low=100.0, previous_close=100.0,
+        checkpoint_at=CHECKPOINT_AT, session_date=SESSION_DATE,
+    )
     assert result == pytest.approx(ADAPTIVE_PRICE_THRESHOLD_CEILING_PCT, abs=1e-9)
 
 
@@ -144,14 +161,20 @@ def test_adaptive_threshold_day_high_equals_day_low_is_valid_zero_range():
     session) is valid, not an error -- range_percent is exactly 0 and
     the result correctly clamps to the 0.5% floor, never treated as
     unavailable/invalid."""
-    result = _compute_adaptive_price_threshold(day_high=100.0, day_low=100.0, previous_close=100.0)
+    result = _compute_adaptive_price_threshold(
+        day_high=100.0, day_low=100.0, previous_close=100.0,
+        checkpoint_at=CHECKPOINT_AT, session_date=SESSION_DATE,
+    )
     assert result == pytest.approx(ADAPTIVE_PRICE_THRESHOLD_FLOOR_PCT, abs=1e-9)
 
 
 def test_adaptive_threshold_day_low_greater_than_day_high_is_invalid_fallback():
     """A real impossibility (like negative volume elsewhere in this
     module) -- must fall back, never produce a negative range_percent."""
-    result = _compute_adaptive_price_threshold(day_high=99.0, day_low=100.0, previous_close=100.0)
+    result = _compute_adaptive_price_threshold(
+        day_high=99.0, day_low=100.0, previous_close=100.0,
+        checkpoint_at=CHECKPOINT_AT, session_date=SESSION_DATE,
+    )
     assert result == ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT
 
 
@@ -165,7 +188,10 @@ def test_adaptive_threshold_day_low_greater_than_day_high_is_invalid_fallback():
     ],
 )
 def test_adaptive_threshold_none_range_values_fall_back(day_high, day_low, previous_close):
-    result = _compute_adaptive_price_threshold(day_high, day_low, previous_close)
+    result = _compute_adaptive_price_threshold(
+        day_high, day_low, previous_close,
+        checkpoint_at=CHECKPOINT_AT, session_date=SESSION_DATE,
+    )
     assert result == ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT
 
 
@@ -181,7 +207,10 @@ def test_adaptive_threshold_none_range_values_fall_back(day_high, day_low, previ
     ],
 )
 def test_adaptive_threshold_nan_or_infinite_inputs_fall_back(day_high, day_low, previous_close):
-    result = _compute_adaptive_price_threshold(day_high, day_low, previous_close)
+    result = _compute_adaptive_price_threshold(
+        day_high, day_low, previous_close,
+        checkpoint_at=CHECKPOINT_AT, session_date=SESSION_DATE,
+    )
     assert result == ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT
 
 
@@ -189,8 +218,12 @@ def test_adaptive_threshold_zero_or_negative_previous_close_falls_back():
     """previous_close is already validated positive by MarketSnapshot in
     production, but this pure function does not trust its caller
     blindly (same philosophy as the rest of this module)."""
-    assert _compute_adaptive_price_threshold(110.0, 100.0, 0.0) == ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT
-    assert _compute_adaptive_price_threshold(110.0, 100.0, -50.0) == ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT
+    assert _compute_adaptive_price_threshold(
+        110.0, 100.0, 0.0, checkpoint_at=CHECKPOINT_AT, session_date=SESSION_DATE,
+    ) == ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT
+    assert _compute_adaptive_price_threshold(
+        110.0, 100.0, -50.0, checkpoint_at=CHECKPOINT_AT, session_date=SESSION_DATE,
+    ) == ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT
 
 
 def test_adaptive_threshold_uses_full_precision_not_rounded():
@@ -204,9 +237,114 @@ def test_adaptive_threshold_uses_full_precision_not_rounded():
     expected_range_percent = (day_high - day_low) / previous_close * 100  # 6.3
     expected = ADAPTIVE_PRICE_THRESHOLD_RANGE_MULTIPLIER * expected_range_percent  # 1.575
     assert 0.5 < expected < 3.0  # sanity: genuinely between the clamp bounds
-    result = _compute_adaptive_price_threshold(day_high, day_low, previous_close)
+    result = _compute_adaptive_price_threshold(
+        day_high, day_low, previous_close,
+        checkpoint_at=CHECKPOINT_AT, session_date=SESSION_DATE,
+    )
     assert result == pytest.approx(expected, abs=1e-12)
     assert result == pytest.approx(1.575, abs=1e-9)
+
+
+# ============================================================
+# _compute_adaptive_price_threshold -- near-market-open guard
+# ============================================================
+
+
+def test_adaptive_threshold_early_checkpoint_cannot_freeze_a_hypersensitive_value():
+    """(a) A checkpoint established only 1 minute after market open, with
+    a razor-thin observed range that would otherwise clamp to the 0.5%
+    floor under the normal formula, must instead use
+    EARLY_SESSION_PRICE_THRESHOLD_FALLBACK_PCT -- the near-open guard
+    intercepts BEFORE the floor/ceiling clamp logic ever runs. This is
+    the core regression proof for the checkpoint-timing fix."""
+    early_checkpoint_at = ist_time_on_session(9, 16)  # 1 minute after 9:15 open
+    result = _compute_adaptive_price_threshold(
+        day_high=100.01, day_low=100.00, previous_close=100.0,  # range_percent ~= 0.01%
+        checkpoint_at=early_checkpoint_at, session_date=SESSION_DATE,
+    )
+    assert result == EARLY_SESSION_PRICE_THRESHOLD_FALLBACK_PCT
+    assert result != ADAPTIVE_PRICE_THRESHOLD_FLOOR_PCT  # would have floored under the old logic
+
+
+def test_adaptive_threshold_later_checkpoint_uses_observed_range_not_early_fallback():
+    """(b) The SAME razor-thin range, once past the guard, is evaluated
+    normally and clamps to the general 0.5% floor -- proving the guard
+    only intercepts the early window, not the formula itself."""
+    late_checkpoint_at = ist_time_on_session(10, 15)  # 60 minutes after open
+    result = _compute_adaptive_price_threshold(
+        day_high=100.01, day_low=100.00, previous_close=100.0,
+        checkpoint_at=late_checkpoint_at, session_date=SESSION_DATE,
+    )
+    assert result == pytest.approx(ADAPTIVE_PRICE_THRESHOLD_FLOOR_PCT, abs=1e-9)
+
+
+def test_adaptive_threshold_one_minute_before_guard_boundary_uses_early_fallback():
+    """Boundary: the comparison is strict '<', so one minute short of
+    _MIN_MINUTES_SINCE_OPEN_FOR_PRICE_THRESHOLD (14 of 15 minutes
+    elapsed) still uses the early-session fallback -- even with a WIDE
+    range that would otherwise clamp all the way to the 3.0% ceiling."""
+    assert _MIN_MINUTES_SINCE_OPEN_FOR_PRICE_THRESHOLD == 15.0  # pins the locked value
+    checkpoint_at = ist_time_on_session(9, 29)  # 14 minutes after open
+    result = _compute_adaptive_price_threshold(
+        day_high=150.0, day_low=100.0, previous_close=100.0,  # would clamp to the 3.0 ceiling
+        checkpoint_at=checkpoint_at, session_date=SESSION_DATE,
+    )
+    assert result == EARLY_SESSION_PRICE_THRESHOLD_FALLBACK_PCT
+
+
+def test_adaptive_threshold_exactly_at_guard_boundary_uses_observed_range():
+    """Boundary: exactly _MIN_MINUTES_SINCE_OPEN_FOR_PRICE_THRESHOLD
+    minutes elapsed is inclusive (same '>=' convention as this module's
+    other inclusive boundaries) -- no longer 'early,' the range is
+    trusted."""
+    checkpoint_at = ist_time_on_session(9, 30)  # exactly 15 minutes after open
+    result = _compute_adaptive_price_threshold(
+        day_high=150.0, day_low=100.0, previous_close=100.0,
+        checkpoint_at=checkpoint_at, session_date=SESSION_DATE,
+    )
+    assert result == pytest.approx(ADAPTIVE_PRICE_THRESHOLD_CEILING_PCT, abs=1e-9)
+
+
+def test_adaptive_threshold_early_guard_also_covers_missing_range_data():
+    """An early checkpoint with ALSO-missing/invalid day_high/day_low
+    must still resolve safely -- EARLY_SESSION_PRICE_THRESHOLD_FALLBACK_PCT
+    and ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT happen to share the same
+    numeric value today (both locked at 1.0), so this does not prove
+    which internal branch ran -- it only confirms the combination of
+    "early" and "no usable range" together degrades safely, never
+    raising and never producing an unexpected value."""
+    early_checkpoint_at = ist_time_on_session(9, 16)
+    result = _compute_adaptive_price_threshold(
+        day_high=None, day_low=None, previous_close=None,
+        checkpoint_at=early_checkpoint_at, session_date=SESSION_DATE,
+    )
+    assert result == EARLY_SESSION_PRICE_THRESHOLD_FALLBACK_PCT
+
+
+def test_frozen_early_session_threshold_is_honored_unchanged_by_evaluate_change():
+    """(c) Once a checkpoint's price_threshold_applied was frozen via the
+    early-session fallback, evaluate_change must apply that EXACT frozen
+    value on every later comparison. evaluate_change takes no
+    day_high/day_low/checkpoint_at/session_date inputs at all -- it is
+    structurally incapable of re-deriving a threshold from a later,
+    wider intraday range, which is the actual mechanism guaranteeing the
+    freeze holds, not just a convention this test hopes is followed."""
+    # A move that clears the OLD general 0.5% floor but stays below the
+    # frozen 1.0% early-session value -- must NOT be meaningful if the
+    # frozen value is genuinely applied, not silently relaxed back down.
+    below = price_only(
+        checkpoint_price=100.0, current_price=100.6,
+        price_threshold=EARLY_SESSION_PRICE_THRESHOLD_FALLBACK_PCT,
+    )
+    assert below.price_signal.threshold == EARLY_SESSION_PRICE_THRESHOLD_FALLBACK_PCT
+    assert below.price_signal.meaningful is False  # 0.6% < 1.0% frozen threshold
+
+    # A move that clears the frozen 1.0% threshold IS meaningful.
+    above = price_only(
+        checkpoint_price=100.0, current_price=101.2,
+        price_threshold=EARLY_SESSION_PRICE_THRESHOLD_FALLBACK_PCT,
+    )
+    assert above.price_signal.meaningful is True
 
 
 # ---------- 1. No checkpoint ----------

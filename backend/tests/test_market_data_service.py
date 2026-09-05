@@ -2,7 +2,10 @@ from datetime import date, datetime, timedelta, timezone
 
 from app.models.market_snapshot import SnapshotStatus
 from app.providers.base import MarketDataProvider, RawQuote
-from app.services.market_data_service import MarketDataService
+from app.services.market_data_service import (
+    STALE_THRESHOLD_SECONDS,
+    MarketDataService,
+)
 
 
 class FakeProvider(MarketDataProvider):
@@ -617,3 +620,169 @@ def test_no_db_supplied_skips_persistence_and_fallback_entirely(mock_db):
         {"RELIANCE.NS": "inst123"}
     )
     assert snapshots == []
+
+
+# --- get_snapshots: cache-first read path for GET /watchlist ----------
+#
+# fetch_snapshots always calls the provider. get_snapshots (used only by
+# GET /watchlist) skips the provider call entirely when a fresh-enough
+# persisted snapshot already exists, and otherwise delegates to
+# fetch_snapshots unchanged -- so persist-on-success and stale-fallback-
+# on-failure are exercised through the exact same code already tested
+# above, not reimplemented.
+
+
+class CountingProvider(MarketDataProvider):
+    """Wraps another provider and counts get_quotes calls, so a test can
+    assert the provider was (or was NOT) actually invoked -- the whole
+    point of get_snapshots is to skip that call when possible."""
+
+    def __init__(self, inner: MarketDataProvider):
+        self._inner = inner
+        self.call_count = 0
+
+    def get_quotes(self, symbols: list[str]) -> list[RawQuote]:
+        self.call_count += 1
+        return self._inner.get_quotes(symbols)
+
+
+def test_fresh_persisted_snapshot_avoids_provider_call(mock_db):
+    seed_provider = FakeProvider([make_quote(last_price=1326.4)])
+    MarketDataService(seed_provider, mock_db).fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    counting_provider = CountingProvider(FakeProvider([make_quote(last_price=9999.0)]))
+    service = MarketDataService(counting_provider, mock_db)
+
+    snapshots = service.get_snapshots({"RELIANCE.NS": "inst123"})
+
+    assert counting_provider.call_count == 0
+    assert len(snapshots) == 1
+    assert snapshots[0].last_price == 1326.4  # the persisted value, not the provider's
+    assert snapshots[0].status == SnapshotStatus.OK
+
+
+def test_stale_persisted_snapshot_triggers_provider_fetch(mock_db):
+    seed_provider = FakeProvider([make_quote(last_price=1326.4)])
+    MarketDataService(seed_provider, mock_db).fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    old_fetched_at = datetime.now(timezone.utc) - timedelta(
+        seconds=STALE_THRESHOLD_SECONDS + 1
+    )
+    mock_db.market_snapshots.update_one(
+        {"instrument_id": "inst123"},
+        {"$set": {"fetched_at": old_fetched_at.isoformat()}},
+    )
+
+    counting_provider = CountingProvider(FakeProvider([make_quote(last_price=1350.0)]))
+    service = MarketDataService(counting_provider, mock_db)
+
+    snapshots = service.get_snapshots({"RELIANCE.NS": "inst123"})
+
+    assert counting_provider.call_count == 1
+    assert len(snapshots) == 1
+    assert snapshots[0].last_price == 1350.0
+    assert snapshots[0].status == SnapshotStatus.OK
+
+
+def test_successful_fetch_after_stale_replaces_persisted_snapshot(mock_db):
+    seed_provider = FakeProvider([make_quote(last_price=1326.4)])
+    MarketDataService(seed_provider, mock_db).fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    old_fetched_at = datetime.now(timezone.utc) - timedelta(
+        seconds=STALE_THRESHOLD_SECONDS + 1
+    )
+    mock_db.market_snapshots.update_one(
+        {"instrument_id": "inst123"},
+        {"$set": {"fetched_at": old_fetched_at.isoformat()}},
+    )
+
+    fresh_provider = FakeProvider([make_quote(last_price=1350.0)])
+    MarketDataService(fresh_provider, mock_db).get_snapshots({"RELIANCE.NS": "inst123"})
+
+    doc = mock_db.market_snapshots.find_one({"instrument_id": "inst123"})
+    assert doc["last_price"] == 1350.0
+    assert doc["status"] == SnapshotStatus.OK.value
+
+
+def test_provider_failure_after_stale_returns_last_known_good_as_stale(mock_db):
+    seed_provider = FakeProvider([make_quote(last_price=1326.4)])
+    MarketDataService(seed_provider, mock_db).fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    old_fetched_at = datetime.now(timezone.utc) - timedelta(
+        seconds=STALE_THRESHOLD_SECONDS + 1
+    )
+    mock_db.market_snapshots.update_one(
+        {"instrument_id": "inst123"},
+        {"$set": {"fetched_at": old_fetched_at.isoformat()}},
+    )
+
+    counting_provider = CountingProvider(
+        FakeProvider([make_quote(fetch_succeeded=False, last_price=None)])
+    )
+    service = MarketDataService(counting_provider, mock_db)
+
+    snapshots = service.get_snapshots({"RELIANCE.NS": "inst123"})
+
+    assert counting_provider.call_count == 1  # a live fetch WAS attempted
+    assert len(snapshots) == 1
+    assert snapshots[0].last_price == 1326.4  # last-known-good, unchanged
+    assert snapshots[0].status == SnapshotStatus.STALE
+
+    # The stale persisted document itself is untouched by the failure.
+    doc = mock_db.market_snapshots.find_one({"instrument_id": "inst123"})
+    assert doc["last_price"] == 1326.4
+
+
+def test_invalid_provider_data_after_stale_does_not_overwrite_persisted_snapshot(mock_db):
+    seed_provider = FakeProvider(
+        [make_quote(last_price=1326.4, previous_close=1302.6)]
+    )
+    MarketDataService(seed_provider, mock_db).fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    old_fetched_at = datetime.now(timezone.utc) - timedelta(
+        seconds=STALE_THRESHOLD_SECONDS + 1
+    )
+    mock_db.market_snapshots.update_one(
+        {"instrument_id": "inst123"},
+        {"$set": {"fetched_at": old_fetched_at.isoformat()}},
+    )
+
+    invalid_provider = FakeProvider([make_quote(previous_close=0.0)])
+    service = MarketDataService(invalid_provider, mock_db)
+
+    snapshots = service.get_snapshots({"RELIANCE.NS": "inst123"})
+
+    assert len(snapshots) == 1
+    assert snapshots[0].last_price == 1326.4
+    assert snapshots[0].status == SnapshotStatus.STALE
+
+    doc = mock_db.market_snapshots.find_one({"instrument_id": "inst123"})
+    assert doc["last_price"] == 1326.4
+    assert doc["previous_close"] == 1302.6
+
+
+def test_missing_persisted_snapshot_attempts_provider_fetch_via_get_snapshots(mock_db):
+    """No persisted document at all -- same as "stale," a live fetch
+    must still be attempted rather than silently reporting nothing."""
+    counting_provider = CountingProvider(FakeProvider([make_quote(last_price=1326.4)]))
+    service = MarketDataService(counting_provider, mock_db)
+
+    snapshots = service.get_snapshots({"RELIANCE.NS": "inst123"})
+
+    assert counting_provider.call_count == 1
+    assert len(snapshots) == 1
+    assert snapshots[0].last_price == 1326.4
+
+
+def test_get_snapshots_with_no_db_falls_back_to_fetch_snapshots_behavior(mock_db):
+    """No db supplied: get_snapshots must behave exactly like
+    fetch_snapshots (always call the provider) -- same backward-
+    compatibility guarantee as fetch_snapshots itself."""
+    counting_provider = CountingProvider(FakeProvider([make_quote(last_price=1326.4)]))
+    service = MarketDataService(counting_provider, None)
+
+    snapshots = service.get_snapshots({"RELIANCE.NS": "inst123"})
+
+    assert counting_provider.call_count == 1
+    assert len(snapshots) == 1
+    assert mock_db.market_snapshots.count_documents({}) == 0

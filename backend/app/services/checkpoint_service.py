@@ -106,6 +106,14 @@ class CheckpointService:
         not duplicated between create_checkpoint_from_snapshot and
         ensure_initial_checkpoint.
         """
+        # Captured ONCE and reused for both the threshold computation
+        # below and the checkpoint's own checkpoint_at -- so the
+        # near-market-open guard inside _compute_adaptive_price_threshold
+        # judges elapsed-time-since-open against the EXACT same instant
+        # this checkpoint is actually stamped with, not a second,
+        # microscopically-different clock read.
+        checkpoint_at = datetime.now(timezone.utc)
+
         # Computed ONCE, here, from the exact snapshot establishing this
         # checkpoint -- never recomputed later from a wider intraday
         # range. This is what "the adaptive threshold must not drift
@@ -113,13 +121,17 @@ class CheckpointService:
         # frozen into baseline_snapshot alongside last_price/volume, not
         # derived fresh on every future GET /watchlist evaluation.
         price_threshold_applied = _compute_adaptive_price_threshold(
-            snapshot.day_high, snapshot.day_low, snapshot.previous_close
+            snapshot.day_high,
+            snapshot.day_low,
+            snapshot.previous_close,
+            checkpoint_at=checkpoint_at,
+            session_date=snapshot.session_date,
         )
 
         checkpoint = Checkpoint(
             user_id=user_id,
             instrument_id=instrument_id,
-            checkpoint_at=datetime.now(timezone.utc),
+            checkpoint_at=checkpoint_at,
             session_date=snapshot.session_date,
             baseline_snapshot=BaselineSnapshot(
                 last_price=snapshot.last_price,

@@ -106,7 +106,13 @@ def get_watchlist(owner_id: str = Depends(resolve_owner_id)) -> dict:
         for inst in instruments
     }
 
-    snapshots = market_service.fetch_snapshots(symbol_to_instrument_id)
+    # get_snapshots (not fetch_snapshots): serves a persisted snapshot
+    # directly, without a provider call, whenever it's still fresh
+    # enough -- see market_data_service.py. Falls through to a live
+    # fetch (with persist-on-success / stale-fallback-on-failure,
+    # identical to every other caller) for anything missing or already
+    # stale.
+    snapshots = market_service.get_snapshots(symbol_to_instrument_id)
     snapshots_by_instrument_id = {s.instrument_id: s for s in snapshots}
 
     results = []
