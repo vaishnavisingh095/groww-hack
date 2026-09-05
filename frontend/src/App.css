@@ -548,6 +548,77 @@ button:focus-visible {
   margin-bottom: 10px;
 }
 
+/* View Details -- a quiet text-style toggle (not a bordered button like
+   Mark as seen, which stays the card's one primary action) revealing a
+   subordinate panel of already-shown facts, restated explicitly. Uses
+   the existing --color-bg token (already used for the Signals pills) as
+   a subtle background so the panel reads as "inset" rather than another
+   card-level surface. */
+.attention-details-toggle {
+  background: transparent;
+  color: var(--color-primary);
+  border: none;
+  padding: 0;
+  margin-bottom: 10px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.attention-details-toggle:hover {
+  color: var(--color-primary-hover);
+  text-decoration: underline;
+}
+
+.attention-details {
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 12px;
+  margin-bottom: 10px;
+}
+
+.attention-details-heading {
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-text-muted);
+  margin: 0 0 8px;
+}
+
+.attention-details-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 0.82rem;
+  padding: 3px 0;
+}
+
+.attention-details-label {
+  color: var(--color-text-muted);
+}
+
+.attention-details-value {
+  color: var(--color-text-primary);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+/* Reuses .attention-block-label (unchanged elsewhere -- still used by
+   the main card's "What changed"/"Why it matters" labels) for the
+   Detection/Detection basis/Volume signal/Data context sub-headings
+   inside this panel, only adjusting its spacing in this specific
+   context to separate consecutive row groups. */
+.attention-details .attention-block-label {
+  margin: 10px 0 4px;
+}
+
+.attention-details .attention-block-label:first-of-type {
+  margin-top: 0;
+}
+
 /* A defined action row, separated from the metadata footer above it by
    the same border token used elsewhere on the card (price-area divider),
    rather than the button simply trailing off the last block. */

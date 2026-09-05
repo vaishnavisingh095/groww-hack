@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { formatPrice, formatPercentChange, formatRelativeTime } from '../format'
 
 // Mirrors app/services/attention_engine.py's AttentionLevel enum values
@@ -22,6 +23,44 @@ const WHY_IT_MATTERS = {
   watch: 'Just crossed into meaningful-change territory.',
 }
 
+// Absolute rendering of the SAME item.detected_at value the footer's
+// relative label already uses -- not a new fact, just a second, precise
+// formatting of one already-displayed field. No new dependency:
+// Date/toLocaleString are built into the JS runtime.
+function formatAbsoluteDetectedAt(isoString) {
+  if (!isoString) return null
+  const date = new Date(isoString)
+  if (Number.isNaN(date.getTime())) return null
+  return date.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
+}
+
+// Mirrors WatchlistTable.jsx's own STATUS_LABELS wording exactly (Fresh/
+// Delayed/Unavailable/Invalid). Duplicated here as a tiny local display
+// map rather than imported -- the two components don't share a module
+// for display-only lookups -- but it is the same real
+// watchlistEntry.status field, never reinterpreted.
+const STATUS_LABELS = {
+  ok: 'Fresh',
+  stale: 'Delayed',
+  unavailable: 'Unavailable',
+  invalid: 'Invalid',
+}
+
+// Mirrors app/services/change_engine.py's PRICE_CHANGE_THRESHOLD_PCT and
+// VOLUME_ACCELERATION_THRESHOLD exactly (both locked at 2.0 -- see
+// decisions.md's "Locked starting thresholds"). These are backend-only
+// Python constants: no API response field ever carries them, so there
+// is no shared module to import across the Python/JS boundary without
+// adding a new backend field or a new shared dependency purely for this
+// UI, which is explicitly out of scope for this change. They are
+// duplicated here as plain literals instead, the same pattern this file
+// already uses for LEVEL_LABELS/WHY_IT_MATTERS (mirroring a backend-
+// defined concept locally rather than fetching it). If either backend
+// constant is ever changed, this copy must be updated by hand -- there
+// is no automatic sync.
+const PRICE_CHANGE_THRESHOLD_PCT = 2.0
+const VOLUME_ACCELERATION_THRESHOLD = 2.0
+
 function AttentionCard({ item, watchlistEntry, onMarkAsSeen, inFlight, actionError }) {
   // GET /watchlist/attention does not include current price, day-over-
   // day change, exchange, or freshness/status -- those live on GET
@@ -33,6 +72,7 @@ function AttentionCard({ item, watchlistEntry, onMarkAsSeen, inFlight, actionErr
   // rather than guessing.
   const price = watchlistEntry ? watchlistEntry.price : null
   const freshnessLabel = watchlistEntry ? watchlistEntry.freshness_label : null
+  const status = watchlistEntry ? watchlistEntry.status : null
   const exchange = watchlistEntry ? watchlistEntry.exchange : null
   // Day-over-day change, from GET /watchlist's percent_change --
   // deliberately a DIFFERENT field from item.price_change_pct
@@ -46,6 +86,17 @@ function AttentionCard({ item, watchlistEntry, onMarkAsSeen, inFlight, actionErr
     dayChangePct > 0 ? 'percent-up' : dayChangePct < 0 ? 'percent-down' : ''
 
   const detectedLabel = formatRelativeTime(item.detected_at)
+  const absoluteDetectedLabel = formatAbsoluteDetectedAt(item.detected_at)
+
+  // View Details is OBSERVATION ONLY -- local component state, no prop,
+  // no callback into App.jsx, no API call. Toggling it never touches
+  // instruments/attentionItems, never calls loadAll(), never creates a
+  // checkpoint or acknowledges anything, and never affects
+  // searchQuery/watchlistFilter. React preserves this state across
+  // polling refreshes because AttentionGroup keys each card by the
+  // stable item.instrument_id.
+  const [expanded, setExpanded] = useState(false)
+  const detailsId = `attention-details-${item.instrument_id}`
 
   return (
     <li className={`attention-card attention-level-${item.attention_level}`}>
@@ -135,6 +186,109 @@ function AttentionCard({ item, watchlistEntry, onMarkAsSeen, inFlight, actionErr
           {freshnessLabel && <span>{freshnessLabel}</span>}
           {freshnessLabel && detectedLabel && <span aria-hidden="true"> · </span>}
           {detectedLabel && <span>{detectedLabel}</span>}
+        </div>
+      )}
+
+      {/* VIEW DETAILS -- deliberately does NOT repeat What Changed / Why
+          It Matters / Signals, which the card above already covers.
+          This explains HOW the item was detected: the existing
+          meaningful-change rule applied to this item's own already-
+          known values (never a new rule, never a new score -- "Result"
+          below is a plain >= comparison against the same locked 2.0%/
+          2.0x constants the backend itself uses), plus data-trust facts
+          not already prominent on the card. Built entirely from
+          item/watchlistEntry, already passed into this component. */}
+      <button
+        type="button"
+        className="attention-details-toggle"
+        aria-expanded={expanded}
+        aria-controls={detailsId}
+        onClick={() => setExpanded((prev) => !prev)}
+      >
+        {expanded ? 'Hide details' : 'View details'}
+      </button>
+
+      {expanded && (
+        <div className="attention-details" id={detailsId}>
+          <p className="attention-details-heading">Details</p>
+
+          <p className="attention-block-label">Detection</p>
+          <div className="attention-details-row">
+            <span className="attention-details-label">Detected</span>
+            <span className="attention-details-value">{absoluteDetectedLabel || '—'}</span>
+          </div>
+          <div className="attention-details-row">
+            <span className="attention-details-label">Attention</span>
+            <span className="attention-details-value">{item.attention_level.toUpperCase()}</span>
+          </div>
+          <div className="attention-details-row">
+            <span className="attention-details-label">Since checkpoint</span>
+            <span className={`attention-details-value ${pctClass}`}>
+              {formatPercentChange(item.price_change_pct)}
+            </span>
+          </div>
+
+          <p className="attention-block-label">Detection basis</p>
+          <div className="attention-details-row">
+            <span className="attention-details-label">Price movement</span>
+            <span className={`attention-details-value ${pctClass}`}>
+              {formatPercentChange(item.price_change_pct)}
+            </span>
+          </div>
+          <div className="attention-details-row">
+            <span className="attention-details-label">Meaningful threshold</span>
+            <span className="attention-details-value">
+              ≥ {PRICE_CHANGE_THRESHOLD_PCT.toFixed(2)}%
+            </span>
+          </div>
+          <div className="attention-details-row">
+            <span className="attention-details-label">Result</span>
+            <span className="attention-details-value">
+              {Math.abs(item.price_change_pct) >= PRICE_CHANGE_THRESHOLD_PCT
+                ? 'Threshold crossed'
+                : 'Below threshold'}
+            </span>
+          </div>
+
+          {/* "Not available" for all three rows -- never a fabricated
+              0.0x or a fabricated threshold/status -- when the volume
+              signal itself is unavailable. Missing volume is never
+              interpreted as zero. */}
+          <p className="attention-block-label">Volume signal</p>
+          <div className="attention-details-row">
+            <span className="attention-details-label">Volume acceleration</span>
+            <span className="attention-details-value">
+              {item.volume_acceleration_available
+                ? `${item.volume_acceleration_ratio.toFixed(2)}×`
+                : 'Not available'}
+            </span>
+          </div>
+          <div className="attention-details-row">
+            <span className="attention-details-label">Meaningful threshold</span>
+            <span className="attention-details-value">
+              {item.volume_acceleration_available
+                ? `≥ ${VOLUME_ACCELERATION_THRESHOLD.toFixed(2)}×`
+                : 'Not available'}
+            </span>
+          </div>
+          <div className="attention-details-row">
+            <span className="attention-details-label">Status</span>
+            <span className="attention-details-value">
+              {item.volume_acceleration_available ? 'Available' : 'Not available'}
+            </span>
+          </div>
+
+          <p className="attention-block-label">Data context</p>
+          <div className="attention-details-row">
+            <span className="attention-details-label">Data status</span>
+            <span className="attention-details-value">
+              {status ? STATUS_LABELS[status] || status : '—'}
+            </span>
+          </div>
+          <div className="attention-details-row">
+            <span className="attention-details-label">Updated</span>
+            <span className="attention-details-value">{freshnessLabel || '—'}</span>
+          </div>
         </div>
       )}
 
