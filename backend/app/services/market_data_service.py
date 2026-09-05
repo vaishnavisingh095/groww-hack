@@ -290,6 +290,7 @@ class MarketDataService:
             percent_change=percent_change,
             volume=volume,
             session_date=quote.session_date,
+            bar_timestamp=quote.bar_timestamp,
             day_high=day_high,
             day_low=day_low,
             fetched_at=quote.fetched_at,

@@ -1,4 +1,4 @@
-import { formatPrice, formatVolume, formatPercentChange } from '../format'
+import { formatPrice, formatVolume, formatPercentChange, formatMarketDataLabel } from '../format'
 
 // Status labels/classes match app/models/market_snapshot.py's
 // SnapshotStatus exactly (ok/stale/unavailable/invalid) -- "invalid" is
@@ -61,7 +61,7 @@ function WatchlistRow({ instrument, onMarkAsSeen, inFlight, actionError, savedMe
       </td>
       <td className="col-volume">{formatVolume(instrument.cumulative_volume)}</td>
       <td className="col-freshness">
-        {instrument.freshness_label}
+        {formatMarketDataLabel(instrument)}
         <br />
         <StatusBadge status={instrument.status} />
       </td>

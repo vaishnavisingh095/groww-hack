@@ -182,6 +182,7 @@ def test_get_watchlist_response_shape(client):
     assert "status" in reliance
     assert "freshness_label" in reliance
     assert "data_age_seconds" in reliance
+    assert "bar_timestamp" in reliance
     assert "change" in reliance
 
     # No yfinance-internal field names should ever leak through
@@ -189,6 +190,61 @@ def test_get_watchlist_response_shape(client):
     assert "fast_info" not in raw_json_keys
     assert "regularMarketTime" not in raw_json_keys
     assert "provider_timestamp" not in raw_json_keys  # diagnostics-only, not exposed to frontend
+
+
+def test_get_watchlist_exposes_bar_timestamp_as_iso_string(client, monkeypatch):
+    """(Focused regression, market-bar timestamp propagation milestone.)
+    bar_timestamp must be exposed as an ISO-8601 string (offset
+    included) when the provider supplied one, and null (not omitted)
+    when it didn't -- purely informational, never used to decide
+    status/freshness."""
+    test_client, mock_db = client
+
+    now = datetime.now(timezone.utc)
+    bar_timestamp = now.replace(microsecond=0)
+    quote_with_bar_timestamp = RawQuote(
+        symbol="RELIANCE.NS",
+        last_price=1326.4,
+        previous_close=1302.6,
+        volume=9122871,
+        provider_timestamp=1788509522,
+        fetched_at=now,
+        fetch_succeeded=True,
+        session_date=now.date(),
+        bar_timestamp=bar_timestamp,
+    )
+    provider = FakeProvider(
+        {
+            "RELIANCE.NS": quote_with_bar_timestamp,
+            "TCS.NS": make_quote("TCS.NS", 2312.8, 2320.0, 1722049),
+            "HDFCBANK.NS": make_quote("HDFCBANK.NS", 715.6, 706.6, 9937354),
+            "INFY.NS": make_quote("INFY.NS", 1129.0, 1130.3, 3875864),
+            "ICICIBANK.NS": make_quote("ICICIBANK.NS", 1432.5, 1430.0, 4072353),
+        }
+    )
+    monkeypatch.setattr(watchlist_routes, "_provider", provider)
+
+    body = test_client.get("/watchlist").json()
+
+    reliance = next(i for i in body["instruments"] if i["symbol"] == "RELIANCE")
+    assert reliance["bar_timestamp"] == bar_timestamp.isoformat()
+
+    # make_quote() (used for the other four) never sets bar_timestamp --
+    # must degrade to null, key still present, never omitted.
+    tcs = next(i for i in body["instruments"] if i["symbol"] == "TCS")
+    assert tcs["bar_timestamp"] is None
+
+
+def test_unavailable_instrument_bar_timestamp_is_null(client, monkeypatch):
+    test_client, mock_db = client
+    empty_provider = FakeProvider({})  # every symbol will fail, nothing ever persisted
+    monkeypatch.setattr(watchlist_routes, "_provider", empty_provider)
+
+    body = test_client.get("/watchlist").json()
+
+    for instrument in body["instruments"]:
+        assert instrument["status"] == "unavailable"
+        assert instrument["bar_timestamp"] is None
 
 
 def test_first_time_has_no_baseline_and_is_not_a_meaningful_change(client):

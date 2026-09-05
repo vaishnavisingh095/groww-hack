@@ -1,4 +1,5 @@
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from app.models.market_snapshot import SnapshotStatus
 from app.providers.base import MarketDataProvider, RawQuote
@@ -299,6 +300,36 @@ def test_valid_day_high_low_pass_through_unchanged():
     assert snapshots[0].day_low == 1310.0
 
 
+def test_bar_timestamp_survives_raw_quote_to_market_snapshot():
+    """(Focused regression, market-bar timestamp propagation milestone.)
+    bar_timestamp must pass through _assemble_snapshot unchanged,
+    tzinfo included -- never recomputed, never fabricated from
+    fetched_at."""
+    bar_timestamp = datetime(2026, 9, 4, 9, 17, tzinfo=ZoneInfo("Asia/Kolkata"))
+    provider = FakeProvider([make_quote(bar_timestamp=bar_timestamp)])
+    service = MarketDataService(provider)
+
+    snapshots = service.fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    assert len(snapshots) == 1
+    assert snapshots[0].bar_timestamp == bar_timestamp
+    assert snapshots[0].bar_timestamp.utcoffset() == timedelta(hours=5, minutes=30)
+
+
+def test_missing_bar_timestamp_degrades_gracefully_price_still_usable():
+    """Per this field's own contract: a missing bar_timestamp must NOT
+    invalidate an otherwise-valid snapshot -- mirrors day_high/day_low's
+    existing degrade-gracefully behavior."""
+    provider = FakeProvider([make_quote(bar_timestamp=None)])
+    service = MarketDataService(provider)
+
+    snapshots = service.fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    assert len(snapshots) == 1
+    assert snapshots[0].last_price == 1326.4
+    assert snapshots[0].bar_timestamp is None
+
+
 def test_missing_day_high_low_degrades_gracefully_price_still_usable():
     """Per this feature's own requirement: missing range data must NOT
     invalidate an otherwise-valid snapshot -- mirrors the existing
@@ -468,6 +499,31 @@ def test_successful_fetch_is_persisted_to_market_snapshots(mock_db):
     assert doc is not None
     assert doc["last_price"] == 1326.4
     assert doc["status"] == SnapshotStatus.OK.value
+
+
+def test_persisted_snapshot_round_trips_bar_timestamp(mock_db):
+    """(Focused regression, market-bar timestamp propagation milestone.)
+    bar_timestamp must survive the existing Mongo persist/read cycle
+    (model_dump(mode="json") -> Mongo -> MarketSnapshot(**doc)) with no
+    migration or new persistence mechanism -- this is the SAME generic
+    round-trip every other field already gets, exercised here via the
+    stale-fallback read path, which reconstructs a MarketSnapshot from a
+    persisted document."""
+    bar_timestamp = datetime(2026, 9, 4, 9, 17, tzinfo=ZoneInfo("Asia/Kolkata"))
+    good_provider = FakeProvider([make_quote(bar_timestamp=bar_timestamp)])
+    MarketDataService(good_provider, mock_db).fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    doc = mock_db.market_snapshots.find_one({"instrument_id": "inst123"})
+    assert doc["bar_timestamp"] == bar_timestamp.isoformat()  # stored as ISO-8601, offset included
+
+    failing_provider = FakeProvider([make_quote(fetch_succeeded=False, last_price=None)])
+    fallback = MarketDataService(failing_provider, mock_db).fetch_snapshots(
+        {"RELIANCE.NS": "inst123"}
+    )
+
+    assert len(fallback) == 1
+    assert fallback[0].bar_timestamp == bar_timestamp
+    assert fallback[0].bar_timestamp.utcoffset() == timedelta(hours=5, minutes=30)
 
 
 def test_provider_failure_with_prior_valid_snapshot_returns_stale_fallback(mock_db):

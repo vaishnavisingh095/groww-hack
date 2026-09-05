@@ -141,6 +141,7 @@ def get_watchlist(owner_id: str = Depends(resolve_owner_id)) -> dict:
                     "status": SnapshotStatus.UNAVAILABLE.value,
                     "freshness_label": "Data unavailable",
                     "data_age_seconds": None,
+                    "bar_timestamp": None,
                     "change": {
                         "has_baseline": False,
                         "meaningful_change": False,
@@ -203,6 +204,13 @@ def get_watchlist(owner_id: str = Depends(resolve_owner_id)) -> dict:
                 "status": snapshot.status.value,
                 "freshness_label": label,
                 "data_age_seconds": age_seconds,
+                # Purely informational -- the actual market-observation
+                # time, distinct from freshness_label/data_age_seconds
+                # above (which remain fetched_at-derived, unchanged).
+                # Never used by this handler to decide status/staleness.
+                "bar_timestamp": (
+                    snapshot.bar_timestamp.isoformat() if snapshot.bar_timestamp else None
+                ),
                 "change": {
                     "has_baseline": change_result.has_baseline,
                     "meaningful_change": change_result.meaningful_change,

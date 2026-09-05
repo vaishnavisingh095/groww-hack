@@ -44,6 +44,19 @@ class RawQuote:
     # was found (fetch_succeeded=False).
     session_date: date | None = None
 
+    # The FULL timestamp of that SAME intraday bar (see session_date
+    # above) -- the actual market-observation time, preserved exactly as
+    # yfinance/pandas reports it (exchange-local, e.g. Asia/Kolkata for
+    # NSE), tzinfo included, never converted to UTC or dropped. This is
+    # deliberately a SEPARATE field from fetched_at (our own clock, when
+    # WE made the request) and provider_timestamp (unverified, diagnostics-
+    # only regularMarketTime) -- see decisions.md's "Market-bar timestamp
+    # propagation" entry. Purely informational: never used to compute
+    # freshness/status, which remains fetched_at's job alone. None only
+    # when no valid bar/price was found (fetch_succeeded=False), same as
+    # session_date.
+    bar_timestamp: datetime | None = None
+
     # Today's intraday high/low, for the adaptive price meaningful-change
     # threshold (see change_engine.py's _compute_adaptive_price_threshold).
     # Derived from the SAME intraday bar data last_price/volume already

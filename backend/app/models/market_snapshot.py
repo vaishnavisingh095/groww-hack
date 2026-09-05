@@ -52,6 +52,19 @@ class MarketSnapshot(BaseModel):
 
     session_date: date
 
+    # The FULL timestamp of the intraday bar last_price/session_date came
+    # from -- the actual market-observation time, preserved exactly as
+    # the provider reported it (exchange-local, tzinfo included, e.g.
+    # Asia/Kolkata for NSE). Deliberately SEPARATE from fetched_at (our
+    # own clock) and provider_timestamp (unverified diagnostics) -- see
+    # decisions.md's "Market-bar timestamp propagation" entry. Nullable
+    # for backward compatibility with documents persisted before this
+    # field existed, and because a valid quote can still lack one (no
+    # valid bar found for the timestamp, same as session_date). Purely
+    # informational: NEVER used to compute `status` below -- that
+    # remains fetched_at's job alone, unchanged.
+    bar_timestamp: datetime | None = None
+
     # Today's intraday high/low, feeding the adaptive price
     # meaningful-change threshold (see change_engine.py). Nullable and
     # deliberately unvalidated beyond typing here -- a missing or

@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { formatPrice, formatPercentChange, formatRelativeTime } from '../format'
+import { formatPrice, formatPercentChange, formatRelativeTime, formatMarketDataLabel } from '../format'
 
 // Mirrors app/services/attention_engine.py's AttentionLevel enum values
 // exactly (already serialized lowercase by the API via `.value`).
@@ -74,7 +74,13 @@ function AttentionCard({ item, watchlistEntry, onMarkAsSeen, inFlight, actionErr
   // between the two fetches), the fields below degrade to "—"/absence
   // rather than guessing.
   const price = watchlistEntry ? watchlistEntry.price : null
-  const freshnessLabel = watchlistEntry ? watchlistEntry.freshness_label : null
+  // formatMarketDataLabel builds "Market data · HH:MM IST · Xm ago" from
+  // watchlistEntry's bar_timestamp + status + data_age_seconds when a
+  // bar_timestamp is available, falling back to the backend's own
+  // freshness_label verbatim otherwise -- see format.js. status/
+  // data_age_seconds (freshness/staleness) are unchanged; bar_timestamp
+  // is purely additional context, never used to decide them.
+  const freshnessLabel = formatMarketDataLabel(watchlistEntry)
   const status = watchlistEntry ? watchlistEntry.status : null
   const exchange = watchlistEntry ? watchlistEntry.exchange : null
   // Day-over-day change, from GET /watchlist's percent_change --

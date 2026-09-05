@@ -20,8 +20,9 @@ Real-network verification against actual yfinance happens separately via
 manual end-to-end testing, not here.
 """
 import math
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -213,6 +214,74 @@ def test_session_date_reflects_the_same_bar_used_for_last_price_across_a_day_bou
     q = quotes[0]
     assert q.last_price == 1310.0  # the last VALID close (earlier day's second bar)
     assert q.session_date == date(2026, 9, 4)  # the SAME bar's date, not 2026-09-05
+
+
+# ---------- 1c. bar_timestamp preserves the exact bar's own timestamp ----------
+
+
+def test_bar_timestamp_is_the_full_tz_aware_timestamp_of_the_last_price_bar():
+    """(Focused regression, market-bar timestamp propagation milestone.)
+    The FULL timestamp (not just the date) of the SAME bar last_price
+    came from must be preserved -- exchange-local (Asia/Kolkata for
+    NSE), tzinfo included, never converted to UTC or stripped."""
+    bars = make_intraday_bars([(1300.0, 1000), (1310.0, 1500), (1322.0, 800)])
+    fake_ticker = make_fake_ticker(bars=bars, info={"regularMarketPreviousClose": 1302.5})
+
+    with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
+        quotes = YFinanceProvider().get_quotes(["RELIANCE.NS"])
+
+    q = quotes[0]
+    # make_intraday_bars starts its index at 2026-09-04 09:15 IST with
+    # 1-minute bars -- the third (last, latest-valid) bar is 09:17 IST.
+    assert q.bar_timestamp == datetime(2026, 9, 4, 9, 17, tzinfo=ZoneInfo("Asia/Kolkata"))
+    assert q.bar_timestamp.tzinfo is not None  # never a naive datetime
+    assert q.bar_timestamp.utcoffset() == timedelta(hours=5, minutes=30)  # IST, preserved as-is
+
+
+def test_bar_timestamp_reflects_the_same_bar_used_for_last_price_across_a_day_boundary():
+    """bar_timestamp (like session_date) must come from the SAME bar as
+    last_price -- when trailing bars on a later calendar day are all
+    invalid and the search falls back to a valid bar on an earlier day,
+    bar_timestamp must reflect THAT earlier bar, not a later one."""
+    earlier_day_index = pd.date_range(
+        "2026-09-04 15:28", periods=2, freq="1min", tz="Asia/Kolkata"
+    )
+    later_day_index = pd.date_range(
+        "2026-09-05 09:15", periods=2, freq="1min", tz="Asia/Kolkata"
+    )
+    index = earlier_day_index.append(later_day_index)
+    bars = pd.DataFrame(
+        {
+            "Open": [1300.0, 1310.0, float("nan"), float("nan")],
+            "High": [1300.0, 1310.0, float("nan"), float("nan")],
+            "Low": [1300.0, 1310.0, float("nan"), float("nan")],
+            "Close": [1300.0, 1310.0, float("nan"), float("nan")],  # last two bars invalid
+            "Volume": [1000, 1500, 0, 0],
+        },
+        index=index,
+    )
+    fake_ticker = make_fake_ticker(bars=bars, info={"regularMarketPreviousClose": 1290.0})
+
+    with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
+        quotes = YFinanceProvider().get_quotes(["RELIANCE.NS"])
+
+    q = quotes[0]
+    assert q.last_price == 1310.0  # the last VALID close (earlier day's second bar)
+    assert q.bar_timestamp == datetime(2026, 9, 4, 15, 29, tzinfo=ZoneInfo("Asia/Kolkata"))
+
+
+def test_bar_timestamp_is_none_when_no_valid_bar_found():
+    """No usable price -> no bar_timestamp either, same degrade-together
+    behavior as session_date."""
+    bars = make_intraday_bars([])
+    fake_ticker = make_fake_ticker(bars=bars, info={"regularMarketPreviousClose": 1302.5})
+
+    with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
+        quotes = YFinanceProvider().get_quotes(["RELIANCE.NS"])
+
+    q = quotes[0]
+    assert q.fetch_succeeded is False
+    assert q.bar_timestamp is None
 
 
 # ---------- 2. Cumulative volume is derived correctly ----------
