@@ -73,6 +73,9 @@ I deliberately avoided Kafka, Redis, WebSockets, Kubernetes, microservices, queu
 
 ## Architecture
 
+![Uploading image.png…]()
+
+
 The frontend communicates only with the FastAPI backend.
 
 The **Market Data Service** is the only component that communicates with `yfinance` and uses a cache-first strategy with last-known-good fallback.
