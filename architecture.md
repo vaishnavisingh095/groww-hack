@@ -6,7 +6,7 @@
 |---|---|---|
 | Anonymous Identity (`identity.py`) | Resolves/issues the per-browser anonymous capability cookie; the one place `user_id` is ever derived | Nothing persisted — the cookie value itself, set on the HTTP response |
 | Watchlist Service | Owner-scoped watchlist membership; global Instrument creation/reuse; Add Stock | Instrument (global), Watchlist (owner-scoped) documents |
-| Market Data Service | Talks to the external provider and assembles snapshots; **as currently implemented, fetches live on demand per request rather than via a background poll loop** (see Data Flow above) | Nothing persisted — in-memory `MarketSnapshot` value objects per request |
+| Market Data Service | Talks to the external provider and assembles snapshots; **as currently implemented, fetches on demand from request handlers rather than via a background poll loop** (see Data Flow above) | `MarketSnapshot` documents in `market_snapshots` (one per instrument, upserted on every successful fetch) — used both as a cache (`GET /watchlist` reads it before calling the provider) and as a last-known-good fallback on provider failure |
 | Checkpoint Service | Creates/advances user checkpoints (explicit only in practice — see Checkpoint Model below) | Checkpoint documents |
 | Meaningful Change Engine | Compares a checkpoint's baseline snapshot to the current snapshot using fixed deterministic rules | Nothing persisted — a pure function of the values passed in |
 | ChangeEvent Service | Persists/dedupes ChangeEvents from the Change Engine's output; acknowledges them on explicit action | ChangeEvent documents |
@@ -45,24 +45,31 @@ their respective services; they don't flow through the poll loop.
 
 **CURRENT IMPLEMENTATION NOTE — this diagram describes the originally
 designed data flow, not what actually runs today.** There is no
-standalone backend poll loop and no persisted `MarketSnapshot` document.
-`MarketDataService.fetch_snapshots` is called synchronously, live,
-inside `GET /watchlist`'s (and the two Mark Seen/Mark All routes')
-own request handler, every time one of those routes is called — the
-"poll" a user experiences is the **frontend's** own client-side
+standalone backend poll loop. `MarketSnapshot` documents ARE now
+persisted (`market_snapshots`, upserted per instrument on every
+successful fetch) — used as a cache and as a last-known-good fallback,
+not as the originally-designed poll-loop's write path. The "poll" a
+user experiences is still the **frontend's** own client-side
 `setInterval` re-calling `GET /watchlist`/`GET /watchlist/attention`
-every 60 seconds, not a backend process. The real, current data flow is:
+every 60 seconds, not a backend process. The real, current data flow
+now differs by entry point:
 
 ```
-[Frontend poll / user action]
+[Frontend poll]
         |
         v
-GET /watchlist  (or a Mark Seen/Mark All route)
+GET /watchlist  --> MarketDataService.get_snapshots
         |
-        v
-MarketDataService.fetch_snapshots  --(live call, every invocation)--> [External Provider]
+        |-- persisted market_snapshots doc <=120s old? --> serve it directly,
+        |                                                  NO provider call
         |
-   in-memory MarketSnapshot value objects (never written to Mongo)
+        `-- missing or stale --> MarketDataService.fetch_snapshots --(live)--> [External Provider]
+                                        |                                          |
+                                        |<-- success: persist to market_snapshots -+
+                                        |
+                                        `-- failure: fall back to the persisted
+                                            doc (if any), reported `stale`;
+                                            otherwise `unavailable`
         |
         v
 [Checkpoint] (Mongo, read-only on this path) ---compare---> [Meaningful Change Engine]
@@ -77,13 +84,30 @@ MarketDataService.fetch_snapshots  --(live call, every invocation)--> [External 
 [Attention Engine] --ranked + explained--> [Frontend]
 ```
 
+```
+[User action: Mark as Seen / Mark All as Seen]
+        |
+        v
+mark_as_seen / mark_all_as_seen --> MarketDataService.fetch_snapshots
+--(always live, never the cache)--> [External Provider]
+        |
+   success (status OK) persists to market_snapshots and advances the
+   checkpoint; a stale fallback or failure is rejected -- never becomes
+   a checkpoint baseline
+        v
+[Checkpoint] (Mongo, write) --> acknowledges any active ChangeEvent
+```
+
 This is a documented, deliberate sequencing choice (the on-demand
 approach reuses the same `MarketDataService`/`MarketDataProvider`
 abstraction the background loop would have used), not an unnoticed gap
 — see `decisions.md`'s "On-demand fetch per request, not a separate
-background poll process" entry for the full reasoning and its known
-trade-off: N concurrent users currently cause N concurrent provider
-fetches for the same instrument, not one shared fetch.
+background poll process" and "Cache-first watchlist reads" entries for
+the full reasoning. The cache-first `GET /watchlist` path reduces, but
+does not eliminate, the known trade-off that N concurrent users can
+still cause N concurrent provider fetches for the same instrument when
+its cached snapshot is stale; `mark_as_seen`/`mark_all_as_seen` have no
+such mitigation, by design.
 
 ## API Boundaries
 
@@ -993,7 +1017,12 @@ results in a `MarketSnapshot.status` of `stale`/`invalid`/`unavailable`.
     once, at explicit checkpoint creation, and frozen onto
     `baseline_snapshot.price_threshold_applied` for that checkpoint
     version's lifetime — it is never recomputed from a later, wider
-    intraday range on a subsequent `GET /watchlist` evaluation.
+    intraday range on a subsequent `GET /watchlist` evaluation. A
+    checkpoint established less than 15 minutes after that session's
+    market open uses a fixed 1.0% fallback threshold instead, since the
+    observed intraday range that early is not yet representative — see
+    `decisions.md`'s "Minimum observation-time guard for the adaptive
+    price threshold" entry.
 
 ## Failure Modes & Responses
 
@@ -1337,11 +1366,14 @@ accepted boundaries of this build's scope.
   documented rate limit, no verified exchange-trade-time field — see
   External Dependency below.
 - **Request-time market-data fetching is not a background pipeline.**
-  Every `GET /watchlist` (and the two Mark Seen/Mark All routes) makes a
-  live provider call; there is no shared poll process and no fan-out
-  deduplication across concurrent users. See the Current Implementation
-  Note under Data Flow above and `decisions.md`'s "On-demand fetch per
-  request" entry.
+  There is still no shared poll process. `GET /watchlist` is cache-first
+  and calls the provider only when its persisted snapshot is missing or
+  older than 120 seconds; `mark_as_seen`/`mark_all_as_seen` always make
+  a live provider call, by design. Neither path has fan-out
+  deduplication across concurrent users/requests. See the Current
+  Implementation Note under Data Flow above and `decisions.md`'s
+  "On-demand fetch per request" and "Cache-first watchlist reads"
+  entries.
 - **Last-known-good fallback is stale-only, not a poll loop.** Every
   successful on-demand fetch upserts its valid `MarketSnapshot` into
   `market_snapshots`, keyed on `instrument_id`. A later failed fetch for
@@ -1355,6 +1387,18 @@ accepted boundaries of this build's scope.
   has never had a successful fetch, it still reports `unavailable`,
   unchanged. See `decisions.md`'s "Last-known-good market data fallback"
   entry.
+- **Provider HTTP calls are individually bounded, not the whole
+  request.** Each yfinance network call (`history()`, `.info`,
+  `.fast_info`) is capped at a 5-second timeout via a shared `requests`
+  session/adapter — this bounds one provider HTTP call, not the total
+  time a `GET /watchlist`/Mark Seen request can take (which can still
+  make several such calls across several instruments). No retries are
+  added. See `decisions.md`'s "Provider network timeout" entry.
+- **Market-bar timestamp is informational only.** `bar_timestamp` (the
+  actual intraday bar's own exchange-local timestamp) is preserved and
+  displayed alongside freshness, but never used to compute
+  `status`/staleness — `fetched_at` remains the sole input to that.
+  See `decisions.md`'s "Market-bar timestamp propagation" entry.
 - **No frontend automated test harness.** The frontend has no test
   framework (no vitest/jest/testing-library) in `package.json`; frontend
   correctness is verified by `npm run lint`/`npm run build` and direct

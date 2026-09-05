@@ -105,7 +105,10 @@ explainable change detection, and attention ranking.
   this product surfaces "what changed," never a position or a trade
   suggestion.
 - News/social features.
-- A persisted "last-known-good" snapshot fallback for provider failure.
+- ~~A persisted "last-known-good" snapshot fallback for provider
+  failure.~~ **Built — this was later reconsidered and shipped; see
+  COMPLETED below and `decisions.md`'s "Last-known-good market data
+  fallback" entry.**
 - Full authentication/account system (OAuth, passwords, login UI) — see
   the Persistent Anonymous Watchlist Identity note under Current Status
   for what identity mechanism was actually built instead.
@@ -175,16 +178,20 @@ assumed).
 
 **Current implementation note**: this section describes the originally
 designed shared backend poll loop. The implementation instead fetches
-on demand, synchronously, inside `GET /watchlist`'s own request
-handler — there is no standalone backend process polling on a timer,
-and no fan-out deduplication across users yet. The "every 60 seconds"
-behavior a user actually experiences today comes from the **frontend's**
-own client-side poll (`App.jsx`'s `setInterval`), which simply calls
-`GET /watchlist`/`GET /watchlist/attention` again. This is a documented,
-deliberate sequencing choice, not an oversight — see `decisions.md`'s
-"On-demand fetch per request, not a separate background poll process"
-entry for the full reasoning and its known trade-offs (no shared-fetch
-protection under concurrent users yet).
+from request handlers — there is no standalone backend process polling
+on a timer. The "every 60 seconds" behavior a user actually experiences
+today comes from the **frontend's** own client-side poll (`App.jsx`'s
+`setInterval`), which simply calls `GET /watchlist`/`GET
+/watchlist/attention` again. This is a documented, deliberate
+sequencing choice, not an oversight — see `decisions.md`'s "On-demand
+fetch per request, not a separate background poll process" entry for
+the full reasoning. `GET /watchlist` itself is now cache-first (reads a
+persisted `market_snapshots` document, ≤120s old, before ever calling
+the provider — see `decisions.md`'s "Cache-first watchlist reads"
+entry), which naturally reduces, but does not eliminate, concurrent
+duplicate fetches for the same instrument when the cache is stale;
+`mark_as_seen`/`mark_all_as_seen` still always fetch live and have no
+such protection.
 
 ## Build Order
 
@@ -334,6 +341,34 @@ Frontend:
     real per-event threshold instead of a hardcoded frontend constant.
     See `decisions.md`'s "Adaptive price meaningful-change threshold"
     entry for the full formula, bounds, and reasoning.
+29. Last-known-good market data fallback + cache-first `GET /watchlist`
+    reads — every successful live fetch persists its `MarketSnapshot`
+    to `market_snapshots`; `GET /watchlist` serves that persisted
+    snapshot directly when it's ≤120s old (no provider call), and falls
+    back to it (marked `stale`) when a live fetch is attempted and
+    fails. A stale fallback is display-only — it can never create a
+    `ChangeEvent` or become a checkpoint baseline. See `decisions.md`'s
+    "Last-known-good market data fallback" and "Cache-first watchlist
+    reads" entries.
+30. Minimum observation-time guard on the adaptive price threshold — a
+    checkpoint established less than 15 minutes after that session's
+    market open uses a fixed 1.0% fallback threshold instead of a
+    range-derived value computed from an not-yet-representative
+    intraday range. See `decisions.md`'s "Minimum observation-time
+    guard for the adaptive price threshold" entry.
+31. Explicit provider network timeout — every yfinance HTTP call
+    (`history()`, `.info`, `.fast_info`) is now bounded to 5 seconds via
+    a shared `requests` session/adapter, replacing yfinance's
+    uncoordinated internal defaults (10s/30s) that could otherwise
+    compound across a full watchlist refresh. See `decisions.md`'s
+    "Provider network timeout" entry.
+32. Market-bar timestamp preservation and frontend display — the actual
+    intraday bar's own exchange-local timestamp (`bar_timestamp`,
+    previously discarded down to date-only) is preserved end-to-end and
+    shown in the UI as "Market data · HH:MM IST · fetched Xs/Xm ago";
+    `fetched_at` remains the sole input to freshness/staleness status,
+    unchanged. See `decisions.md`'s "Market-bar timestamp propagation"
+    entry.
 
 **CURRENT (in progress / not yet done):**
 - Deployment configuration (see "Remaining" below) — a pre-deployment
@@ -376,11 +411,13 @@ the original list; reconfirmed accurate as of this status update):**
 - Historical price charting UI, or any tick-level/append-only history —
   `MarketSnapshot`-shaped data is a per-request value object, not a
   persisted history (see Known Deviations below).
-- A persisted "last-known-good" snapshot fallback on provider failure —
-  a failed instrument reports `unavailable` for that request; there is
-  no cached prior value served in its place. This is a real, current
-  gap (not a design choice made lightly) — see `architecture.md`'s
-  Known Limitations.
+- ~~A persisted "last-known-good" snapshot fallback on provider
+  failure~~ — **no longer a gap; built.** A failed instrument now falls
+  back to its last persisted `market_snapshots` document, reported
+  `stale`, rather than `unavailable`, unless nothing was ever
+  persisted for it. See COMPLETED below, `architecture.md`'s Data Flow
+  and Known Limitations sections, and `decisions.md`'s "Last-known-good
+  market data fallback" and "Cache-first watchlist reads" entries.
 - Full authentication/account system (OAuth, passwords, login UI,
   multi-tenant orgs) — identity is an anonymous capability cookie, not
   an account system; see `decisions.md`'s "Persistent anonymous
@@ -390,16 +427,23 @@ the original list; reconfirmed accurate as of this status update):**
 
 **Known Deviations from the original design (see `decisions.md` for
 full reasoning on each):**
-- Market data is fetched **on demand, synchronously inside the request
-  handler**, not via a separate always-on background poll loop writing
-  to MongoDB on a timer. The "poll every 60 seconds" behavior that
-  exists today is the **frontend's** client-side `setInterval` calling
-  `GET /watchlist`/`GET /watchlist/attention` again — not a backend
-  process. `MarketSnapshot`'s shape is used as an in-memory value
-  object per request; no `market_snapshots` documents are ever written,
-  despite the collection's index existing. See decisions.md's
-  "On-demand fetch per request, not a separate background poll process"
-  entry.
+- Market data is fetched **on demand from request handlers**, not via a
+  separate always-on background poll loop writing to MongoDB on a
+  timer — there is still no standalone backend poll process. The "poll
+  every 60 seconds" behavior a user experiences is still the
+  **frontend's** client-side `setInterval` calling `GET /watchlist`/
+  `GET /watchlist/attention` again, not a backend process. Within that,
+  however, `GET /watchlist` is now **cache-first**: it reads
+  `market_snapshots` first, and serves a persisted snapshot directly
+  (no provider call) whenever it's ≤120 seconds old; only a missing or
+  stale persisted snapshot falls through to a live fetch. A successful
+  live fetch persists its result; a failed live fetch falls back to the
+  last persisted snapshot, reported `stale`, instead of `unavailable`
+  (unless nothing was ever persisted). `mark_as_seen`/`mark_all_as_seen`
+  are unchanged by this — they always require a live fetch, by design,
+  never the cached value. See decisions.md's "On-demand fetch per
+  request, not a separate background poll process" and "Cache-first
+  watchlist reads" entries.
 - Two UI-polish-era decisions ("No 'Mark all as seen' CTA introduced,"
   "No 'View details' action added") were later superseded once those
   features were actually built as real, scoped features — see

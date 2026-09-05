@@ -82,6 +82,14 @@ function AttentionCard({ item, watchlistEntry, onMarkAsSeen, inFlight, actionErr
   // is purely additional context, never used to decide them.
   const freshnessLabel = formatMarketDataLabel(watchlistEntry)
   const status = watchlistEntry ? watchlistEntry.status : null
+  // Mirrors WatchlistTable.jsx's own canMarkAsSeen guard exactly -- this
+  // button and the watchlist row's button both call the SAME
+  // onMarkAsSeen handler (App.jsx's handleMarkAsSeen), which always
+  // fetches fresh and always advances the checkpoint; there is no
+  // separate "acknowledge without a fresh fetch" action anywhere in
+  // this app. A stale/delayed watchlistEntry must disable this button
+  // for the same reason it already disables the watchlist row's.
+  const canMarkAsSeen = watchlistEntry?.status === 'ok'
   const exchange = watchlistEntry ? watchlistEntry.exchange : null
   // Day-over-day change, from GET /watchlist's percent_change --
   // deliberately a DIFFERENT field from item.price_change_pct
@@ -313,7 +321,11 @@ function AttentionCard({ item, watchlistEntry, onMarkAsSeen, inFlight, actionErr
       )}
 
       <div className="attention-card-action">
-        <button onClick={() => onMarkAsSeen(item.instrument_id)} disabled={inFlight}>
+        <button
+          onClick={() => onMarkAsSeen(item.instrument_id)}
+          disabled={!canMarkAsSeen || inFlight}
+          title={!canMarkAsSeen ? 'No current data to acknowledge' : undefined}
+        >
           {inFlight ? 'Saving…' : 'Mark as seen'}
         </button>
         {actionError && <div className="action-error">{actionError}</div>}

@@ -2681,3 +2681,298 @@ and keeps that entire existing suite's assertions meaningful unchanged.
   dependency was introduced. The existing `MarketDataProvider`
   abstraction, the meaningful-change formula, the adaptive threshold
   logic, checkpoint semantics, and attention scoring are all unchanged.
+
+## Decision: Cache-first watchlist reads
+
+### Problem
+`GET /watchlist` called `MarketDataService.fetch_snapshots`, which
+always attempted a live provider call for every instrument on every
+request — even once the last-known-good fallback feature meant a very
+recent, still-valid observation was already sitting in
+`market_snapshots`. This meant a live `yfinance` call on every page
+load and every 60-second frontend poll, regardless of whether the
+persisted data could possibly have changed within that window, and
+exposed every request to provider latency/rate-limit risk that a
+sufficiently-fresh cached value didn't need to incur.
+
+### Decision
+Added `MarketDataService.get_snapshots(symbol_to_instrument_id)`, used
+only by `GET /watchlist` (`routes/watchlist.py`'s `get_watchlist`). For
+each requested instrument, it first reads the persisted
+`market_snapshots` document; if one exists and its age
+(`now - fetched_at`) is `<= STALE_THRESHOLD_SECONDS` (120s, the
+existing constant, unchanged), it is returned directly with **no
+provider call at all**. Any instrument whose persisted snapshot is
+missing or already past that window is batched into one delegated call
+to the existing `fetch_snapshots` — so persist-on-success and
+stale-fallback-on-failure behave exactly as before, not reimplemented.
+`mark_as_seen`/`mark_all_as_seen` deliberately keep calling
+`fetch_snapshots` directly, never `get_snapshots` — "mark as seen"
+means "go get the current price right now," and must never silently
+serve a value already sitting in Mongo.
+
+### Alternatives considered
+- Add the freshness check inside `fetch_snapshots` itself, for every
+  caller.
+- A separate read-through cache with its own TTL/eviction logic.
+- Skip the provider on any cache hit regardless of age.
+- A new `get_snapshots` method, scoped only to `GET /watchlist`
+  (chosen).
+
+### Why rejected
+Changing `fetch_snapshots` itself would have silently changed
+`mark_as_seen`/`mark_all_as_seen`'s "always live" semantics too, which
+those endpoints depend on by design. A separate cache abstraction with
+its own TTL would duplicate `STALE_THRESHOLD_SECONDS`, which already
+defines "how old is too old" for a persisted snapshot — a second,
+independent freshness concept would only risk the two drifting apart.
+Skipping the provider on any cache hit regardless of age was rejected
+because it would let an arbitrarily old cached value silently
+masquerade as current, with no bound at all.
+
+### Consequence
+- `app/services/market_data_service.py`: new public `get_snapshots`
+  method and private `_fresh_persisted_snapshot` helper;
+  `_read_persisted_snapshot` factored out of `_fallback_snapshot` so
+  both share one read/reconstruct implementation.
+- `app/routes/watchlist.py`: `get_watchlist` now calls
+  `market_service.get_snapshots(...)` instead of `fetch_snapshots(...)`;
+  `mark_as_seen`/`mark_all_as_seen` unchanged.
+- `tests/test_market_data_service.py`: new tests cover a fresh cache
+  hit skipping the provider call entirely, a stale cache triggering a
+  live re-fetch, a provider failure after a stale cache correctly
+  falling back to `stale`, and invalid post-stale data never
+  overwriting the persisted document.
+- `tests/test_watchlist_api.py`: a new end-to-end test proves a second
+  `GET /watchlist` within the freshness window makes zero additional
+  provider calls. 17 pre-existing tests that simulated "the price
+  moved, then GET again" needed one line inserted (a shared
+  `_expire_persisted_snapshots(mock_db)` helper call) before the GET
+  that expects to observe the new price — without it, that GET would
+  now legitimately serve the still-fresh cached value instead of
+  re-fetching, which is this feature working as intended, not a
+  regression; every updated test's actual assertions are unchanged.
+- No change to checkpoint semantics, change detection, adaptive
+  thresholds, or the `MarketDataProvider` abstraction. No background
+  poller was introduced — there is still no standalone process; caching
+  only changes whether a given request-time fetch is skipped.
+
+## Decision: Provider network timeout
+
+### Problem
+Manual QA (network disconnected mid-session, with an already-stale
+persisted snapshot) found `GET /watchlist` could take minutes to
+respond. Inspection found `YFinanceProvider` set no explicit timeout
+anywhere, relying entirely on `yfinance`'s own internal defaults (10s
+for `history()`, 30s for `.info`/`.fast_info`'s underlying HTTP layer),
+and `get_quotes` processes a watchlist's symbols **sequentially**, with
+up to two or three sequential sub-calls per symbol (`history` +
+`info`, sometimes + `fast_info`) — so a real network outage could
+cascade to several minutes across a full watchlist refresh, with
+nothing in application code bounding the total.
+
+### Decision
+`YFinanceProvider` now builds one shared `requests.Session` with a
+custom `_TimeoutEnforcingAdapter` (an `HTTPAdapter` subclass) mounted
+on both `http://` and `https://`, and passes it to every
+`yf.Ticker(symbol, session=self._session)` construction. The adapter's
+`send()` unconditionally overrides the `timeout` kwarg to
+`_PROVIDER_REQUEST_TIMEOUT_SECONDS = 5` before delegating to the real
+`HTTPAdapter.send()`, regardless of what timeout value `yfinance`'s own
+internal code tried to use. This was necessary because the installed
+`yfinance==1.7.0` exposes no public per-call timeout parameter for
+`.info`/`.fast_info` (only `history()` has one) — `Ticker`'s own
+`session` parameter, documented as a supported "Custom requests
+session," is the only mechanism that reaches all three calls uniformly,
+since they all route through the same underlying `YfData` built from
+that one session. **This bounds each individual provider HTTP call to
+5 seconds — it does not bound the total time a `GET /watchlist` or Mark
+Seen request can take**, since a request can still make several such
+calls across several instruments, one after another. No retries were
+added.
+
+### Alternatives considered
+- Pass `timeout=` directly to `history()` only.
+- Leave `yfinance`'s own internal defaults in place (status quo).
+- Add retry/backoff logic on top of the timeout.
+- A shared session with a timeout-enforcing `HTTPAdapter`, covering all
+  three call types (chosen).
+
+### Why rejected
+Timeout-ing only `history()` would have left `.info`/`.fast_info`
+unbounded, and the exact QA failure could still recur through either of
+those. Leaving the internal defaults in place is what produced the
+observed multi-minute hang. Retry/backoff was explicitly out of scope
+for this fix and was not added.
+
+### Consequence
+- `app/providers/yfinance_provider.py`: new
+  `_PROVIDER_REQUEST_TIMEOUT_SECONDS` constant,
+  `_TimeoutEnforcingAdapter` class, `YFinanceProvider.__init__` builds
+  the shared session, the single `Ticker(...)` construction site now
+  passes `session=self._session`.
+- `backend/requirements.txt`: `requests==2.34.2` pinned explicitly —
+  already an installed transitive dependency of `yfinance`; no new
+  capability introduced.
+- `tests/test_yfinance_provider.py`: new tests prove the session/adapter
+  is constructed and mounted on both schemes, that `get_quotes` passes
+  the bounded session to every `Ticker(...)` call, and that the adapter
+  actually overrides a caller-supplied timeout value.
+- No change to `MarketDataService`'s fallback logic, caching, checkpoint
+  semantics, or API contracts — a timeout is classified as
+  `fetch_succeeded=False` exactly like any other provider failure
+  already was, and correctly still routes to the existing
+  stale/unavailable fallback path.
+
+## Decision: Minimum observation-time guard for the adaptive price threshold
+
+### Problem
+The adaptive price threshold (`clamp(0.25 * range_percent, 0.5%,
+3.0%)`) is computed once at checkpoint creation from `day_high`/
+`day_low` observed **so far** that session. A checkpoint established
+shortly after market open sees a still-forming, near-zero range, which
+the existing formula floors to 0.5% — a value ordinary, non-anomalous
+intraday movement (0.5–1.5%) can trivially cross for the rest of that
+session, since the threshold then stays frozen. Confirmed as a real,
+reachable risk (not hypothetical) by inspection:
+`_compute_adaptive_price_threshold` had no time-awareness at all,
+unlike the existing volume-signal near-open guard
+(`_MIN_MINUTES_SINCE_OPEN_FOR_RATE`) already in the same module.
+
+### Decision
+`_compute_adaptive_price_threshold` now requires `checkpoint_at` and
+`session_date` (keyword-only, no default — this function does not trust
+its caller blindly, same philosophy as `evaluate_change`). Before
+evaluating `day_high`/`day_low` at all, it computes
+`minutes_since_open = (checkpoint_at - _market_open_at(session_date)).total_seconds() / 60.0`
+(reusing the existing `_market_open_at` helper, not duplicating
+market-open-time logic). If that is less than
+`_MIN_MINUTES_SINCE_OPEN_FOR_PRICE_THRESHOLD = 15.0`, the function
+returns a new, separately-named
+`EARLY_SESSION_PRICE_THRESHOLD_FALLBACK_PCT = 1.0` — deliberately a
+distinct constant from the existing `ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT`
+(the missing/invalid-range fallback), even though both are 1.0% today,
+so the two scenarios (insufficient observation time vs. genuinely bad
+range data) can be tuned independently later without first having to
+determine which one produced a given frozen value.
+`checkpoint_service.py`'s `_write_checkpoint` now captures
+`checkpoint_at = datetime.now(timezone.utc)` once and reuses that exact
+same value for both the threshold computation and the `Checkpoint`'s
+own `checkpoint_at` field, instead of two separate clock reads.
+
+### Alternatives considered
+- Reuse the existing `ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT` constant
+  for this case too.
+- Reuse `_MIN_MINUTES_SINCE_OPEN_FOR_RATE` (the existing volume guard's
+  2-minute constant) for this guard as well.
+- Change the general floor/coefficient (0.5%/0.25) instead of adding a
+  time guard.
+- A separate named constant and a separate, larger time guard (chosen).
+
+### Why rejected
+Reusing the missing-data fallback constant was rejected because it
+conflates two semantically different situations — missing data vs. not
+enough elapsed time — under one name, and would block independently
+tuning either later. Reusing the volume guard's 2-minute constant was
+rejected because that guard protects a rate-calculation denominator
+from being near-zero (numerical stability), not range representativeness
+— the two answer different questions and 2 minutes is far too short for
+this one. Changing the general floor/coefficient was explicitly out of
+scope for this fix and was not touched.
+
+### Consequence
+- `app/services/change_engine.py`: two new constants
+  (`_MIN_MINUTES_SINCE_OPEN_FOR_PRICE_THRESHOLD`,
+  `EARLY_SESSION_PRICE_THRESHOLD_FALLBACK_PCT`);
+  `_compute_adaptive_price_threshold`'s signature grew to require
+  `checkpoint_at`/`session_date`.
+- `app/services/checkpoint_service.py`: `_write_checkpoint` hoists a
+  single `datetime.now(timezone.utc)` call, reused for both the
+  threshold computation and `Checkpoint.checkpoint_at`.
+- `tests/test_change_engine.py`: all existing call sites of
+  `_compute_adaptive_price_threshold` updated to pass the file's
+  existing "safely late" `CHECKPOINT_AT`/`SESSION_DATE` fixture (no
+  behavioral change to what any of them test); new tests cover the
+  early-vs-late boundary, the exact 15-minute inclusive boundary, and
+  that a frozen early-session threshold is honored unchanged by
+  `evaluate_change` regardless of a later, wider real range.
+- `tests/test_checkpoint_service.py`: a new wiring test (using a
+  `session_date` in the future relative to real time, so elapsed time
+  is deterministically negative regardless of when the suite runs)
+  proves `checkpoint_at`/`session_date` actually flow from
+  `_write_checkpoint` into the threshold function.
+- No change to the general 0.25 coefficient, 0.5% floor, 3.0% ceiling,
+  or the existing 1.0% missing-data fallback value — this guard is
+  additive and only affects checkpoints established very early in a
+  session.
+
+## Decision: Market-bar timestamp propagation
+
+### Problem
+`yfinance`'s intraday bars carry their own exchange-local timestamp —
+the actual moment a price was observed on the market — distinct from
+`fetched_at` (our own clock, when we made the request) and
+`provider_timestamp` (an already-distrusted, diagnostics-only field).
+This real timestamp was being read (`bars.index`) but immediately
+truncated to `.date()` inside `YFinanceProvider._latest_valid_close`
+and discarded — nothing downstream (`RawQuote`, `MarketSnapshot`, the
+API, or the frontend) ever had access to when the underlying price was
+actually observed, only when we happened to fetch it.
+
+### Decision
+`_latest_valid_close` now converts the bar's pandas `Timestamp` to a
+native Python `datetime` via `.to_pydatetime()` — preserving its
+exchange-local `tzinfo` (e.g. Asia/Kolkata) exactly as reported, never
+converted to UTC or stripped — and returns it as a third value
+alongside price/`session_date`, from that SAME bar. This threads
+through `RawQuote.bar_timestamp` (new, nullable) →
+`MarketSnapshot.bar_timestamp` (new, nullable, round-trips through the
+existing Mongo persist/read/fallback path with zero changes to that
+code, since it already serializes/reconstructs the whole model
+generically) → `GET /watchlist`'s response as an ISO-8601 string (or
+`null`). The frontend's `formatMarketDataLabel` (`format.js`) renders
+it as `"Market data · HH:MM IST · fetched Xs/Xm ago"` when available,
+using `Intl.DateTimeFormat` pinned to `timeZone: 'Asia/Kolkata'` for the
+time portion (so every viewer sees the same market-local wall-clock
+hour regardless of their own machine's timezone), and falls back to the
+backend's existing `freshness_label` verbatim whenever `bar_timestamp`
+is missing. `bar_timestamp` is never used to compute
+`status`/staleness — `fetched_at`/`data_age_seconds` remain the sole
+input to that, unchanged.
+
+### Alternatives considered
+- Convert `bar_timestamp` to UTC before storing/displaying.
+- Reuse `provider_timestamp` for this purpose instead of a new field.
+- Recompute the "Xs/Xm ago" age from `bar_timestamp` instead of
+  `fetched_at`.
+- A new, separate `bar_timestamp` field, preserved in its original
+  timezone, purely informational (chosen).
+
+### Why rejected
+Converting to UTC was rejected because it loses the exchange-local
+wall-clock meaning that makes the displayed time recognizable as
+"market time," and the explicit instruction was to preserve the
+original timezone information, not normalize it away. Reusing
+`provider_timestamp` was rejected because that field is explicitly
+documented as unverified/diagnostics-only and is never used anywhere
+user-facing — repurposing it here would contradict that existing rule.
+Recomputing the displayed age from `bar_timestamp` was rejected because
+it would silently change what "freshness" means; `fetched_at` must
+remain the sole authoritative clock for status/staleness.
+
+### Consequence
+- `app/providers/yfinance_provider.py`, `app/providers/base.py`,
+  `app/models/market_snapshot.py`, `app/services/market_data_service.py`,
+  `app/routes/watchlist.py`: `bar_timestamp` threaded through as
+  described, nullable throughout for backward compatibility with
+  quotes/documents that predate this field.
+- `frontend/src/format.js`, `WatchlistTable.jsx`, `AttentionSection.jsx`:
+  new `formatMarketDataLabel`; the underlying `data_age_seconds`/
+  `status` values and their meaning are unchanged.
+- `tests/test_yfinance_provider.py`, `test_market_data_service.py`,
+  `test_watchlist_api.py`: new tests cover extraction from the correct
+  bar, survival from `RawQuote` into `MarketSnapshot`, the Mongo
+  persist/fallback round-trip (offset preserved), and API exposure as
+  an ISO-8601 string or `null`.
+- No change to caching, checkpoint semantics, change detection, adaptive
+  thresholds, or the `MarketDataProvider` abstraction.
