@@ -361,6 +361,14 @@ button:focus-visible {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(280px, 360px));
   gap: 12px;
+  /* Grid's default align-items is `stretch`, which forces every card in
+     a row to match the tallest card's height -- so expanding one card's
+     View Details panel stretched every collapsed sibling in that row
+     too, leaving visible empty space inside them. `start` makes each
+     card size to its own natural content height instead; an expanded
+     card can still grow freely, it just no longer drags its row-mates
+     up with it. */
+  align-items: start;
 }
 
 .attention-card {
@@ -824,8 +832,67 @@ button:focus-visible {
   font-size: 0.85rem;
 }
 
-.add-stock-symbol-input {
+/* Anchor for the suggestions dropdown -- same width the bare input used
+   to occupy, so the rest of the form's flex row is unaffected. */
+.add-stock-symbol-field {
+  position: relative;
   width: 120px;
+}
+
+.add-stock-symbol-field .add-stock-symbol-input {
+  width: 100%;
+}
+
+/* Positioned like .add-stock-form itself (an anchored popover), just
+   relative to the symbol field instead of the toggle button -- same
+   pattern, one level in. Scrollable rather than unbounded since the
+   curated list can hold up to 30 entries. */
+.add-stock-suggestions {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 20;
+  width: max-content;
+  min-width: 220px;
+  max-width: 280px;
+  max-height: 220px;
+  overflow-y: auto;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-md);
+}
+
+.add-stock-suggestion {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  width: 100%;
+  background: none;
+  border: none;
+  border-radius: var(--radius);
+  padding: 6px 8px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.add-stock-suggestion:hover {
+  background: var(--color-bg);
+}
+
+.add-stock-suggestion-symbol {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+
+.add-stock-suggestion-name {
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
 }
 
 .add-stock-submit {

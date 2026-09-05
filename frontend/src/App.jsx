@@ -3,6 +3,7 @@ import './App.css'
 import { addInstrument, fetchAttention, fetchWatchlist, markAllAsSeen, markInstrumentAsSeen } from './api'
 import AttentionSection from './components/AttentionSection'
 import WatchlistTable from './components/WatchlistTable'
+import { filterStockSuggestions, findStockSuggestion } from './stockSuggestions'
 
 // Simple polling per the approved design: no WebSockets, one shared
 // timer for both endpoints. 60s matches the backend's own documented
@@ -106,6 +107,11 @@ export default function App() {
   const [addExchange, setAddExchange] = useState('NSE')
   const [addInFlight, setAddInFlight] = useState(false)
   const [addError, setAddError] = useState(null)
+  // Suggestion-dropdown visibility only -- the suggestion DATA itself
+  // (which entries are shown) is derived fresh on every render from
+  // addExchange/addSymbol via filterStockSuggestions, never duplicated
+  // into its own state.
+  const [addSuggestionsOpen, setAddSuggestionsOpen] = useState(false)
 
   // Both endpoints are fetched together, on the SAME timer -- still
   // exactly one polling interval, not two. They are independent reads,
@@ -291,6 +297,19 @@ export default function App() {
         return
       }
 
+      // Only a curated suggestion actually selected (or exactly typed)
+      // for the CURRENTLY selected exchange may be submitted -- this is
+      // a pure client-side check against stockSuggestions.js, never a
+      // network call, and never a replacement for the backend's own
+      // provider-resolvability check below. Using the matched entry's
+      // own canonical-cased symbol (not the raw typed text) means
+      // casing is always consistent regardless of how the user typed it.
+      const matchedSuggestion = findStockSuggestion(addExchange, trimmedSymbol)
+      if (!matchedSuggestion) {
+        setAddError('Select a stock from the suggestions.')
+        return
+      }
+
       setAddInFlight(true)
       setAddError(null)
 
@@ -299,13 +318,14 @@ export default function App() {
         // existing Instrument model) and the provider-resolvability
         // check -- this call does not duplicate that logic, it just
         // surfaces whatever truthful error comes back.
-        await addInstrument(trimmedSymbol, addExchange)
+        await addInstrument(matchedSuggestion.symbol, addExchange)
         // Clear the form and re-fetch real server state only after a
         // confirmed success -- never optimistically add to instruments/
         // attentionItems, and never touch searchQuery/watchlistFilter.
         setAddSymbol('')
         setAddExchange('NSE')
         setAddFormOpen(false)
+        setAddSuggestionsOpen(false)
         await loadAll()
       } catch (err) {
         setAddError(err.message)
@@ -315,6 +335,23 @@ export default function App() {
     },
     [addSymbol, addExchange, loadAll]
   )
+
+  // Changing the exchange replaces the suggestion list; a currently
+  // typed/selected symbol is cleared only if it's NOT also valid for
+  // the newly selected exchange (a symbol that happens to be curated
+  // for both is left alone, per the requirement to clear only an
+  // INCOMPATIBLE selection).
+  const handleAddExchangeChange = useCallback((e) => {
+    const nextExchange = e.target.value
+    setAddExchange(nextExchange)
+    setAddSymbol((prevSymbol) => {
+      const trimmed = prevSymbol.trim()
+      if (trimmed && !findStockSuggestion(nextExchange, trimmed)) {
+        return ''
+      }
+      return prevSymbol
+    })
+  }, [])
 
   // Small, simple filter -- the dataset is 5 instruments, not large
   // enough to warrant useMemo. instruments itself is never reassigned or
@@ -328,6 +365,12 @@ export default function App() {
       matchesSearch(inst.symbol, inst.exchange, searchQuery) &&
       matchesWatchlistFilter(inst, watchlistFilter, attentionInstrumentIds)
   )
+
+  // Curated suggestions for the CURRENTLY selected Add Stock exchange,
+  // filtered by whatever's typed so far -- recomputed on every render
+  // (the underlying list is a small, static, in-memory array; no reason
+  // to memoize it separately from addExchange/addSymbol themselves).
+  const addStockSuggestions = filterStockSuggestions(addExchange, addSymbol)
 
   return (
     <div className="app">
@@ -398,20 +441,57 @@ export default function App() {
                 <div className="add-stock-control">
                   {addFormOpen ? (
                     <form className="add-stock-form" onSubmit={handleAddInstrument}>
-                      <input
-                        type="text"
-                        className="add-stock-symbol-input"
-                        placeholder="Symbol"
-                        aria-label="New instrument symbol"
-                        value={addSymbol}
-                        onChange={(e) => setAddSymbol(e.target.value)}
-                        disabled={addInFlight}
-                      />
+                      {/* Wrapper is the position:relative anchor for the
+                          suggestions dropdown -- everything else in this
+                          form (select/submit/cancel) is unaffected. */}
+                      <div className="add-stock-symbol-field">
+                        <input
+                          type="text"
+                          className="add-stock-symbol-input"
+                          placeholder="Symbol"
+                          aria-label="New instrument symbol"
+                          value={addSymbol}
+                          onChange={(e) => setAddSymbol(e.target.value)}
+                          onFocus={() => setAddSuggestionsOpen(true)}
+                          onBlur={() => {
+                            // Deferred so a suggestion's onClick (fired
+                            // on mousedown-prevented buttons below)
+                            // still registers before the list unmounts.
+                            window.setTimeout(() => setAddSuggestionsOpen(false), 100)
+                          }}
+                          disabled={addInFlight}
+                          autoComplete="off"
+                        />
+                        {addSuggestionsOpen && addStockSuggestions.length > 0 && (
+                          <ul className="add-stock-suggestions">
+                            {addStockSuggestions.map((suggestion) => (
+                              <li key={suggestion.symbol}>
+                                <button
+                                  type="button"
+                                  className="add-stock-suggestion"
+                                  onMouseDown={(e) => e.preventDefault()}
+                                  onClick={() => {
+                                    setAddSymbol(suggestion.symbol)
+                                    setAddSuggestionsOpen(false)
+                                  }}
+                                >
+                                  <span className="add-stock-suggestion-symbol">
+                                    {suggestion.symbol}
+                                  </span>
+                                  <span className="add-stock-suggestion-name">
+                                    {suggestion.name}
+                                  </span>
+                                </button>
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
                       <select
                         className="add-stock-exchange-select"
                         aria-label="New instrument exchange"
                         value={addExchange}
-                        onChange={(e) => setAddExchange(e.target.value)}
+                        onChange={handleAddExchangeChange}
                         disabled={addInFlight}
                       >
                         {EXCHANGE_OPTIONS.map((exchange) => (
@@ -430,6 +510,7 @@ export default function App() {
                         onClick={() => {
                           setAddFormOpen(false)
                           setAddError(null)
+                          setAddSuggestionsOpen(false)
                         }}
                       >
                         Cancel
