@@ -16,6 +16,8 @@ Responsibilities (per architecture.md):
 import math
 from datetime import datetime, timezone
 
+from pymongo.database import Database
+
 from app.models.market_snapshot import MarketSnapshot, SnapshotStatus
 from app.providers.base import MarketDataProvider, RawQuote
 
@@ -28,42 +30,99 @@ STALE_THRESHOLD_SECONDS = 120
 
 
 class MarketDataService:
-    def __init__(self, provider: MarketDataProvider):
+    def __init__(self, provider: MarketDataProvider, db: Database | None = None):
         self._provider = provider
+        # Optional: last-known-good persistence/fallback is only active
+        # when a db handle is supplied. Callers that don't need it (e.g.
+        # watchlist_service.add_instrument's provider-existence check,
+        # which has no real instrument_id yet to key a snapshot by --
+        # see decisions.md) construct this without a db and get the
+        # exact previous, persistence-free behavior.
+        self._db = db
 
     def fetch_snapshots(self, symbol_to_instrument_id: dict[str, str]) -> list[MarketSnapshot]:
         """
-        Fetch current data for the given symbols and return valid,
-        assembled MarketSnapshot objects.
+        Fetch current data for the given symbols and return MarketSnapshot
+        objects: one per symbol with a fresh, valid price this cycle, plus
+        -- when a db was supplied -- one last-known-good FALLBACK snapshot
+        (status forced to STALE, per decisions.md) for any symbol that
+        failed this cycle but has a previously-persisted valid snapshot.
 
         symbol_to_instrument_id maps a yfinance-ready ticker string
         (e.g. "RELIANCE.NS") to our own instrument_id, since RawQuote
         only knows the provider's symbol string, not our internal id.
 
-        Returns one MarketSnapshot per symbol that produced a usable
-        price. A symbol that fails entirely (no usable price) is
-        SKIPPED here, not included as a broken document -- the caller
-        (the route/service that persists these) is responsible for
-        deciding what happens to an instrument with no new snapshot
-        this cycle (i.e., keep serving its last-known-good snapshot,
-        per architecture.md's failure table). This function's only job
-        is "give me the valid snapshots you could get," not "explain
-        what to do about the ones you couldn't."
+        A symbol with neither a fresh valid price nor a persisted
+        fallback is SKIPPED entirely (not included as a broken
+        document) -- the caller reports it as unavailable, same as
+        before this fallback existed.
         """
         symbols = list(symbol_to_instrument_id.keys())
         raw_quotes = self._provider.get_quotes(symbols)
+        quotes_by_symbol = {quote.symbol: quote for quote in raw_quotes}
 
         snapshots: list[MarketSnapshot] = []
-        for quote in raw_quotes:
-            instrument_id = symbol_to_instrument_id.get(quote.symbol)
-            if instrument_id is None:
-                continue  # defensive: provider returned an unrequested symbol
+        for symbol, instrument_id in symbol_to_instrument_id.items():
+            quote = quotes_by_symbol.get(symbol)
+            snapshot = (
+                self._assemble_snapshot(quote, instrument_id)
+                if quote is not None
+                else None
+            )
 
-            snapshot = self._assemble_snapshot(quote, instrument_id)
             if snapshot is not None:
+                self._persist_snapshot(snapshot)
                 snapshots.append(snapshot)
+                continue
+
+            fallback = self._fallback_snapshot(instrument_id)
+            if fallback is not None:
+                snapshots.append(fallback)
 
         return snapshots
+
+    def _persist_snapshot(self, snapshot: MarketSnapshot) -> None:
+        """
+        Save a freshly-assembled, valid snapshot as this instrument's
+        last-known-good document. Only ever called with a snapshot that
+        just passed _assemble_snapshot's validity checks -- invalid or
+        failed provider data never reaches here, so it can never
+        overwrite a good persisted snapshot with something worse
+        (invariant: invalid data must never overwrite last-known-good).
+
+        Upserted keyed on instrument_id, matching the existing unique
+        index (uniq_instrument_id, db/indexes.py) -- one document per
+        instrument, replaced in place, not an append-only history,
+        exactly as that index already documents.
+        """
+        if self._db is None or snapshot.status != SnapshotStatus.OK:
+            return
+        self._db.market_snapshots.replace_one(
+            {"instrument_id": snapshot.instrument_id},
+            snapshot.model_dump(mode="json"),
+            upsert=True,
+        )
+
+    def _fallback_snapshot(self, instrument_id: str) -> MarketSnapshot | None:
+        """
+        Look up this instrument's last persisted valid snapshot for use
+        as a stale, display-only fallback after this cycle's fetch
+        failed or produced nothing usable. A provider failure never
+        deletes/mutates the stored document -- this is a read-only
+        lookup.
+
+        Always returns the snapshot with status forced to STALE,
+        regardless of what it was persisted with -- a fallback is never
+        a fresh observation, so it must never be reported as OK.
+        """
+        if self._db is None:
+            return None
+        doc = self._db.market_snapshots.find_one({"instrument_id": instrument_id})
+        if doc is None:
+            return None
+        doc.pop("_id", None)
+        persisted = MarketSnapshot(**doc)
+        return persisted.model_copy(update={"status": SnapshotStatus.STALE})
 
     def _assemble_snapshot(self, quote: RawQuote, instrument_id: str) -> MarketSnapshot | None:
         if (

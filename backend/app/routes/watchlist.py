@@ -99,7 +99,7 @@ def get_watchlist(owner_id: str = Depends(resolve_owner_id)) -> dict:
     instruments = get_watchlist_instruments(db, owner_id)
     checkpoint_service = CheckpointService(db)
     change_event_service = ChangeEventService(db)
-    market_service = MarketDataService(_provider)
+    market_service = MarketDataService(_provider, db)
 
     symbol_to_instrument_id = {
         yfinance_ticker_for(inst["symbol"], inst["exchange"]): str(inst["_id"])
@@ -116,14 +116,14 @@ def get_watchlist(owner_id: str = Depends(resolve_owner_id)) -> dict:
 
         if snapshot is None:
             # Provider gave us nothing usable this cycle for this
-            # instrument. Per architecture.md's failure table: do not
-            # fabricate data, report unavailable. (This slice has no
-            # "last known good" persistence for snapshots yet -- see
-            # Known Limitations in the implementation report.) An
-            # invalid/unavailable snapshot must never create or advance
-            # checkpoint state -- there is nothing here to checkpoint
-            # against, and this read path never writes a checkpoint
-            # regardless.
+            # instrument, AND there is no last-known-good snapshot
+            # persisted for it either (MarketDataService.fetch_snapshots
+            # already tried that fallback -- see market_data_service.py).
+            # Per architecture.md's failure table: do not fabricate data,
+            # report unavailable. An invalid/unavailable snapshot must
+            # never create or advance checkpoint state -- there is
+            # nothing here to checkpoint against, and this read path
+            # never writes a checkpoint regardless.
             results.append(
                 {
                     "instrument_id": instrument_id,
@@ -291,15 +291,19 @@ def mark_as_seen(instrument_id: str, owner_id: str = Depends(resolve_owner_id)) 
     if instrument_id not in watchlist.instrument_ids:
         raise HTTPException(status_code=404, detail="Instrument not found")
 
-    market_service = MarketDataService(_provider)
+    market_service = MarketDataService(_provider, db)
     ticker = yfinance_ticker_for(instrument_doc["symbol"], instrument_doc["exchange"])
     snapshots = market_service.fetch_snapshots({ticker: instrument_id})
 
-    if not snapshots:
+    if not snapshots or snapshots[0].status != SnapshotStatus.OK:
         # Missing/invalid/unavailable current data must never become a
         # valid baseline -- fail the request instead of fabricating a
-        # checkpoint from stale or absent data. Nothing is acknowledged
-        # either, since we never reach the checkpoint write below.
+        # checkpoint from stale or absent data. A last-known-good STALE
+        # fallback snapshot is explicitly included in this rejection: a
+        # stale fallback is for UI continuity only and must never
+        # advance/create a checkpoint (see market_data_service.py).
+        # Nothing is acknowledged either, since we never reach the
+        # checkpoint write below.
         raise HTTPException(
             status_code=503,
             detail="Could not fetch current market data — checkpoint not saved.",
@@ -351,7 +355,7 @@ def mark_all_as_seen(owner_id: str = Depends(resolve_owner_id)) -> dict:
     """
     db = get_database()
     instruments = get_watchlist_instruments(db, owner_id)
-    market_service = MarketDataService(_provider)
+    market_service = MarketDataService(_provider, db)
     checkpoint_service = CheckpointService(db)
     change_event_service = ChangeEventService(db)
 
@@ -368,10 +372,13 @@ def mark_all_as_seen(owner_id: str = Depends(resolve_owner_id)) -> dict:
         instrument_id = str(inst["_id"])
         snapshot = snapshots_by_instrument_id.get(instrument_id)
 
-        if snapshot is None:
-            # No valid current snapshot for this instrument this cycle
-            # -- skip it rather than fabricating a checkpoint or failing
-            # the entire batch over one instrument's bad data.
+        if snapshot is None or snapshot.status != SnapshotStatus.OK:
+            # No FRESH valid current snapshot for this instrument this
+            # cycle -- skip it rather than fabricating a checkpoint or
+            # failing the entire batch over one instrument's bad data.
+            # This also excludes a last-known-good STALE fallback
+            # snapshot: it exists for UI continuity only and must never
+            # advance/create a checkpoint (see market_data_service.py).
             skipped.append({"instrument_id": instrument_id, "symbol": inst["symbol"]})
             continue
 

@@ -295,8 +295,15 @@ def test_malformed_quote_after_checkpoint_exists_does_not_corrupt_or_advance_it(
     instrument, a later provider response with a poisonous price
     (previous_close=0.0, fetch_succeeded=True) must not crash, must not
     advance/replace the checkpoint, and must not corrupt the frozen
-    baseline -- the instrument simply degrades to unavailable for that
-    request while its checkpoint is left exactly as it was."""
+    baseline.
+
+    Since the last-known-good fallback feature, the instrument no
+    longer degrades all the way to "unavailable" here -- the first GET
+    in this test (with healthy data) persisted a valid snapshot, so the
+    malformed cycle now falls back to that snapshot as STALE instead.
+    What must still hold, unchanged, is the checkpoint itself: it is
+    never advanced/replaced/corrupted by this malformed cycle, and no
+    ChangeEvent is created from the stale fallback."""
     test_client, mock_db = client
 
     first = test_client.get("/watchlist").json()
@@ -319,15 +326,11 @@ def test_malformed_quote_after_checkpoint_exists_does_not_corrupt_or_advance_it(
     body = response.json()
 
     reliance_after = next(i for i in body["instruments"] if i["symbol"] == "RELIANCE")
-    assert reliance_after["status"] == "unavailable"
-    # Per the route's own contract (see routes/watchlist.py's snapshot-
-    # is-None branch): when current data is unavailable, the response
-    # always reports has_baseline=False, regardless of whether a
-    # checkpoint actually exists in storage -- it never claims to
-    # compare against a baseline it cannot currently verify. The
-    # checkpoint document itself (asserted below) is what actually
-    # proves the baseline survived untouched.
-    assert reliance_after["change"]["has_baseline"] is False
+    # Falls back to the last-known-good snapshot (persisted by the
+    # first GET above), reported as stale -- not fabricated, not
+    # unavailable, and not silently treated as fresh.
+    assert reliance_after["status"] == "stale"
+    assert reliance_after["price"] == 1326.4
     assert reliance_after["change"]["meaningful_change"] is False
 
     checkpoint_after = mock_db.checkpoints.find_one({"instrument_id": instrument_id})
@@ -337,6 +340,9 @@ def test_malformed_quote_after_checkpoint_exists_does_not_corrupt_or_advance_it(
         == checkpoint_before["baseline_snapshot"]["last_price"]
     )
     assert mock_db.checkpoints.count_documents({}) == 1
+    # A stale fallback must never create a ChangeEvent, even when a
+    # checkpoint exists to compare against.
+    assert mock_db.change_events.count_documents({}) == 0
 
 
 def test_unavailable_instrument_still_includes_instrument_id(client, monkeypatch):
@@ -516,6 +522,68 @@ def test_mark_all_as_seen_skips_instruments_without_valid_snapshot(client, monke
     # Only the 2 successful instruments got checkpoints -- nothing
     # fabricated for the 3 skipped ones.
     assert mock_db.checkpoints.count_documents({}) == 2
+
+
+# --- Last-known-good market data fallback (stale, display-only) -------
+
+
+def test_get_watchlist_stale_fallback_shows_truthful_freshness(client, monkeypatch):
+    """End-to-end: a successful GET persists a snapshot; a later GET
+    with a total provider outage falls back to it, truthfully reporting
+    status=stale and a freshness label/age reflecting the ORIGINAL
+    fetch, not a fabricated "now"."""
+    test_client, mock_db = client
+
+    test_client.get("/watchlist")  # persists all five instruments
+
+    monkeypatch.setattr(watchlist_routes, "_provider", FakeProvider({}))
+    response = test_client.get("/watchlist")
+    assert response.status_code == 200
+    body = response.json()
+
+    reliance = next(i for i in body["instruments"] if i["symbol"] == "RELIANCE")
+    assert reliance["status"] == "stale"
+    assert reliance["price"] == 1326.4
+    assert reliance["data_age_seconds"] is not None
+    assert reliance["data_age_seconds"] >= 0
+    assert "ago" in reliance["freshness_label"]
+
+
+def test_mark_all_as_seen_skips_stale_fallback_and_advances_nothing(client, monkeypatch):
+    """(e) A last-known-good STALE fallback must not be usable as a
+    mark-all-as-seen baseline either -- every instrument falls back to
+    stale (persisted by the earlier GET) and must all be skipped, with
+    zero checkpoints created."""
+    test_client, mock_db = client
+
+    test_client.get("/watchlist")  # persists all five instruments
+
+    monkeypatch.setattr(watchlist_routes, "_provider", FakeProvider({}))
+    response = test_client.post("/watchlist/checkpoint")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["updated"] == []
+    assert len(body["skipped"]) == 5
+    assert mock_db.checkpoints.count_documents({}) == 0
+
+
+def test_mark_as_seen_rejects_stale_fallback_snapshot(client, monkeypatch):
+    """(e) Single-instrument mark-as-seen must likewise reject a STALE
+    fallback snapshot -- it is display-only and must never become a new
+    checkpoint baseline, with or without a prior explicit checkpoint."""
+    test_client, mock_db = client
+
+    first = test_client.get("/watchlist").json()  # persists all five instruments
+    instrument_id = next(
+        i for i in first["instruments"] if i["symbol"] == "RELIANCE"
+    )["instrument_id"]
+
+    monkeypatch.setattr(watchlist_routes, "_provider", FakeProvider({}))
+    response = test_client.post(f"/watchlist/instruments/{instrument_id}/checkpoint")
+
+    assert response.status_code == 503
+    assert mock_db.checkpoints.count_documents({"instrument_id": instrument_id}) == 0
 
 
 def test_mark_all_as_seen_replaces_existing_checkpoints_not_duplicates(client):
@@ -1863,10 +1931,14 @@ def test_provider_failure_for_one_instrument_does_not_affect_a_siblings_existing
     Edge case I: a provider failure for ONE instrument must never
     mutate a DIFFERENT instrument's existing checkpoint/change-event
     state. Both RELIANCE and TCS get real checkpoints first; then TCS's
-    data becomes unavailable while RELIANCE keeps moving meaningfully --
-    RELIANCE's own detection must proceed completely normally,
-    unaffected by TCS's failure, and TCS's existing checkpoint must stay
-    exactly as it was.
+    data fails while RELIANCE keeps moving meaningfully -- RELIANCE's
+    own detection must proceed completely normally, unaffected by TCS's
+    failure, and TCS's existing checkpoint must stay exactly as it was.
+
+    Since the last-known-good fallback feature, TCS degrades to a
+    stale fallback here (not "unavailable") because the initial GET
+    above already persisted a valid TCS snapshot -- that fallback must
+    still leave TCS's checkpoint/change-events completely untouched.
     """
     test_client, mock_db = client
 
@@ -1896,7 +1968,7 @@ def test_provider_failure_for_one_instrument_does_not_affect_a_siblings_existing
     tcs = next(i for i in body["instruments"] if i["symbol"] == "TCS")
 
     assert reliance["change"]["meaningful_change"] is True
-    assert tcs["status"] == "unavailable"
+    assert tcs["status"] == "stale"
 
     # RELIANCE's own detection proceeded normally.
     assert mock_db.change_events.count_documents({"instrument_id": reliance_id}) == 1

@@ -442,3 +442,178 @@ def test_fetched_at_one_second_above_stale_threshold_is_stale():
     snapshots = service.fetch_snapshots({"RELIANCE.NS": "inst123"})
 
     assert snapshots[0].status == SnapshotStatus.STALE
+
+
+# --- Last-known-good snapshot persistence + fallback ------------------
+#
+# These tests exercise the optional `db` argument to MarketDataService:
+# a successful fetch persists into market_snapshots, and a later failed
+# fetch for the same instrument falls back to that persisted document
+# (reported as STALE) instead of vanishing outright. Every test above
+# this section constructs MarketDataService with NO db, and continues
+# to pass unchanged -- confirming persistence/fallback is strictly
+# additive, opt-in behavior.
+
+
+def test_successful_fetch_is_persisted_to_market_snapshots(mock_db):
+    provider = FakeProvider([make_quote()])
+    service = MarketDataService(provider, mock_db)
+
+    service.fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    doc = mock_db.market_snapshots.find_one({"instrument_id": "inst123"})
+    assert doc is not None
+    assert doc["last_price"] == 1326.4
+    assert doc["status"] == SnapshotStatus.OK.value
+
+
+def test_provider_failure_with_prior_valid_snapshot_returns_stale_fallback(mock_db):
+    """(b) A previously-persisted valid snapshot is served, marked
+    STALE, when this cycle's fetch fails entirely."""
+    good_provider = FakeProvider([make_quote(last_price=1326.4)])
+    MarketDataService(good_provider, mock_db).fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    failing_provider = FakeProvider(
+        [make_quote(fetch_succeeded=False, last_price=None)]
+    )
+    service = MarketDataService(failing_provider, mock_db)
+
+    snapshots = service.fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    assert len(snapshots) == 1
+    assert snapshots[0].instrument_id == "inst123"
+    assert snapshots[0].last_price == 1326.4
+    assert snapshots[0].status == SnapshotStatus.STALE
+
+
+def test_provider_failure_with_no_saved_snapshot_remains_unavailable(mock_db):
+    """(c) Same failure, but nothing was ever persisted for this
+    instrument -- must degrade to "no snapshot" exactly as it did
+    before this feature existed (the caller reports unavailable)."""
+    failing_provider = FakeProvider([make_quote(fetch_succeeded=False, last_price=None)])
+    service = MarketDataService(failing_provider, mock_db)
+
+    snapshots = service.fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    assert snapshots == []
+
+
+def test_invalid_provider_data_does_not_overwrite_saved_snapshot(mock_db):
+    """(d) A good snapshot is persisted; a later cycle's invalid quote
+    (e.g. zero previous_close) must not touch the stored document --
+    the next failure still falls back to the ORIGINAL good values."""
+    good_provider = FakeProvider([make_quote(last_price=1326.4, previous_close=1302.6)])
+    MarketDataService(good_provider, mock_db).fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    invalid_provider = FakeProvider([make_quote(previous_close=0.0)])
+    MarketDataService(invalid_provider, mock_db).fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    doc = mock_db.market_snapshots.find_one({"instrument_id": "inst123"})
+    assert doc["last_price"] == 1326.4
+    assert doc["previous_close"] == 1302.6
+
+    failing_provider = FakeProvider([make_quote(fetch_succeeded=False, last_price=None)])
+    fallback = MarketDataService(failing_provider, mock_db).fetch_snapshots(
+        {"RELIANCE.NS": "inst123"}
+    )
+    assert fallback[0].last_price == 1326.4
+    assert fallback[0].previous_close == 1302.6
+
+
+def test_provider_failure_never_deletes_saved_snapshot(mock_db):
+    """(5) A provider failure must never delete/corrupt the persisted
+    document -- it must still be readable (and usable as a fallback)
+    after any number of subsequent failed cycles."""
+    good_provider = FakeProvider([make_quote(last_price=1326.4)])
+    MarketDataService(good_provider, mock_db).fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    failing_provider = FakeProvider([make_quote(fetch_succeeded=False, last_price=None)])
+    for _ in range(3):
+        MarketDataService(failing_provider, mock_db).fetch_snapshots(
+            {"RELIANCE.NS": "inst123"}
+        )
+
+    doc = mock_db.market_snapshots.find_one({"instrument_id": "inst123"})
+    assert doc is not None
+    assert doc["last_price"] == 1326.4
+
+
+def test_fresh_valid_data_replaces_previous_snapshot(mock_db):
+    """(6) Fresh, valid provider data DOES replace the previous
+    snapshot -- persistence is a last-known-good cache, not a one-time
+    write. A later successful fetch with a new price must overwrite the
+    old one, so a subsequent failure falls back to the NEWEST good
+    value, not the original."""
+    first_provider = FakeProvider([make_quote(last_price=1326.4)])
+    MarketDataService(first_provider, mock_db).fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    second_provider = FakeProvider([make_quote(last_price=1350.0)])
+    MarketDataService(second_provider, mock_db).fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    failing_provider = FakeProvider([make_quote(fetch_succeeded=False, last_price=None)])
+    fallback = MarketDataService(failing_provider, mock_db).fetch_snapshots(
+        {"RELIANCE.NS": "inst123"}
+    )
+    assert fallback[0].last_price == 1350.0
+
+
+def test_stale_fallback_age_is_calculated_from_saved_snapshot_timestamp(mock_db):
+    """(f) The fallback's fetched_at must be the ORIGINAL persisted
+    fetch time, not "now" -- that original timestamp is what the route
+    layer's _status_label uses to compute how old the data really is.
+
+    The initial fetch must be fresh (fetched_at="now") to actually get
+    persisted at all -- _persist_snapshot only ever saves a snapshot
+    whose own computed status is OK, and a quote fetched >120s ago would
+    already compute as STALE at assembly time. So elapsed time is
+    simulated the way it really occurs: by backdating the ALREADY
+    PERSISTED document directly, not the quote that produced it."""
+    good_provider = FakeProvider([make_quote()])
+    MarketDataService(good_provider, mock_db).fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    old_fetched_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+    mock_db.market_snapshots.update_one(
+        {"instrument_id": "inst123"},
+        {"$set": {"fetched_at": old_fetched_at.isoformat()}},
+    )
+
+    failing_provider = FakeProvider([make_quote(fetch_succeeded=False, last_price=None)])
+    fallback = MarketDataService(failing_provider, mock_db).fetch_snapshots(
+        {"RELIANCE.NS": "inst123"}
+    )
+
+    assert len(fallback) == 1
+    age = (datetime.now(timezone.utc) - fallback[0].fetched_at).total_seconds()
+    assert 590 <= age <= 610  # ~10 minutes, not "now"
+
+
+def test_missing_quote_entirely_still_falls_back_to_saved_snapshot(mock_db):
+    """A provider that omits a requested symbol from its response
+    altogether (not even a failed RawQuote) must be treated the same as
+    an explicit failure for fallback purposes."""
+    good_provider = FakeProvider([make_quote()])
+    MarketDataService(good_provider, mock_db).fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    empty_provider = FakeProvider([])  # no quote at all for RELIANCE.NS
+    fallback = MarketDataService(empty_provider, mock_db).fetch_snapshots(
+        {"RELIANCE.NS": "inst123"}
+    )
+
+    assert len(fallback) == 1
+    assert fallback[0].status == SnapshotStatus.STALE
+
+
+def test_no_db_supplied_skips_persistence_and_fallback_entirely(mock_db):
+    """Backward-compatibility guard: MarketDataService constructed
+    without a db (as every test above this section, and
+    watchlist_service.add_instrument's provider-existence check, do)
+    must neither persist nor fall back -- exact previous behavior."""
+    good_provider = FakeProvider([make_quote()])
+    MarketDataService(good_provider, None).fetch_snapshots({"RELIANCE.NS": "inst123"})
+    assert mock_db.market_snapshots.count_documents({}) == 0
+
+    failing_provider = FakeProvider([make_quote(fetch_succeeded=False, last_price=None)])
+    snapshots = MarketDataService(failing_provider).fetch_snapshots(
+        {"RELIANCE.NS": "inst123"}
+    )
+    assert snapshots == []

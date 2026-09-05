@@ -38,7 +38,7 @@ function ChangeIndicator({ change }) {
 }
 
 function WatchlistRow({ instrument, onMarkAsSeen, inFlight, actionError, savedMessage }) {
-  const canMarkAsSeen = instrument.status !== 'unavailable'
+  const canMarkAsSeen = instrument.status === 'ok'
 
   return (
     <tr>

@@ -105,14 +105,16 @@ fetches for the same instrument, not one shared fetch.
   the source of truth for what's trackable; the provider is the source of
   truth for price/volume values only.
 - **Current market state**: `MarketSnapshot` — the latest fetched value
-  per instrument, but **as currently implemented, this is an in-memory
-  value object computed fresh on every request, never written to
-  MongoDB** (see the Current Implementation Note under Data Flow above).
-  The `market_snapshots` collection and its unique index on
-  `instrument_id` exist (see Database Integrity below) but no code path
-  writes to that collection today — it is dormant infrastructure, kept
-  for the originally-designed persisted-poll-loop model, not currently
-  load-bearing.
+  per instrument, computed fresh on every request (see the Current
+  Implementation Note under Data Flow above). Every successful fetch is
+  ALSO upserted into the `market_snapshots` collection, keyed on its
+  unique `instrument_id` index (see Database Integrity below), so it can
+  serve as a last-known-good, display-only fallback the next time a
+  fetch for that instrument fails — see the Known Limitations entry and
+  `decisions.md`'s "Last-known-good market data fallback" entry. This is
+  a stale-fallback cache, not the originally-designed persisted-poll-
+  loop's write path (there is still no background poll process — see the
+  Current Implementation Note).
 - **What the user has seen**: `Checkpoint` — entirely our own state, never
   derived from the provider.
 - **What changed**: `ChangeEvent` — computed once by us, then persisted as
@@ -307,15 +309,19 @@ as the real per-owner membership record — see decisions.md.
 }
 ```
 This is the originally designed shape: one document per instrument,
-upserted every poll cycle (not an append-only history — see
-`decisions.md` on why we don't keep tick history for the hackathon
-scope). **As currently implemented, this shape exists as a Pydantic
-value object (`app/models/market_snapshot.py`) constructed fresh inside
-each request that needs it and never persisted to MongoDB** — see the
-Current Implementation Note under Data Flow above. The
-`market_snapshots` collection/index described elsewhere in this
-document is real (index creation is idempotent and runs on every
-startup) but currently unused by any write path.
+upserted every fetch (not an append-only history — see `decisions.md`
+on why we don't keep tick history for the hackathon scope). This shape
+exists as a Pydantic value object (`app/models/market_snapshot.py`)
+constructed fresh inside each request that needs it — see the Current
+Implementation Note under Data Flow above for why fetching is still
+on-demand-per-request, not a background poll loop. Every VALID
+(`status == ok`) snapshot is additionally upserted into the
+`market_snapshots` collection, keyed on the same unique `instrument_id`
+index, so a later failed fetch for that instrument can fall back to it
+(reported as `status == stale`) instead of reporting `unavailable` —
+see `decisions.md`'s "Last-known-good market data fallback" entry. A
+failed/invalid fetch is never written here, so it can never overwrite
+or corrupt the last-known-good document.
 
 `status` is computed at write time from `fetched_at` (see Freshness Model
 below), not left for the reader to infer, and never from
@@ -991,27 +997,31 @@ results in a `MarketSnapshot.status` of `stale`/`invalid`/`unavailable`.
 
 ## Failure Modes & Responses
 
-**Current implementation note**: the rows below describing "keep/retain
-last known valid snapshot" and the backoff policy paragraph describe the
-originally-designed, persisted-poll-loop model. **As currently
-implemented, there is no persisted snapshot to retain** — each request
-fetches live, and a failed instrument simply reports `unavailable` for
-that one request, with no cached prior value served in its place (a real
-current gap, not a design choice — see Known Limitations). This is
-called out per-row below rather than only once, since it changes what
-the user actually sees for several of these rows.
+**Current implementation note**: fetching is still on-demand-per-request,
+not a background poll loop — there is no shared poll process and no
+fan-out deduplication across concurrent users (see the Current
+Implementation Note under Data Flow). Within that constraint, though,
+"retain last known valid snapshot" IS implemented: every successful
+fetch is upserted into `market_snapshots`, and a failed fetch for an
+instrument that has a prior valid snapshot falls back to it, reported as
+`stale`, rather than reporting `unavailable` — see `decisions.md`'s
+"Last-known-good market data fallback" entry. An instrument that has
+never had a successful fetch still reports `unavailable`, since there is
+nothing to fall back to. This is called out per-row below since it
+changes what the user actually sees for several of these rows.
 
 | Failure | Backend behavior | User sees |
 |---|---|---|
-| Provider timeout | **As implemented**: no persisted snapshot exists to retain; this instrument reports `unavailable` for this request only, and may succeed again on the next request/poll with no memory of the failure. *(Originally designed: retain last known valid snapshot, mark `stale` after threshold.)* | "Data unavailable" this cycle; may recover next poll |
-| Provider rate-limited (429) | No backoff loop exists (there is no poll loop to back off) — a 429 is caught the same as any other provider failure, per-instrument, per-request; not exercised by any live test. *(Originally designed: exponential backoff on the poll loop.)* | Same as any other single-request provider failure — "Data unavailable" this cycle |
-| Provider returns malformed/partial response | Reject the update for that instrument this request; no snapshot is produced (see the market-data hardening fix below for the specific non-finite/non-positive-price case) | "Data unavailable" this cycle |
-| Price missing, non-numeric, or non-finite | Reject the value outright; no snapshot for that instrument this request — and, per the P0 Hardening #2 fix, this failure is scoped to the one malformed instrument and never aborts sibling instruments' snapshots in the same batch | "Data unavailable" this cycle for that instrument; siblings unaffected |
+| Provider timeout | A prior valid snapshot for this instrument, if one exists, is served as the current data with `status: stale` and a real age (e.g. "Data delayed — 4m ago"); otherwise `unavailable`, same as before. Either way this request never blocks retrying on the next request/poll. | "Data delayed — Xm ago" if a last-known-good value exists, else "Data unavailable" |
+| Provider rate-limited (429) | No backoff loop exists (there is no poll loop to back off) — a 429 is caught the same as any other provider failure, per-instrument, per-request, and falls back to the last-known-good snapshot (if any) exactly like a timeout above; not exercised by any live test. *(Originally designed: exponential backoff on the poll loop — still not implemented.)* | Same as the Provider timeout row above |
+| Provider returns malformed/partial response | Reject the update for that instrument this request; no NEW snapshot is produced, but the previously-persisted valid snapshot (if any) is still served as a stale fallback — the malformed response never overwrites or deletes it (see the market-data hardening fix below for the specific non-finite/non-positive-price case) | "Data delayed — Xm ago" if a last-known-good value exists, else "Data unavailable" |
+| Price missing, non-numeric, or non-finite | Reject the value outright; no NEW snapshot for that instrument this request (falls back to last-known-good, if any) — and, per the P0 Hardening #2 fix, this failure is scoped to the one malformed instrument and never aborts sibling instruments' snapshots in the same batch | Stale fallback if available, else "Data unavailable" this cycle for that instrument; siblings unaffected |
 | Volume missing, non-numeric, non-finite, or negative | Reject the volume value; retain the price if it is otherwise valid, mark the volume signal unavailable rather than discarding the whole snapshot (negative volume is rejected as a real impossibility; missing/non-numeric volume degrades gracefully rather than invalidating the snapshot) | Price still shown if valid; volume/change-detection simply omitted for that update |
-| Provider unavailable entirely (network failure, service down) | Do not fabricate a snapshot; report `unavailable` for every affected instrument this request | "Data unavailable" this cycle |
+| Provider unavailable entirely (network failure, service down) | Do not fabricate a NEW snapshot; fall back to each affected instrument's last-known-good snapshot (`stale`) where one exists, else report `unavailable` | "Data delayed — Xm ago" where a last-known-good value exists, else "Data unavailable" |
 | Checkpoint and current snapshot span a session boundary | Volume acceleration marked unavailable; price comparison still computed | Change may still surface on price alone; no volume claim shown |
 | New instrument, no snapshot yet | `status: unavailable` | "Fetching initial data..." |
 | New instrument, no checkpoint yet | Change Engine skips it | "Baseline pending" instead of a change or a crash |
+| Mark Seen (single or all) is attempted while an instrument is only serving a stale last-known-good fallback | Rejected (503 for single-instrument; skipped, not fabricated, for mark-all) — a stale fallback is display-only and can never become a checkpoint baseline, and (per `ChangeEventService.get_or_create_active`'s existing `status == ok` guard) can never create a `ChangeEvent` either | "Could not fetch current market data — checkpoint not saved" (single); reported under `skipped` (mark-all) |
 | Two requests advance the same checkpoint concurrently | Last-write-wins via `replace_one(upsert=True)` — a single atomic MongoDB operation, so the result is always one complete, valid checkpoint document (never a torn/partial write), whichever request's write lands last | No visible inconsistency for a single user's own action |
 | A `GET` evaluation races a concurrent Mark Seen on the same instrument | `ChangeEventService` re-validates the checkpoint is still current before persisting a `ChangeEvent` (P0 Hardening #3 fix) — a stale evaluation is silently dropped, never persisted against a superseded checkpoint | No orphaned/resurfaced attention item |
 | Concurrent Add Stock / first-owner seeding for the same new `(symbol, exchange)` | `DuplicateKeyError` recovery re-fetches the winning request's document and adds it to the losing request's own membership (P0 Hardening #4/#5 fix) | Both owners end up with correct membership; no 500 |
@@ -1332,12 +1342,19 @@ accepted boundaries of this build's scope.
   deduplication across concurrent users. See the Current Implementation
   Note under Data Flow above and `decisions.md`'s "On-demand fetch per
   request" entry.
-- **No persisted last-known-good snapshot.** A provider failure for an
-  instrument reports `unavailable` for that request only, with nothing
-  cached to fall back to — unlike the originally-designed
-  persisted-poll-loop model, which would have retained a prior valid
-  value. This is the direct consequence of the on-demand-fetch deviation
-  above, not a separate choice.
+- **Last-known-good fallback is stale-only, not a poll loop.** Every
+  successful on-demand fetch upserts its valid `MarketSnapshot` into
+  `market_snapshots`, keyed on `instrument_id`. A later failed fetch for
+  that instrument falls back to this persisted document, reported with
+  `status="stale"` and a freshness label/age computed from its real,
+  original `fetched_at` — never fabricated as fresh. This is
+  display-only: a stale fallback can never create a `ChangeEvent`
+  (`ChangeEventService.get_or_create_active` already requires
+  `status == ok`) or become a checkpoint baseline (`mark_as_seen`/
+  `mark_all_as_seen` both reject a non-`ok` snapshot). If an instrument
+  has never had a successful fetch, it still reports `unavailable`,
+  unchanged. See `decisions.md`'s "Last-known-good market data fallback"
+  entry.
 - **No frontend automated test harness.** The frontend has no test
   framework (no vitest/jest/testing-library) in `package.json`; frontend
   correctness is verified by `npm run lint`/`npm run build` and direct

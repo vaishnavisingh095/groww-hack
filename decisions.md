@@ -2563,3 +2563,121 @@ demonstrated need, not adopted because it looks more rigorous.
 - No Stable/Normal/Volatile classification, ATR, beta, historical
   volatility, or ML/LLM component was introduced anywhere in this
   change.
+
+## Decision: Last-known-good market data fallback
+
+### Problem
+Per the Known Limitations bullet this decision replaces: a provider
+failure (timeout, rate limit, network/provider failure) for an
+instrument reported `unavailable` for that request only, with nothing
+cached to fall back to, even though the `market_snapshots` collection
+and its unique `instrument_id` index already existed for exactly this
+purpose (Phase 1) and simply had no write path using it. A single
+transient provider hiccup could flash an otherwise-healthy instrument to
+"Data unavailable" for one refresh cycle, then recover on the next —
+worse UI continuity than necessary given data this system already had
+moments earlier.
+
+### Decision
+`MarketDataService` gained an optional `db` constructor argument (still
+`None` by default, so every existing caller/test that doesn't pass one
+gets the exact previous, persistence-free behavior). When a `db` is
+supplied: every snapshot that passes the existing validity checks and
+computes `status == ok` is upserted into `market_snapshots`, keyed on
+`instrument_id` (the same unique index from Phase 1 makes this a safe
+replace, not an accumulating history). When a symbol's fetch fails or
+produces an invalid quote this cycle, the service looks up that
+instrument's persisted document and, if one exists, returns it with
+`status` forced to `stale` — never as `ok`, since a fallback is never a
+fresh observation. Its `fetched_at` is left untouched (the ORIGINAL
+persisted fetch time), so the route layer's existing `_status_label`
+computes a truthful age/label ("Data delayed — Xm ago") without any
+change to that function. If no persisted document exists, the instrument
+still degrades to `unavailable`, unchanged.
+
+`routes/watchlist.py`'s three handlers now construct
+`MarketDataService(_provider, db)` (previously provider-only).
+`mark_as_seen`/`mark_all_as_seen` each gained an explicit
+`status == ok` check before treating a returned snapshot as a valid
+checkpoint baseline — previously neither checked `status` at all, which
+would have let a newly-introduced `stale` fallback snapshot silently
+become a checkpoint baseline had this guard not been added.
+`get_watchlist` needed no equivalent change: it never writes a
+checkpoint on its own, and `ChangeEventService.get_or_create_active`
+already had a pre-existing `status != ok` guard (added for the
+naturally-occurring stale-snapshot case, before this feature existed)
+that transparently also blocks a `ChangeEvent` from a stale fallback,
+with zero changes to that service.
+
+`watchlist_service.add_instrument`'s provider-existence check
+deliberately keeps constructing `MarketDataService(provider)` with NO
+`db` argument: that call has no real `instrument_id` yet (the
+`Instrument` document doesn't exist until after this check passes), so
+passing `db` there would have persisted a `market_snapshots` document
+keyed by the yfinance ticker string instead of a real instrument_id —
+never read by anything, and never cleaned up. Leaving this one call
+site persistence-free was a deliberate exclusion, not an oversight.
+
+### Alternatives considered
+- Give `MarketDataService` an optional `db` and do the read/write inside
+  it (chosen).
+- A separate thin wrapper/service around `MarketDataService` in the
+  routes layer, keeping `MarketDataService` itself provider-only.
+- Always persist every snapshot (`db` required, not optional).
+
+### Why rejected
+A separate wrapper was rejected: `MarketDataService`'s own module
+docstring already frames its responsibility as "the translation from a
+provider's RawQuote into a persisted, valid MarketSnapshot" — the
+persistence/fallback logic belongs exactly where the validity rules
+already live, not split into a second layer that would need to
+re-import those same rules to decide what counts as "valid enough to
+persist." Making `db` required was rejected because it would have
+forced every existing unit test in `test_market_data_service.py` (over
+25 tests, all constructing `MarketDataService(provider)` with no `db`)
+to be rewritten just to keep passing, for a feature those tests aren't
+exercising — an optional, default-`None` argument is strictly additive
+and keeps that entire existing suite's assertions meaningful unchanged.
+
+### Consequence
+- `app/services/market_data_service.py`: `MarketDataService.__init__`
+  gained `db: Database | None = None`; `fetch_snapshots` now drives its
+  loop from the requested `symbol_to_instrument_id` map (not just
+  whatever quotes a provider happened to return) so a symbol the
+  provider omits entirely is treated the same as an explicit failure for
+  fallback purposes; two new private methods, `_persist_snapshot` (only
+  ever called with an already-valid, `status == ok` snapshot, so invalid
+  data can never overwrite a good persisted document) and
+  `_fallback_snapshot` (read-only lookup, always returns `status =
+  stale`).
+- `app/routes/watchlist.py`: all three `MarketDataService(...)`
+  construction sites now pass `db`; `mark_as_seen` and
+  `mark_all_as_seen` each gained a `status == ok` check before
+  checkpoint creation.
+- `tests/test_market_data_service.py`: existing tests unchanged (all
+  still construct without `db`); new tests cover persist-on-success,
+  stale-fallback-on-failure, no-fallback-when-nothing-persisted,
+  invalid-data-never-overwrites-good-data, provider-failure-never-
+  deletes-the-persisted-document, fresh-data-does-replace-the-previous
+  snapshot, fallback-age-from-the-persisted-timestamp (not "now"), and a
+  provider that omits a symbol entirely.
+- `tests/test_watchlist_api.py`: new API-level tests cover a truthful
+  stale freshness label end-to-end, and that a stale fallback is
+  rejected by both `mark_as_seen` and `mark_all_as_seen`. Three
+  PRE-EXISTING tests whose scenario happened to also exercise this exact
+  path (a checkpoint/prior valid snapshot already existed, then that
+  same instrument's next fetch failed) were updated from asserting
+  `status == "unavailable"` to `status == "stale"` — this is the
+  intended, improved behavior this decision implements, not a
+  regression; each updated test still asserts its original core
+  invariant (checkpoint left untouched, sibling instruments unaffected,
+  no `ChangeEvent` created).
+- `architecture.md`: the "No persisted last-known-good snapshot" Known
+  Limitations bullet, the Failure Modes & Responses table, and the two
+  Data Ownership/MarketSnapshot sections describing the collection as
+  "currently unused by any write path" were all corrected to describe
+  the fallback now in place.
+- No Redis, new cache service, background poller, queue, or new
+  dependency was introduced. The existing `MarketDataProvider`
+  abstraction, the meaningful-change formula, the adaptive threshold
+  logic, checkpoint semantics, and attention scoring are all unchanged.
