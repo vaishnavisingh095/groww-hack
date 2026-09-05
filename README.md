@@ -73,8 +73,7 @@ I deliberately avoided Kafka, Redis, WebSockets, Kubernetes, microservices, queu
 
 ## Architecture
 
-![Uploading image.png…]()
-
+<img width="1460" height="801" alt="Screenshot 2026-09-05 at 11 05 02 PM" src="https://github.com/user-attachments/assets/d4f3f227-82f6-43c6-b540-5ef8f3ac70d0" />
 
 The frontend communicates only with the FastAPI backend.
 
