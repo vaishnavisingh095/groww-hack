@@ -4,11 +4,23 @@ import { addInstrument, fetchAttention, fetchWatchlist, markAllAsSeen, markInstr
 import AttentionSection from './components/AttentionSection'
 import WatchlistTable from './components/WatchlistTable'
 import { filterStockSuggestions, findStockSuggestion } from './stockSuggestions'
+// TEMPORARY DEMO MODE — screenshot use only. See demoAttentionFixture.js
+// for the exact removal steps; this import is one of them.
+import { DEMO_ATTENTION_ITEMS, DEMO_WATCHLIST_ENTRIES } from './demoAttentionFixture'
 
 // Simple polling per the approved design: no WebSockets, one shared
 // timer for both endpoints. 60s matches the backend's own documented
 // target freshness window (see decisions.md's Freshness Policy).
 const POLL_INTERVAL_MS = 60_000
+
+// TEMPORARY DEMO MODE — screenshot use only, not production behavior.
+// When true, 3 fabricated attention cards (see demoAttentionFixture.js)
+// are prepended to the REAL attention items/instruments passed into
+// AttentionSection below — real state (attentionItems/instruments) is
+// never mutated, only what's passed to that one component. Set to
+// false to instantly disable, or delete this flag + the import above +
+// the two `DEMO_MODE ? ... : ...` lines below to fully remove.
+const DEMO_MODE = true
 
 // Case-insensitive match against an instrument's symbol or exchange --
 // the only fields GET /watchlist already returns that a "search your
@@ -372,6 +384,17 @@ export default function App() {
   // to memoize it separately from addExchange/addSymbol themselves).
   const addStockSuggestions = filterStockSuggestions(addExchange, addSymbol)
 
+  // TEMPORARY DEMO MODE — screenshot use only (see flag above). Fed only
+  // into AttentionSection's props below, never into WatchlistTable or
+  // any real state — the demo cards appear in "Since You Last Checked"
+  // only, not in the watchlist table itself.
+  const displayedAttentionItems = DEMO_MODE
+    ? [...DEMO_ATTENTION_ITEMS, ...attentionItems]
+    : attentionItems
+  const displayedAttentionInstruments = DEMO_MODE
+    ? [...DEMO_WATCHLIST_ENTRIES, ...instruments]
+    : instruments
+
   return (
     <div className="app">
       <header className="app-header">
@@ -386,8 +409,8 @@ export default function App() {
       ) : (
         <>
           <AttentionSection
-            items={attentionItems}
-            instruments={instruments}
+            items={displayedAttentionItems}
+            instruments={displayedAttentionInstruments}
             onMarkAsSeen={handleMarkAsSeen}
             inFlightIds={inFlightIds}
             actionErrors={actionErrors}
