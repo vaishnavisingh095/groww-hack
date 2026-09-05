@@ -62,8 +62,10 @@ def resolve_owner_id(request: Request, response: Response) -> str:
     - A missing or empty cookie value is never trusted or reused -- a
       fresh token is generated and set on the response instead, with
       the full set of security attributes required for a persistent
-      anonymous capability cookie (httpOnly, SameSite=Lax, environment-
-      dependent Secure, ~1 year, path=/).
+      anonymous capability cookie (httpOnly, environment-dependent
+      SameSite/Secure -- Lax/not-Secure for local HTTP dev, None/Secure
+      for the deployed cross-site frontend/backend split, ~1 year,
+      path=/).
     - The frontend never receives this value in a form JavaScript can
       read: httponly=True is set below, and no route in this app ever
       echoes the resolved owner_id back in a response body.
@@ -73,13 +75,23 @@ def resolve_owner_id(request: Request, response: Response) -> str:
         return existing
 
     owner_id = generate_owner_id()
+    # Local dev: frontend and backend are both plain-HTTP localhost, so
+    # SameSite=Lax + no Secure is what actually works there (Secure
+    # cookies are refused outright over HTTP). Production: the deployed
+    # frontend (Vercel) and backend (Render) are two different real
+    # origins, so the cookie must be sent on a cross-site fetch --
+    # SameSite=None is required for that, and browsers refuse to accept
+    # SameSite=None at all unless Secure is also set, which is already
+    # true here since both flip on together, gated by the same
+    # environment check.
+    is_production = settings.environment == "production"
     response.set_cookie(
         key=OWNER_COOKIE_NAME,
         value=owner_id,
         max_age=_COOKIE_MAX_AGE_SECONDS,
         httponly=True,
-        samesite="lax",
-        secure=settings.environment == "production",
+        samesite="none" if is_production else "lax",
+        secure=is_production,
         path="/",
     )
     return owner_id

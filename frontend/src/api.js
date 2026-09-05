@@ -3,7 +3,13 @@
 // thing that talks to the market data provider. One place for the base
 // URL and every backend call, so nothing else in the app hand-rolls a
 // fetch() and risks drifting from the real route paths.
-const API_BASE = 'http://localhost:8000'
+//
+// VITE_API_BASE_URL is read at build time (Vite inlines import.meta.env
+// values into the bundle) -- set it in the Vercel project's environment
+// variables to point at the deployed Render backend. Falls back to the
+// existing localhost:8000 target so local dev (`npm run dev`, no env
+// file needed) behaves exactly as before.
+const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
 
 // Every call includes the browser's cookies (credentials: 'include') so
 // the backend's anonymous owner cookie (httpOnly, set by

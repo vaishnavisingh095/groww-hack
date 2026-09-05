@@ -33,18 +33,24 @@ app = FastAPI(title="Groww Smart Watchlist", lifespan=lifespan)
 # CORS: the React dev server runs on a different origin (typically
 # localhost:5173 for Vite) than the FastAPI backend (localhost:8000).
 # Without this, the browser blocks the frontend's fetch() calls entirely.
-# Scoped to localhost dev origins only -- this is a local MVP, not a
-# deployed service with a real domain to restrict to.
+# In production, the deployed frontend (Vercel) and backend (Render) are
+# two different real origins for the same reason -- so the deployed
+# frontend origin is added alongside the local dev ones, not in place of
+# them, since both need to keep working.
 #
 # allow_credentials=True is required for the browser to send/accept the
 # anonymous owner cookie (see app/services/identity.py) across this
 # origin split. This must never be combined with a wildcard
 # allow_origins=["*"] -- browsers reject that combination outright, and
-# it would be a real misconfiguration if this list is ever widened for a
-# real deployment; keep it an explicit list of real origins.
+# it would be a real misconfiguration if this list is ever widened
+# further; keep it an explicit list of real origins.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "https://smart-market-watchlist-six.vercel.app",
+    ],
     allow_credentials=True,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
