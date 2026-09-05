@@ -71,6 +71,29 @@ class ChangeEventService:
         if not change_result.meaningful_change:
             return None
 
+        # Defends against a race between this evaluation and a
+        # concurrent explicit Mark as Seen on the same instrument: the
+        # `checkpoint` argument was read by the caller (e.g. GET
+        # /watchlist) at the START of this request, but a Mark as Seen
+        # request racing against it can have already advanced the
+        # checkpoint (via CheckpointService's replace_one upsert) to a
+        # newer version by the time we get here -- market-data fetches
+        # take long enough (network round trip) for this window to be
+        # real. Without this check, this evaluation -- computed against
+        # an already-superseded checkpoint -- would persist a brand new
+        # unacknowledged ChangeEvent for market state the user has
+        # already effectively acknowledged. Re-reading the CURRENT
+        # checkpoint right before the write (rather than trusting the
+        # one passed in) shrinks that window to just this function's own
+        # insert, without needing a lock or a cross-collection
+        # transaction: the current checkpoint version will still be
+        # correctly (re-)evaluated on the very next observation.
+        current_checkpoint_doc = self._db.checkpoints.find_one(
+            {"user_id": user_id, "instrument_id": instrument_id}
+        )
+        if current_checkpoint_doc is None or current_checkpoint_doc.get("id") != checkpoint.id:
+            return None
+
         existing = self._find(user_id, instrument_id, checkpoint.id)
         if existing is not None:
             return existing

@@ -391,6 +391,7 @@ export default function AttentionSection({
   markAllPartialMessage,
   searchQuery,
   matchesSearch,
+  attentionUnavailable,
 }) {
   const instrumentsById = new Map(instruments.map((inst) => [inst.instrument_id, inst]))
 
@@ -446,9 +447,24 @@ export default function AttentionSection({
         <h2 className="attention-heading">Since You Last Checked</h2>
 
         {items.length === 0 ? (
-          <p className="attention-caught-up">
-            You're all caught up — nothing has meaningfully changed since you last checked.
-          </p>
+          // attentionUnavailable is true only when GET /watchlist/attention
+          // has NEVER successfully returned data -- `items` being empty in
+          // that case is an absence of information, not a backend-confirmed
+          // "zero active changes." Asserting "caught up" here would claim a
+          // fact the backend never actually returned. Once attention has
+          // succeeded at least once, a later transient failure keeps
+          // showing the last real (possibly genuinely empty) result
+          // instead, which is legitimate per the existing "keep last known
+          // good data" behavior loadAll() already applies everywhere else.
+          attentionUnavailable ? (
+            <p className="attention-caught-up">
+              Attention data is temporarily unavailable — trying again shortly.
+            </p>
+          ) : (
+            <p className="attention-caught-up">
+              You're all caught up — nothing has meaningfully changed since you last checked.
+            </p>
+          )
         ) : (
           // Meta text (count/breakdown) and the Mark-all action sit as a
           // horizontal row -- text on the left, the one primary action on

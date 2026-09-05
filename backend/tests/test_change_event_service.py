@@ -15,6 +15,7 @@ from datetime import date, datetime, timezone
 
 import mongomock
 import pytest
+from pymongo.errors import DuplicateKeyError
 
 from app.db.indexes import ensure_indexes
 from app.models.market_snapshot import MarketSnapshot, SnapshotStatus
@@ -279,6 +280,43 @@ def test_new_checkpoint_after_old_one_creates_a_new_independent_event(db):
 # --- E: acknowledge_active ---------------------------------------------
 
 
+def test_evaluation_against_a_superseded_checkpoint_creates_no_orphaned_event(db):
+    """REGRESSION/L3: simulates the race where a GET's change evaluation
+    was computed against checkpoint_1, but by the time it goes to
+    persist the ChangeEvent, a concurrent explicit Mark as Seen has
+    already advanced the checkpoint to checkpoint_2 (e.g. the GET's
+    market-data fetch was in flight while the user clicked Mark as Seen
+    on the same instrument). Persisting an event tied to the
+    now-superseded checkpoint_1 would resurface, as a brand new
+    unacknowledged attention item, a market state the user has already
+    effectively acknowledged. This must be a no-op instead -- the
+    current checkpoint (checkpoint_2) will be correctly (re-)evaluated
+    on the next observation."""
+    checkpoint_service = CheckpointService(db)
+    event_service = ChangeEventService(db)
+
+    checkpoint_1 = checkpoint_service.create_checkpoint_from_snapshot(
+        "user1", "inst123", make_snapshot(last_price=100.0)
+    )
+    # A concurrent explicit Mark as Seen already advanced the checkpoint
+    # before this (stale) evaluation gets around to persisting its event.
+    checkpoint_2 = checkpoint_service.create_checkpoint_from_snapshot(
+        "user1", "inst123", make_snapshot(last_price=105.0)
+    )
+    assert checkpoint_2.id != checkpoint_1.id
+
+    result = event_service.get_or_create_active(
+        user_id="user1",
+        instrument_id="inst123",
+        checkpoint=checkpoint_1,
+        snapshot_status=SnapshotStatus.OK,
+        change_result=meaningful_change(checkpoint_price=100.0, current_price=110.0),
+    )
+
+    assert result is None
+    assert db.change_events.count_documents({}) == 0
+
+
 def test_acknowledge_active_marks_matching_events_and_leaves_other_instruments_alone(db):
     checkpoint_service = CheckpointService(db)
     event_service = ChangeEventService(db)
@@ -310,6 +348,45 @@ def test_acknowledge_active_marks_matching_events_and_leaves_other_instruments_a
     event_b = db.change_events.find_one({"instrument_id": "inst-B"})
     assert event_a["acknowledged"] is True
     assert event_b["acknowledged"] is False
+
+
+def test_concurrent_insert_race_recovers_existing_event_instead_of_raising(db, monkeypatch):
+    """REGRESSION/L1: simulates two concurrent requests both detecting
+    the same meaningful change against the same checkpoint version. The
+    'losing' request's insert_one hits the unique
+    (user_id, instrument_id, checkpoint_id) index and raises
+    DuplicateKeyError, exactly as real MongoDB would under genuine
+    concurrency -- the service must recover by returning whatever the
+    'winning' request actually persisted, never raise, and never leave
+    more than one document behind."""
+    checkpoint = CheckpointService(db).create_checkpoint_from_snapshot(
+        "user1", "inst123", make_snapshot()
+    )
+    service = ChangeEventService(db)
+
+    real_insert_one = db.change_events.insert_one
+
+    def racing_insert_one(doc):
+        # Simulate the winning concurrent request's insert landing
+        # first (using the real collection method, not a mock), then
+        # this request's own attempt fails on the unique index, exactly
+        # as pymongo itself would report it.
+        real_insert_one(doc)
+        raise DuplicateKeyError("simulated concurrent insert")
+
+    monkeypatch.setattr(db.change_events, "insert_one", racing_insert_one)
+
+    result = service.get_or_create_active(
+        user_id="user1",
+        instrument_id="inst123",
+        checkpoint=checkpoint,
+        snapshot_status=SnapshotStatus.OK,
+        change_result=meaningful_change(),
+    )
+
+    assert result is not None
+    assert result.checkpoint_id == checkpoint.id
+    assert db.change_events.count_documents({}) == 1
 
 
 def test_acknowledge_active_is_a_no_op_when_no_events_exist(db):

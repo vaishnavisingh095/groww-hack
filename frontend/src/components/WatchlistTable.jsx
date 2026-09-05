@@ -85,12 +85,27 @@ function WatchlistRow({ instrument, onMarkAsSeen, inFlight, actionError, savedMe
 
 export default function WatchlistTable({
   instruments,
+  totalCount,
+  unavailable,
   onMarkAsSeen,
   inFlightIds,
   actionErrors,
   savedMessages,
 }) {
+  // Three distinct reasons this list can be empty must not collapse
+  // into one misleading message: the watchlist fetch never
+  // successfully loaded (unavailable -- do NOT claim a confirmed
+  // empty watchlist), the real watchlist has items but the current
+  // search/filter matched none of them, or the watchlist is genuinely
+  // empty. `totalCount` is the real, unfiltered instrument count --
+  // `instruments` here is already search/filter-narrowed.
   if (instruments.length === 0) {
+    if (unavailable) {
+      return <p className="empty-state">Could not load your watchlist. Retrying shortly.</p>
+    }
+    if (totalCount > 0) {
+      return <p className="empty-state">No stocks in your watchlist match the current search/filter.</p>
+    }
     return <p className="empty-state">Your watchlist is empty.</p>
   }
 

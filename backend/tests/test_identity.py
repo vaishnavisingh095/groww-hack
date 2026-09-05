@@ -5,7 +5,46 @@ dependency, a real Request/Response, and real routes) is covered in
 test_watchlist_api.py instead, since that needs the full app + TestClient
 machinery already set up there.
 """
-from app.services.identity import generate_owner_id
+from app.services.identity import OWNER_COOKIE_NAME, generate_owner_id, resolve_owner_id
+
+
+class _FakeRequest:
+    """Minimal stand-in exposing only what resolve_owner_id reads
+    (.cookies) -- avoids constructing a real Starlette Request just to
+    exercise this function's own logic in isolation."""
+
+    def __init__(self, cookies: dict):
+        self.cookies = cookies
+
+
+class _FakeResponse:
+    """Minimal stand-in recording set_cookie calls, so a test can
+    assert whether a NEW cookie was (or wasn't) issued."""
+
+    def __init__(self):
+        self.set_cookie_calls = []
+
+    def set_cookie(self, **kwargs):
+        self.set_cookie_calls.append(kwargs)
+
+
+def test_resolve_owner_id_trusts_any_nonempty_cookie_value_as_is():
+    """resolve_owner_id imposes no length limit and no character
+    allow-list -- values a real HTTP Cookie header cannot carry
+    unencoded (raw whitespace, raw non-ASCII) are still exercised here
+    directly against the function's own logic, since a real client
+    would percent-encode them first and this function would see the
+    already-decoded string either way. Each must be trusted as-is and
+    must never trigger issuing a fresh cookie (that only happens when
+    no cookie value is present at all)."""
+    for value in ["   ", "x" * 10_000, "token-with-unicode-éü-and-spaces here"]:
+        request = _FakeRequest({OWNER_COOKIE_NAME: value})
+        response = _FakeResponse()
+
+        result = resolve_owner_id(request, response)
+
+        assert result == value
+        assert response.set_cookie_calls == []
 
 
 def test_generate_owner_id_returns_a_non_empty_string():

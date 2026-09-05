@@ -37,6 +37,15 @@ export async function fetchWatchlist() {
     throw new Error(await parseErrorDetail(response))
   }
   const data = await response.json()
+  // A 200 with an unexpected shape (null body, missing/non-array
+  // `instruments`) is treated the same as any other failed request --
+  // reusing loadAll()'s existing rejection handling (keep last known
+  // good data, show a truthful error) rather than letting `undefined`
+  // silently flow into instruments.filter()/.map() downstream and
+  // crash the page, or silently replacing real prior data with [].
+  if (!data || !Array.isArray(data.instruments)) {
+    throw new Error('Unexpected response from server.')
+  }
   return data.instruments
 }
 
@@ -46,6 +55,10 @@ export async function fetchAttention() {
     throw new Error(await parseErrorDetail(response))
   }
   const data = await response.json()
+  // Same defensive shape check as fetchWatchlist -- see its comment.
+  if (!data || !Array.isArray(data.attention_items)) {
+    throw new Error('Unexpected response from server.')
+  }
   return data.attention_items
 }
 

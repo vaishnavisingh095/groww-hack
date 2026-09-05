@@ -83,8 +83,23 @@ def ensure_seed_instruments(db: Database) -> list[dict]:
 
         instrument = Instrument(symbol=symbol, exchange=exchange)
         doc = instrument.model_dump(mode="json")
-        insert_result = db.instruments.insert_one(doc)
-        doc["_id"] = insert_result.inserted_id
+        try:
+            insert_result = db.instruments.insert_one(doc)
+            doc["_id"] = insert_result.inserted_id
+        except DuplicateKeyError:
+            # Two brand-new owners' first-ever requests can both reach
+            # this loop (via get_or_create_watchlist) for the same
+            # not-yet-seeded symbol before either has inserted it -- the
+            # unique index (uniq_symbol_exchange) is the real source of
+            # truth here, same pattern as add_instrument's own recovery.
+            # Reuse whatever the winning request actually persisted
+            # rather than raising an unhandled 500 for the loser.
+            existing = db.instruments.find_one(
+                {"symbol": symbol, "exchange": exchange.value}
+            )
+            if existing is None:
+                raise
+            doc = existing
         result.append(doc)
     return result
 
@@ -213,8 +228,26 @@ def add_instrument(
         raise ProviderResolutionError(instrument.symbol, instrument.exchange.value)
 
     doc = instrument.model_dump(mode="json")
-    insert_result = db.instruments.insert_one(doc)
-    doc["_id"] = insert_result.inserted_id
+    try:
+        insert_result = db.instruments.insert_one(doc)
+        doc["_id"] = insert_result.inserted_id
+    except DuplicateKeyError:
+        # Another owner's concurrent Add Stock for this exact
+        # (symbol, exchange) pair won the race and already created the
+        # global Instrument document -- the unique index
+        # (uniq_symbol_exchange, Phase 1) is the real source of truth
+        # here, same pattern as get_or_create_watchlist's own recovery.
+        # This request still needs to add the now-existing instrument to
+        # ITS OWN owner's membership rather than raising an unhandled
+        # 500 and leaving this owner with no membership at all.
+        existing = db.instruments.find_one(
+            {"symbol": instrument.symbol, "exchange": instrument.exchange.value}
+        )
+        if existing is None:
+            raise
+        _add_instrument_to_watchlist(db, owner_id, str(existing["_id"]))
+        return existing, False
+
     _add_instrument_to_watchlist(db, owner_id, str(doc["_id"]))
     return doc, True
 

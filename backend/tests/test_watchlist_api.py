@@ -202,6 +202,30 @@ def test_mark_as_seen_with_malformed_instrument_id_returns_400(client):
     assert response.status_code == 400
 
 
+@pytest.mark.parametrize(
+    "bad_id",
+    [
+        "x" * 5000,  # extremely long
+        "!!!not-hex!!!",  # unexpected characters
+        "507f1f77bcf86cd799439011extra",  # right-length-prefix but invalid
+    ],
+    ids=["extremely_long", "unexpected_characters", "invalid_with_valid_prefix"],
+)
+def test_mark_as_seen_with_various_malformed_instrument_ids_returns_400_not_500(client, bad_id):
+    """Step 18: every malformed-ObjectId shape must be caught by
+    _to_object_id's InvalidId handler and rejected with a safe 400 --
+    never an unhandled 500, and never a MongoDB internal error leaked
+    to the response body. (A trailing-slash-unsafe id like an empty
+    string is exercised at the URL-routing level separately.)"""
+    test_client, mock_db = client
+
+    response = test_client.post(f"/watchlist/instruments/{bad_id}/checkpoint")
+
+    assert response.status_code == 400
+    assert "detail" in response.json()
+    assert mock_db.checkpoints.count_documents({}) == 0
+
+
 def test_provider_failure_for_one_symbol_does_not_affect_others(client, monkeypatch):
     """One symbol failing must not take down the whole watchlist
     response."""
@@ -227,6 +251,92 @@ def test_provider_failure_for_one_symbol_does_not_affect_others(client, monkeypa
     assert reliance["price"] == 1326.4
     assert tcs["status"] == "unavailable"
     assert tcs["price"] is None
+
+
+def test_malformed_zero_previous_close_for_one_symbol_does_not_500_or_affect_others(
+    client, monkeypatch
+):
+    """REGRESSION: a provider quote with previous_close=0.0 (or any
+    non-positive/non-finite price) used to raise an unhandled
+    ZeroDivisionError/pydantic.ValidationError inside
+    MarketDataService.fetch_snapshots, which had no per-quote
+    try/except -- crashing the ENTIRE GET /watchlist call for every
+    instrument in the batch, not just the malformed one. This proves,
+    through the full API/DB path, that such a quote instead degrades
+    to "unavailable" for just that one instrument while a healthy
+    sibling is returned correctly."""
+    test_client, mock_db = client
+
+    malformed_provider = FakeProvider(
+        {
+            "RELIANCE.NS": make_quote("RELIANCE.NS", 1326.4, 0.0, 9122871),
+            "TCS.NS": make_quote("TCS.NS", 2312.8, 2320.0, 1722049),
+        }
+    )
+    monkeypatch.setattr(watchlist_routes, "_provider", malformed_provider)
+
+    response = test_client.get("/watchlist")
+    assert response.status_code == 200
+    body = response.json()
+
+    reliance = next(i for i in body["instruments"] if i["symbol"] == "RELIANCE")
+    tcs = next(i for i in body["instruments"] if i["symbol"] == "TCS")
+
+    assert reliance["status"] == "unavailable"
+    assert reliance["price"] is None
+    assert tcs["status"] == "ok"
+    assert tcs["price"] == 2312.8
+
+
+def test_malformed_quote_after_checkpoint_exists_does_not_corrupt_or_advance_it(
+    client, monkeypatch
+):
+    """REGRESSION + edge case E: once a real checkpoint exists for an
+    instrument, a later provider response with a poisonous price
+    (previous_close=0.0, fetch_succeeded=True) must not crash, must not
+    advance/replace the checkpoint, and must not corrupt the frozen
+    baseline -- the instrument simply degrades to unavailable for that
+    request while its checkpoint is left exactly as it was."""
+    test_client, mock_db = client
+
+    first = test_client.get("/watchlist").json()
+    reliance = next(i for i in first["instruments"] if i["symbol"] == "RELIANCE")
+    instrument_id = reliance["instrument_id"]
+
+    test_client.post(f"/watchlist/instruments/{instrument_id}/checkpoint")
+    checkpoint_before = mock_db.checkpoints.find_one({"instrument_id": instrument_id})
+
+    malformed_provider = FakeProvider(
+        {
+            "RELIANCE.NS": make_quote("RELIANCE.NS", 1326.4, 0.0, 9122871),
+            "TCS.NS": make_quote("TCS.NS", 2312.8, 2320.0, 1722049),
+        }
+    )
+    monkeypatch.setattr(watchlist_routes, "_provider", malformed_provider)
+
+    response = test_client.get("/watchlist")
+    assert response.status_code == 200
+    body = response.json()
+
+    reliance_after = next(i for i in body["instruments"] if i["symbol"] == "RELIANCE")
+    assert reliance_after["status"] == "unavailable"
+    # Per the route's own contract (see routes/watchlist.py's snapshot-
+    # is-None branch): when current data is unavailable, the response
+    # always reports has_baseline=False, regardless of whether a
+    # checkpoint actually exists in storage -- it never claims to
+    # compare against a baseline it cannot currently verify. The
+    # checkpoint document itself (asserted below) is what actually
+    # proves the baseline survived untouched.
+    assert reliance_after["change"]["has_baseline"] is False
+    assert reliance_after["change"]["meaningful_change"] is False
+
+    checkpoint_after = mock_db.checkpoints.find_one({"instrument_id": instrument_id})
+    assert checkpoint_after["checkpoint_at"] == checkpoint_before["checkpoint_at"]
+    assert (
+        checkpoint_after["baseline_snapshot"]["last_price"]
+        == checkpoint_before["baseline_snapshot"]["last_price"]
+    )
+    assert mock_db.checkpoints.count_documents({}) == 1
 
 
 def test_unavailable_instrument_still_includes_instrument_id(client, monkeypatch):
@@ -1210,6 +1320,20 @@ def test_missing_or_unusual_cookie_never_causes_a_server_error(client):
     assert mock_db.watchlists.count_documents({"user_id": "not-a-real-issued-token"}) == 1
 
 
+def test_extremely_long_cookie_value_never_causes_a_server_error(client):
+    """Step 4 edge case: an extremely long (but otherwise ordinary,
+    wire-transmittable) cookie value is trusted as its own distinct
+    (new, currently-empty-until-seeded) owner identity -- no length
+    limit, no crash, no collision with a different real owner's data."""
+    test_client, mock_db = client
+    cookie_value = "x" * 4000
+
+    response = test_client.get("/watchlist", cookies={"watchlist_owner": cookie_value})
+
+    assert response.status_code == 200
+    assert mock_db.watchlists.count_documents({"user_id": cookie_value}) == 1
+
+
 def test_request_body_user_id_is_ignored_identity_comes_from_cookie(client, monkeypatch):
     test_client, mock_db = client
     monkeypatch.setattr(watchlist_routes, "_provider", FakeProvider(_quotes_with_wipro_added()))
@@ -1317,6 +1441,59 @@ def test_legacy_demo_user_data_is_never_touched(client):
     assert mock_db.checkpoints.count_documents({"user_id": "new-owner"}) == 1
 
 
+def test_ensure_seed_instruments_survives_concurrent_seeding_race(mock_db, monkeypatch):
+    """
+    REGRESSION (P0 Hardening #5): ensure_seed_instruments is called by
+    EVERY brand-new owner's first-ever request (via
+    get_or_create_watchlist), and on a fresh database the 5 seed
+    Instrument documents don't exist yet -- so two genuinely
+    first-ever, concurrent requests (from two DIFFERENT brand-new
+    owners, or two tabs of the same one) can both see a given seed
+    symbol as "not yet created" and both attempt to insert it. Unlike
+    get_or_create_watchlist and add_instrument, this loop had no
+    DuplicateKeyError recovery around its own insert_one -- the losing
+    request would raise an unhandled 500 instead of reusing the
+    instrument the winning request just created.
+
+    Forced deterministically (not via real threads) with the same
+    "find_one misses once" technique used for the analogous Watchlist-
+    creation and Add-Stock races.
+    """
+    from app.models.instrument import Instrument
+    from app.services.watchlist_service import SEED_INSTRUMENTS, ensure_seed_instruments
+
+    symbol, exchange = SEED_INSTRUMENTS[0]
+
+    # A "concurrent" request already won the race and inserted this
+    # exact seed instrument first.
+    winning_doc = Instrument(symbol=symbol, exchange=exchange).model_dump(mode="json")
+    insert_result = mock_db.instruments.insert_one(winning_doc)
+    winning_doc["_id"] = insert_result.inserted_id
+
+    real_find_one = mock_db.instruments.find_one
+    call_count = {"n": 0}
+
+    def find_one_misses_once(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return None
+        return real_find_one(*args, **kwargs)
+
+    monkeypatch.setattr(mock_db.instruments, "find_one", find_one_misses_once)
+
+    result = ensure_seed_instruments(mock_db)
+
+    assert len(result) == len(SEED_INSTRUMENTS)
+    first_result_doc = next(d for d in result if d["symbol"] == symbol)
+    assert first_result_doc["_id"] == winning_doc["_id"]
+    assert (
+        mock_db.instruments.count_documents(
+            {"symbol": symbol, "exchange": exchange.value}
+        )
+        == 1
+    )
+
+
 def test_get_or_create_watchlist_survives_concurrent_creation_race(mock_db, monkeypatch):
     """
     Backend-side safety net for the scenario the frontend's own
@@ -1373,3 +1550,447 @@ def test_get_or_create_watchlist_survives_concurrent_creation_race(mock_db, monk
     assert mock_db.watchlists.count_documents({"user_id": owner_id}) == 1
     assert result.user_id == owner_id
     assert len(result.instrument_ids) == 5
+
+
+def test_concurrent_membership_additions_of_different_symbols_do_not_clobber_each_other(
+    mock_db, monkeypatch
+):
+    """
+    Step 4/16: _add_instrument_to_watchlist uses $addToSet (an atomic,
+    single-document array-append operator), not a read-modify-write
+    replace_one -- so two updates adding DIFFERENT symbols to the SAME
+    owner's Watchlist can never lose one membership to a last-write-wins
+    overwrite, regardless of ordering. Simulated here as three
+    successive additions (each is what a single concurrent request
+    would issue) rather than real threads, since $addToSet's atomicity
+    is a per-call MongoDB guarantee, not something that depends on
+    ordering to prove -- if a $push/replace_one were used instead, this
+    exact sequence would still only leave whichever update ran last.
+    """
+    from app.services.watchlist_service import (
+        _add_instrument_to_watchlist,
+        get_or_create_watchlist,
+    )
+
+    owner_id = "owner-concurrent-adds"
+    get_or_create_watchlist(mock_db, owner_id)  # seeds the 5 default instruments
+
+    tcs_id = str(mock_db.instruments.find_one({"symbol": "TCS"})["_id"])
+    infy_id = str(mock_db.instruments.find_one({"symbol": "INFY"})["_id"])
+    hdfc_id = str(mock_db.instruments.find_one({"symbol": "HDFCBANK"})["_id"])
+
+    # Each call is independently atomic -- none of these should observe
+    # or overwrite the others' effect.
+    _add_instrument_to_watchlist(mock_db, owner_id, tcs_id)
+    _add_instrument_to_watchlist(mock_db, owner_id, infy_id)
+    _add_instrument_to_watchlist(mock_db, owner_id, hdfc_id)
+
+    watchlist = mock_db.watchlists.find_one({"user_id": owner_id})
+    assert tcs_id in watchlist["instrument_ids"]
+    assert infy_id in watchlist["instrument_ids"]
+    assert hdfc_id in watchlist["instrument_ids"]
+    # $addToSet never introduces a duplicate for a symbol already
+    # present from seeding (all 5 seeds already include TCS/INFY/HDFCBANK).
+    assert watchlist["instrument_ids"].count(tcs_id) == 1
+
+
+def test_add_instrument_survives_concurrent_creation_race_for_same_new_symbol(
+    mock_db, monkeypatch
+):
+    """
+    REGRESSION (P0 Hardening #4, Step 10's known Add Stock concurrency
+    gap): two owners simultaneously Add Stock for the same brand-new
+    (symbol, exchange) pair that does not exist globally yet. Both
+    requests' own find_one sees "doesn't exist" before either has
+    inserted, so both proceed to validate via the provider and attempt
+    insert_one -- the losing request must hit the real unique index
+    (uniq_symbol_exchange) and recover by joining the Instrument the
+    winning request actually created, rather than raising an unhandled
+    500 and leaving the losing owner with no membership at all.
+
+    Forced deterministically (not via real threads) by making this
+    request's OWN find_one miss a document a "concurrent" request
+    already inserted -- the same pattern
+    test_get_or_create_watchlist_survives_concurrent_creation_race uses
+    for the analogous Watchlist-creation race.
+    """
+    from app.models.instrument import Exchange, Instrument
+    from app.services.watchlist_service import add_instrument
+
+    symbol, exchange = "WIPRO", Exchange.NSE
+    provider = FakeProvider({"WIPRO.NS": make_quote("WIPRO.NS", 480.0, 475.0, 5_000_000)})
+
+    # A "concurrent" request (owner A) for this exact (symbol, exchange)
+    # already won the race and inserted the global Instrument first.
+    winning_doc = Instrument(symbol=symbol, exchange=exchange).model_dump(mode="json")
+    insert_result = mock_db.instruments.insert_one(winning_doc)
+    winning_doc["_id"] = insert_result.inserted_id
+
+    real_find_one = mock_db.instruments.find_one
+    call_count = {"n": 0}
+
+    def find_one_misses_once(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return None
+        return real_find_one(*args, **kwargs)
+
+    monkeypatch.setattr(mock_db.instruments, "find_one", find_one_misses_once)
+
+    doc, created = add_instrument(
+        mock_db, provider, "owner-b", Instrument(symbol=symbol, exchange=exchange)
+    )
+
+    assert created is False  # owner-b did not create it -- joined owner A's
+    assert doc["_id"] == winning_doc["_id"]
+    assert (
+        mock_db.instruments.count_documents({"symbol": symbol, "exchange": exchange.value}) == 1
+    )
+
+    watchlist_b = mock_db.watchlists.find_one({"user_id": "owner-b"})
+    assert str(winning_doc["_id"]) in watchlist_b["instrument_ids"]
+
+
+# --- P0 Hardening: observation must never become acknowledgement -----------
+#
+# The call-graph inspection behind these tests found the invariant already
+# holds (GET /watchlist can reach checkpoints.replace_one? No -- it never
+# calls create_checkpoint_from_snapshot. GET /watchlist/attention performs
+# zero writes at all -- confirmed by grepping every insert_one/update_one/
+# update_many/replace_one call site in app/). These tests close specific,
+# verified gaps in existing coverage rather than fix any production bug.
+
+
+def test_new_owner_repeated_observation_creates_no_checkpoint_or_change_event(client):
+    """
+    Edge cases A1/A2/A3: a brand-new owner with no checkpoint at all.
+    Repeated, INTERLEAVED GET /watchlist and GET /watchlist/attention
+    calls must never create a Checkpoint or a ChangeEvent, and must
+    never alter the owner's own Watchlist membership -- observation
+    alone, no matter how many times repeated, is never acknowledgement.
+    """
+    test_client, mock_db = client
+
+    for _ in range(3):
+        test_client.get("/watchlist")
+        test_client.get("/watchlist/attention")
+
+    assert mock_db.checkpoints.count_documents({}) == 0
+    assert mock_db.change_events.count_documents({}) == 0
+    assert mock_db.watchlists.count_documents({}) == 1
+    assert len(mock_db.watchlists.find_one({})["instrument_ids"]) == 5
+
+
+def test_checkpoint_remains_unchanged_when_get_detects_a_meaningful_change(client, monkeypatch):
+    """
+    Edge case C: GET /watchlist may OBSERVE a meaningful change and
+    persist the resulting ChangeEvent (a detection fact -- see
+    ChangeEventService's own docstring), but the underlying Checkpoint
+    itself must never advance or be modified merely because that
+    detection happened, including across repeated GETs afterward.
+    """
+    test_client, mock_db = client
+
+    first = test_client.get("/watchlist").json()
+    instrument_id = next(i for i in first["instruments"] if i["symbol"] == "RELIANCE")[
+        "instrument_id"
+    ]
+    test_client.post(f"/watchlist/instruments/{instrument_id}/checkpoint")
+    checkpoint_before = mock_db.checkpoints.find_one({"instrument_id": instrument_id})
+
+    monkeypatch.setattr(
+        watchlist_routes, "_provider", FakeProvider(_quotes_with_reliance_price(1400.0))
+    )
+
+    # The GET that actually detects and persists the ChangeEvent.
+    body = test_client.get("/watchlist").json()
+    reliance = next(i for i in body["instruments"] if i["symbol"] == "RELIANCE")
+    assert reliance["change"]["meaningful_change"] is True
+    assert mock_db.change_events.count_documents({}) == 1
+
+    checkpoint_after_detection = mock_db.checkpoints.find_one({"instrument_id": instrument_id})
+    assert checkpoint_after_detection == checkpoint_before
+
+    # A further repeated GET while the same change stays unacknowledged.
+    test_client.get("/watchlist")
+    test_client.get("/watchlist")
+    checkpoint_after_repeats = mock_db.checkpoints.find_one({"instrument_id": instrument_id})
+    assert checkpoint_after_repeats == checkpoint_before
+    assert mock_db.checkpoints.count_documents({}) == 1
+    assert mock_db.change_events.count_documents({}) == 1  # no duplicate either
+
+
+def test_simulated_frontend_polling_sequence_never_acknowledges_or_advances(client, monkeypatch):
+    """
+    Edge case E: simulates the real frontend's own loadAll() pattern --
+    GET /watchlist and GET /watchlist/attention, repeated several times
+    (as the 60s poll would) -- while a real unacknowledged meaningful
+    change exists. None of this presentation-layer polling may silently
+    acknowledge the event, advance the checkpoint, replace the baseline,
+    or create a duplicate ChangeEvent.
+    """
+    test_client, mock_db = client
+
+    first = test_client.get("/watchlist").json()
+    instrument_id = next(i for i in first["instruments"] if i["symbol"] == "RELIANCE")[
+        "instrument_id"
+    ]
+    test_client.post(f"/watchlist/instruments/{instrument_id}/checkpoint")
+    checkpoint_before = mock_db.checkpoints.find_one({"instrument_id": instrument_id})
+
+    monkeypatch.setattr(
+        watchlist_routes, "_provider", FakeProvider(_quotes_with_reliance_price(1400.0))
+    )
+
+    for _ in range(4):
+        test_client.get("/watchlist")
+        test_client.get("/watchlist/attention")
+
+    checkpoint_after = mock_db.checkpoints.find_one({"instrument_id": instrument_id})
+    assert checkpoint_after == checkpoint_before
+    assert mock_db.checkpoints.count_documents({}) == 1
+    assert mock_db.change_events.count_documents({}) == 1
+
+    event = mock_db.change_events.find_one({"instrument_id": instrument_id})
+    assert event["acknowledged"] is False
+
+    attention_items = test_client.get("/watchlist/attention").json()["attention_items"]
+    assert any(item["symbol"] == "RELIANCE" for item in attention_items)
+
+    assert len(mock_db.watchlists.find_one({})["instrument_ids"]) == 5
+
+
+def test_repeated_mark_as_seen_on_same_instrument_is_safe(client):
+    """
+    Edge case G: calling Mark as Seen repeatedly for the same instrument
+    is safe -- each call is a real, explicit user action (unlike a GET),
+    so it's expected (existing, intended semantics) to advance the
+    checkpoint again each time, never error, and never duplicate the
+    checkpoint document.
+    """
+    test_client, mock_db = client
+
+    first = test_client.get("/watchlist").json()
+    instrument_id = next(i for i in first["instruments"] if i["symbol"] == "RELIANCE")[
+        "instrument_id"
+    ]
+
+    response1 = test_client.post(f"/watchlist/instruments/{instrument_id}/checkpoint")
+    assert response1.status_code == 200
+    checkpoint_after_first = mock_db.checkpoints.find_one({"instrument_id": instrument_id})
+
+    response2 = test_client.post(f"/watchlist/instruments/{instrument_id}/checkpoint")
+    assert response2.status_code == 200
+    checkpoint_after_second = mock_db.checkpoints.find_one({"instrument_id": instrument_id})
+
+    # Still exactly one checkpoint document -- advanced, not duplicated.
+    assert mock_db.checkpoints.count_documents({"instrument_id": instrument_id}) == 1
+    # A fresh explicit action always writes a new checkpoint id, even
+    # with an unchanged price (architecture.md's "advancing the
+    # checkpoint replaces the previous one" -- existing semantics,
+    # unchanged by this hardening pass).
+    assert checkpoint_after_second["id"] != checkpoint_after_first["id"]
+
+    response3 = test_client.post(f"/watchlist/instruments/{instrument_id}/checkpoint")
+    assert response3.status_code == 200
+    assert mock_db.checkpoints.count_documents({"instrument_id": instrument_id}) == 1
+
+
+def test_mark_all_as_seen_does_not_touch_another_owners_state(client, monkeypatch):
+    """
+    Edge case H.7: Mark All as Seen for owner A must never create,
+    advance, or acknowledge anything belonging to a DIFFERENT owner --
+    only the calling owner's own membership/checkpoints/events are ever
+    touched.
+    """
+    test_client, mock_db = client
+
+    # Owner B establishes their own checkpoint + active ChangeEvent first.
+    owner_b_first = test_client.get(
+        "/watchlist", cookies={"watchlist_owner": "owner-b"}
+    ).json()
+    reliance_id = next(i for i in owner_b_first["instruments"] if i["symbol"] == "RELIANCE")[
+        "instrument_id"
+    ]
+    test_client.post(
+        f"/watchlist/instruments/{reliance_id}/checkpoint",
+        cookies={"watchlist_owner": "owner-b"},
+    )
+    monkeypatch.setattr(
+        watchlist_routes, "_provider", FakeProvider(_quotes_with_reliance_price(1400.0))
+    )
+    test_client.get("/watchlist", cookies={"watchlist_owner": "owner-b"})
+
+    owner_b_checkpoint_before = mock_db.checkpoints.find_one(
+        {"user_id": "owner-b", "instrument_id": reliance_id}
+    )
+    owner_b_event_before = mock_db.change_events.find_one(
+        {"user_id": "owner-b", "instrument_id": reliance_id}
+    )
+    assert owner_b_event_before["acknowledged"] is False
+
+    # Owner A (a completely separate, brand-new owner) calls Mark All.
+    response = test_client.post(
+        "/watchlist/checkpoint", cookies={"watchlist_owner": "owner-a"}
+    )
+    assert response.status_code == 200
+
+    owner_b_checkpoint_after = mock_db.checkpoints.find_one(
+        {"user_id": "owner-b", "instrument_id": reliance_id}
+    )
+    owner_b_event_after = mock_db.change_events.find_one(
+        {"user_id": "owner-b", "instrument_id": reliance_id}
+    )
+
+    assert owner_b_checkpoint_after == owner_b_checkpoint_before
+    assert owner_b_event_after == owner_b_event_before
+    assert owner_b_event_after["acknowledged"] is False
+
+    # Owner A's own mark-all only ever touched owner A's own checkpoints.
+    assert mock_db.checkpoints.count_documents({"user_id": "owner-a"}) == 5
+    assert mock_db.checkpoints.count_documents({"user_id": "owner-b"}) == 1
+
+
+def test_provider_failure_for_one_instrument_does_not_affect_a_siblings_existing_checkpoint(
+    client, monkeypatch
+):
+    """
+    Edge case I: a provider failure for ONE instrument must never
+    mutate a DIFFERENT instrument's existing checkpoint/change-event
+    state. Both RELIANCE and TCS get real checkpoints first; then TCS's
+    data becomes unavailable while RELIANCE keeps moving meaningfully --
+    RELIANCE's own detection must proceed completely normally,
+    unaffected by TCS's failure, and TCS's existing checkpoint must stay
+    exactly as it was.
+    """
+    test_client, mock_db = client
+
+    first = test_client.get("/watchlist").json()
+    reliance_id = next(i for i in first["instruments"] if i["symbol"] == "RELIANCE")[
+        "instrument_id"
+    ]
+    tcs_id = next(i for i in first["instruments"] if i["symbol"] == "TCS")["instrument_id"]
+
+    test_client.post(f"/watchlist/instruments/{reliance_id}/checkpoint")
+    test_client.post(f"/watchlist/instruments/{tcs_id}/checkpoint")
+    tcs_checkpoint_before = mock_db.checkpoints.find_one({"instrument_id": tcs_id})
+
+    partial_provider = FakeProvider(
+        {
+            "RELIANCE.NS": make_quote("RELIANCE.NS", 1400.0, 1302.6, 9122871),
+            # TCS deliberately omitted -> unavailable this cycle
+            "HDFCBANK.NS": make_quote("HDFCBANK.NS", 715.6, 706.6, 9937354),
+            "INFY.NS": make_quote("INFY.NS", 1129.0, 1130.3, 3875864),
+            "ICICIBANK.NS": make_quote("ICICIBANK.NS", 1432.5, 1430.0, 4072353),
+        }
+    )
+    monkeypatch.setattr(watchlist_routes, "_provider", partial_provider)
+
+    body = test_client.get("/watchlist").json()
+    reliance = next(i for i in body["instruments"] if i["symbol"] == "RELIANCE")
+    tcs = next(i for i in body["instruments"] if i["symbol"] == "TCS")
+
+    assert reliance["change"]["meaningful_change"] is True
+    assert tcs["status"] == "unavailable"
+
+    # RELIANCE's own detection proceeded normally.
+    assert mock_db.change_events.count_documents({"instrument_id": reliance_id}) == 1
+    # TCS's existing checkpoint is completely untouched by its own
+    # provider failure.
+    tcs_checkpoint_after = mock_db.checkpoints.find_one({"instrument_id": tcs_id})
+    assert tcs_checkpoint_after == tcs_checkpoint_before
+    assert mock_db.change_events.count_documents({"instrument_id": tcs_id}) == 0
+
+
+def test_checkpoint_unchanged_across_a_session_boundary(client, monkeypatch):
+    """
+    Edge case L: a checkpoint set in one trading session, observed again
+    once the current snapshot belongs to a LATER session, must remain
+    completely unchanged -- GET never replaces a baseline merely because
+    the session rolled over. (The volume-acceleration-unavailable-
+    across-a-session-boundary computation itself is already covered at
+    the unit level in test_change_engine.py; this test is specifically
+    about checkpoint immutability, not re-deriving that rule.)
+    """
+    from datetime import date
+
+    test_client, mock_db = client
+
+    first = test_client.get("/watchlist").json()
+    instrument_id = next(i for i in first["instruments"] if i["symbol"] == "RELIANCE")[
+        "instrument_id"
+    ]
+    test_client.post(f"/watchlist/instruments/{instrument_id}/checkpoint")
+    checkpoint_before = mock_db.checkpoints.find_one({"instrument_id": instrument_id})
+    checkpoint_session_date = date.fromisoformat(checkpoint_before["session_date"])
+
+    next_session_quotes = _quotes_with_reliance_price(1400.0)
+    next_session_quotes["RELIANCE.NS"] = RawQuote(
+        symbol="RELIANCE.NS",
+        last_price=1400.0,
+        previous_close=1302.6,
+        volume=9122871,
+        provider_timestamp=1788509522,
+        fetched_at=datetime.now(timezone.utc),
+        fetch_succeeded=True,
+        session_date=checkpoint_session_date + timedelta(days=1),
+    )
+    monkeypatch.setattr(watchlist_routes, "_provider", FakeProvider(next_session_quotes))
+
+    test_client.get("/watchlist")
+    test_client.get("/watchlist")
+
+    checkpoint_after = mock_db.checkpoints.find_one({"instrument_id": instrument_id})
+    assert checkpoint_after == checkpoint_before
+    assert mock_db.checkpoints.count_documents({}) == 1
+
+
+def test_owner_as_get_requests_cannot_touch_owner_bs_active_event_or_checkpoint(
+    client, monkeypatch
+):
+    """
+    Edge case N: owner B has an active, unacknowledged ChangeEvent and a
+    real checkpoint. Owner A performing repeated GET /watchlist and GET
+    /watchlist/attention calls -- even ones that establish A's OWN
+    checkpoints/events along the way -- must never read, advance, or
+    acknowledge anything of B's.
+    """
+    test_client, mock_db = client
+
+    owner_b_first = test_client.get(
+        "/watchlist", cookies={"watchlist_owner": "owner-b"}
+    ).json()
+    reliance_id = next(i for i in owner_b_first["instruments"] if i["symbol"] == "RELIANCE")[
+        "instrument_id"
+    ]
+    test_client.post(
+        f"/watchlist/instruments/{reliance_id}/checkpoint",
+        cookies={"watchlist_owner": "owner-b"},
+    )
+    monkeypatch.setattr(
+        watchlist_routes, "_provider", FakeProvider(_quotes_with_reliance_price(1400.0))
+    )
+    test_client.get("/watchlist", cookies={"watchlist_owner": "owner-b"})
+
+    owner_b_checkpoint_before = mock_db.checkpoints.find_one({"user_id": "owner-b"})
+    owner_b_event_before = mock_db.change_events.find_one({"user_id": "owner-b"})
+    assert owner_b_event_before["acknowledged"] is False
+
+    # Owner A does a full round of their OWN observation activity -- this
+    # must never reach into B's state at all.
+    for _ in range(3):
+        test_client.get("/watchlist", cookies={"watchlist_owner": "owner-a"})
+        test_client.get("/watchlist/attention", cookies={"watchlist_owner": "owner-a"})
+
+    owner_b_checkpoint_after = mock_db.checkpoints.find_one({"user_id": "owner-b"})
+    owner_b_event_after = mock_db.change_events.find_one({"user_id": "owner-b"})
+
+    assert owner_b_checkpoint_after == owner_b_checkpoint_before
+    assert owner_b_event_after == owner_b_event_before
+    assert owner_b_event_after["acknowledged"] is False
+
+    # Owner A's attention list never includes B's item.
+    owner_a_attention = test_client.get(
+        "/watchlist/attention", cookies={"watchlist_owner": "owner-a"}
+    ).json()
+    assert owner_a_attention["attention_items"] == []

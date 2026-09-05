@@ -232,6 +232,60 @@ def test_both_signals_above_threshold_reason_mentions_both():
     assert "and" in result.reason  # combined into one sentence
 
 
+def test_price_exactly_at_threshold_with_volume_below_threshold_is_meaningful():
+    """E5: price exactly at its inclusive boundary (+2.0%) combined with
+    a volume signal below its own threshold (1.5x) -- the price signal
+    alone must still be sufficient."""
+    result = with_volume(
+        checkpoint_price=100.0,
+        current_price=102.0,  # exactly +2.0%
+        current_volume=CHECKPOINT_VOLUME + 45_000,  # exactly 1.5x, below threshold
+        minutes_after_checkpoint=30,
+    )
+
+    assert result.price_signal.meaningful is True
+    assert result.volume_signal.volume_acceleration_ratio == pytest.approx(1.5, abs=0.01)
+    assert result.volume_signal.meaningful is False
+    assert result.meaningful_change is True
+
+
+def test_volume_exactly_at_threshold_with_price_below_threshold_is_meaningful():
+    """E6: volume exactly at its inclusive boundary (2.0x) combined with
+    a price signal below its own threshold (+1.0%) -- the volume signal
+    alone must still be sufficient."""
+    result = with_volume(
+        checkpoint_price=100.0,
+        current_price=101.0,  # +1.0%, below threshold
+        current_volume=CHECKPOINT_VOLUME + 60_000,  # exactly 2.0x
+        minutes_after_checkpoint=30,
+    )
+
+    assert result.price_signal.meaningful is False
+    assert result.volume_signal.volume_acceleration_ratio == pytest.approx(2.0, abs=0.01)
+    assert result.volume_signal.meaningful is True
+    assert result.meaningful_change is True
+
+
+def test_both_signals_exactly_at_their_thresholds_is_meaningful():
+    """E7: price and volume both sitting exactly on their own inclusive
+    boundary at once -- both must be independently reported meaningful,
+    and the combined reason must mention both."""
+    result = with_volume(
+        checkpoint_price=100.0,
+        current_price=102.0,  # exactly +2.0%
+        current_volume=CHECKPOINT_VOLUME + 60_000,  # exactly 2.0x
+        minutes_after_checkpoint=30,
+    )
+
+    assert result.price_signal.meaningful is True
+    assert result.volume_signal.volume_acceleration_ratio == pytest.approx(2.0, abs=0.01)
+    assert result.volume_signal.meaningful is True
+    assert result.meaningful_change is True
+    assert "2.0%" in result.reason
+    assert "accelerated" in result.reason
+    assert "and" in result.reason
+
+
 # ---------- 15-16. Invalid/zero baseline and market values ----------
 
 

@@ -1,4 +1,4 @@
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from app.models.market_snapshot import SnapshotStatus
 from app.providers.base import MarketDataProvider, RawQuote
@@ -97,6 +97,97 @@ def test_missing_previous_close_produces_no_snapshot():
     snapshots = service.fetch_snapshots({"RELIANCE.NS": "inst123"})
 
     assert snapshots == []
+
+
+def test_zero_previous_close_produces_no_snapshot_not_a_crash():
+    """REGRESSION for the ZeroDivisionError bug: previous_close=0.0
+    reaching MarketSnapshot.compute_percent_change's raw division used
+    to raise an unhandled ZeroDivisionError. It must instead be treated
+    like any other unusable price -- no snapshot, no exception."""
+    provider = FakeProvider([make_quote(previous_close=0.0)])
+    service = MarketDataService(provider)
+
+    snapshots = service.fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    assert snapshots == []
+
+
+def test_negative_previous_close_produces_no_snapshot_not_a_crash():
+    """REGRESSION: a negative previous_close used to survive the
+    division and then raise an unhandled pydantic.ValidationError at
+    MarketSnapshot construction (gt=0). Must degrade to no snapshot."""
+    provider = FakeProvider([make_quote(previous_close=-10.0)])
+    service = MarketDataService(provider)
+
+    snapshots = service.fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    assert snapshots == []
+
+
+def test_zero_last_price_produces_no_snapshot_not_a_crash():
+    """REGRESSION: last_price=0.0 used to survive the None-checks, get
+    divided through, and then raise an unhandled pydantic.ValidationError
+    at MarketSnapshot construction (gt=0). Must degrade to no snapshot."""
+    provider = FakeProvider([make_quote(last_price=0.0)])
+    service = MarketDataService(provider)
+
+    snapshots = service.fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    assert snapshots == []
+
+
+def test_negative_last_price_produces_no_snapshot_not_a_crash():
+    provider = FakeProvider([make_quote(last_price=-5.0)])
+    service = MarketDataService(provider)
+
+    snapshots = service.fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    assert snapshots == []
+
+
+def test_nan_last_price_produces_no_snapshot_not_a_crash():
+    """REGRESSION: a non-finite last_price (NaN) must never reach the
+    percent_change division or the MarketSnapshot constructor."""
+    provider = FakeProvider([make_quote(last_price=float("nan"))])
+    service = MarketDataService(provider)
+
+    snapshots = service.fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    assert snapshots == []
+
+
+def test_infinite_previous_close_produces_no_snapshot_not_a_crash():
+    """REGRESSION: a non-finite previous_close (inf) must never reach
+    the percent_change division or the MarketSnapshot constructor."""
+    provider = FakeProvider([make_quote(previous_close=float("inf"))])
+    service = MarketDataService(provider)
+
+    snapshots = service.fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    assert snapshots == []
+
+
+def test_one_instrument_with_zero_previous_close_does_not_corrupt_sibling():
+    """REGRESSION (the core failure-isolation bug): before the fix, a
+    single malformed quote (previous_close=0.0) would raise out of
+    fetch_snapshots entirely -- crashing the whole batch and silently
+    losing every OTHER instrument's otherwise-healthy snapshot too. A
+    bad instrument must never take down its siblings."""
+    provider = FakeProvider(
+        [
+            make_quote(symbol="BAD.NS", previous_close=0.0),
+            make_quote(symbol="GOOD.NS", last_price=100.0, previous_close=90.0),
+        ]
+    )
+    service = MarketDataService(provider)
+
+    snapshots = service.fetch_snapshots(
+        {"BAD.NS": "inst-bad", "GOOD.NS": "inst-good"}
+    )
+
+    assert len(snapshots) == 1
+    assert snapshots[0].instrument_id == "inst-good"
+    assert snapshots[0].last_price == 100.0
 
 
 def test_missing_session_date_produces_no_snapshot():
@@ -234,3 +325,56 @@ def test_unrequested_symbol_from_provider_is_ignored():
     snapshots = service.fetch_snapshots({"RELIANCE.NS": "inst123"})
 
     assert snapshots == []
+
+
+def test_fetched_at_one_second_below_stale_threshold_is_ok():
+    from app.services.market_data_service import STALE_THRESHOLD_SECONDS
+
+    fetched_at = datetime.now(timezone.utc) - timedelta(
+        seconds=STALE_THRESHOLD_SECONDS - 1
+    )
+    provider = FakeProvider([make_quote(fetched_at=fetched_at)])
+    service = MarketDataService(provider)
+
+    snapshots = service.fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    assert snapshots[0].status == SnapshotStatus.OK
+
+
+def test_fetched_at_exactly_at_stale_threshold_is_ok():
+    """The service's own comparison is strictly `>`, so a quote exactly
+    STALE_THRESHOLD_SECONDS old is still OK -- only one second older
+    tips it into STALE. This pins that boundary.
+
+    _compute_status calls datetime.now() itself, a second wall-clock
+    read after this test computes fetched_at, so a small positive skew
+    (test execution time between the two calls) is unavoidable without
+    a clock-injection seam in production code, which is not worth
+    adding just for this. A 50ms tolerance absorbs that skew while
+    still asserting the boundary is inclusive, not the one-second gap
+    the below/above tests already cover exactly."""
+    from app.services.market_data_service import STALE_THRESHOLD_SECONDS
+
+    fetched_at = datetime.now(timezone.utc) - timedelta(
+        seconds=STALE_THRESHOLD_SECONDS - 0.05
+    )
+    provider = FakeProvider([make_quote(fetched_at=fetched_at)])
+    service = MarketDataService(provider)
+
+    snapshots = service.fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    assert snapshots[0].status == SnapshotStatus.OK
+
+
+def test_fetched_at_one_second_above_stale_threshold_is_stale():
+    from app.services.market_data_service import STALE_THRESHOLD_SECONDS
+
+    fetched_at = datetime.now(timezone.utc) - timedelta(
+        seconds=STALE_THRESHOLD_SECONDS + 1
+    )
+    provider = FakeProvider([make_quote(fetched_at=fetched_at)])
+    service = MarketDataService(provider)
+
+    snapshots = service.fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    assert snapshots[0].status == SnapshotStatus.STALE

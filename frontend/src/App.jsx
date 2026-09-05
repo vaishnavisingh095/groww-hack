@@ -138,6 +138,23 @@ export default function App() {
   // poll, and adds no new request.
   const hasResolvedIdentity = useRef(false)
 
+  // Truthfulness guards, independent of `error` (a single combined
+  // banner string): `error` already tells the user a request failed,
+  // but the WATCHLIST/ATTENTION SECTIONS THEMSELVES must not fall back
+  // to their default empty-state copy ("Your watchlist is empty." /
+  // "You're all caught up...") when that emptiness is only because the
+  // very first fetch failed and no real data has EVER been confirmed
+  // yet -- that would assert a positive fact (confirmed-empty,
+  // confirmed-caught-up) the backend never actually returned. Once a
+  // feed has genuinely succeeded at least once, a LATER transient
+  // failure correctly keeps showing that last real data (or a real
+  // confirmed-empty state) rather than flipping back to "unavailable"
+  // -- these flags only ever matter before the first real success.
+  const hasLoadedWatchlistOnce = useRef(false)
+  const hasLoadedAttentionOnce = useRef(false)
+  const [watchlistUnavailable, setWatchlistUnavailable] = useState(false)
+  const [attentionUnavailable, setAttentionUnavailable] = useState(false)
+
   const loadAll = useCallback(async () => {
     let watchlistResult
     let attentionResult
@@ -159,9 +176,23 @@ export default function App() {
     // state for data we simply couldn't refresh this cycle.
     if (watchlistResult.status === 'fulfilled') {
       setInstruments(watchlistResult.value)
+      hasLoadedWatchlistOnce.current = true
+      setWatchlistUnavailable(false)
+    } else if (!hasLoadedWatchlistOnce.current) {
+      // Never successfully loaded -- `instruments` is still its
+      // pristine [] default, which must not be presented as a
+      // confirmed empty watchlist.
+      setWatchlistUnavailable(true)
     }
     if (attentionResult.status === 'fulfilled') {
       setAttentionItems(attentionResult.value)
+      hasLoadedAttentionOnce.current = true
+      setAttentionUnavailable(false)
+    } else if (!hasLoadedAttentionOnce.current) {
+      // Never successfully loaded -- `attentionItems` is still its
+      // pristine [] default, which must not be presented as a
+      // confirmed "you're all caught up."
+      setAttentionUnavailable(true)
     }
 
     const watchlistFailed = watchlistResult.status === 'rejected'
@@ -326,6 +357,7 @@ export default function App() {
             markAllPartialMessage={markAllPartialMessage}
             searchQuery={searchQuery}
             matchesSearch={matchesSearch}
+            attentionUnavailable={attentionUnavailable}
           />
 
           <section className="watchlist-section">
@@ -421,6 +453,8 @@ export default function App() {
             </div>
             <WatchlistTable
               instruments={filteredInstruments}
+              totalCount={instruments.length}
+              unavailable={watchlistUnavailable}
               onMarkAsSeen={handleMarkAsSeen}
               inFlightIds={inFlightIds}
               actionErrors={actionErrors}

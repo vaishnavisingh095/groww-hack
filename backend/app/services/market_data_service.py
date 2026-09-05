@@ -13,6 +13,7 @@ Responsibilities (per architecture.md):
   (price can still be usable even if volume isn't).
 - Never let a provider failure raise into a caller.
 """
+import math
 from datetime import datetime, timezone
 
 from app.models.market_snapshot import MarketSnapshot, SnapshotStatus
@@ -95,6 +96,33 @@ class MarketDataService:
             # populated by the provider from the actual bar last_price
             # came from -- never fabricated here from our own clock (see
             # decisions.md's session_date correctness fix).
+            return None
+
+        # A non-finite or non-positive last_price/previous_close must
+        # never reach the division below or the MarketSnapshot
+        # constructor: a zero previous_close divides by zero (an
+        # unhandled ZeroDivisionError, raised before MarketSnapshot's
+        # own gt=0 validation ever runs), and a non-positive/non-finite
+        # value that survives the division still raises an unhandled
+        # pydantic.ValidationError at construction. Either way, before
+        # this check, ONE instrument's malformed quote could abort this
+        # entire fetch_snapshots call -- the surrounding for-loop has no
+        # per-quote try/except -- silently taking down every OTHER
+        # instrument's snapshot in the same batch too. Reusing this
+        # function's own existing "no usable price -> no snapshot"
+        # contract (the None-checks above) for this case keeps the
+        # failure scoped to this one instrument, exactly like a missing
+        # price already is. The real yfinance provider already guards
+        # last_price this way when scanning bars (see
+        # YFinanceProvider._latest_valid_close), but this assembly
+        # boundary should not rely on any one MarketDataProvider
+        # implementation being that careful.
+        if (
+            not math.isfinite(quote.last_price)
+            or quote.last_price <= 0
+            or not math.isfinite(quote.previous_close)
+            or quote.previous_close <= 0
+        ):
             return None
 
         percent_change = MarketSnapshot.compute_percent_change(
