@@ -10,7 +10,7 @@ objects, or shapes ever reach the frontend.
 """
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pymongo.database import Database
 
 from app.db.connection import get_database
@@ -21,11 +21,12 @@ from app.services.attention_engine import AttentionEngine
 from app.services.change_engine import evaluate_change
 from app.services.change_event_service import ChangeEventService
 from app.services.checkpoint_service import CheckpointService
+from app.services.identity import resolve_owner_id
 from app.services.market_data_service import MarketDataService
 from app.services.watchlist_service import (
-    DEMO_USER_ID,
     ProviderResolutionError,
     add_instrument,
+    get_or_create_watchlist,
     get_watchlist_instruments,
     yfinance_ticker_for,
 )
@@ -59,11 +60,13 @@ def _status_label(status: SnapshotStatus, fetched_at: datetime) -> tuple[str, in
 
 
 @router.get("/watchlist")
-def get_watchlist() -> dict:
+def get_watchlist(owner_id: str = Depends(resolve_owner_id)) -> dict:
     """
-    Fetch current market data for the demo watchlist, compare each
+    Fetch current market data for this owner's watchlist, compare each
     instrument against its checkpoint (if any), and return clean domain
-    JSON for the frontend.
+    JSON for the frontend. owner_id is the anonymous capability-cookie
+    identity resolved by resolve_owner_id -- never taken from the
+    request body/query/headers.
 
     Checkpoint handling on this read path (per the checkpoint semantics
     contract): opening the app, rendering, or refreshing is NEVER
@@ -93,7 +96,7 @@ def get_watchlist() -> dict:
     ChangeEventService.get_or_create_active.
     """
     db = get_database()
-    instruments = get_watchlist_instruments(db)
+    instruments = get_watchlist_instruments(db, owner_id)
     checkpoint_service = CheckpointService(db)
     change_event_service = ChangeEventService(db)
     market_service = MarketDataService(_provider)
@@ -147,7 +150,7 @@ def get_watchlist() -> dict:
         # Read-only: this endpoint never creates or advances a
         # checkpoint. If none exists, the comparison below correctly
         # falls back to the no-baseline branch.
-        checkpoint = checkpoint_service.get_checkpoint(DEMO_USER_ID, instrument_id)
+        checkpoint = checkpoint_service.get_checkpoint(owner_id, instrument_id)
 
         if checkpoint is not None:
             change_result = evaluate_change(
@@ -173,7 +176,7 @@ def get_watchlist() -> dict:
         # snapshot.status is OK, and change_result.meaningful_change is
         # True -- see ChangeEventService.get_or_create_active.
         change_event_service.get_or_create_active(
-            user_id=DEMO_USER_ID,
+            user_id=owner_id,
             instrument_id=instrument_id,
             checkpoint=checkpoint,
             snapshot_status=snapshot.status,
@@ -216,9 +219,9 @@ def get_watchlist() -> dict:
 
 
 @router.get("/watchlist/attention")
-def get_attention() -> dict:
+def get_attention(owner_id: str = Depends(resolve_owner_id)) -> dict:
     """
-    Ranked, active (unacknowledged) attention items for the demo user --
+    Ranked, active (unacknowledged) attention items for this owner --
     the Attention Engine (Phase 6) exposed read-only. Pure computation
     over already-persisted ChangeEvents; like GET /watchlist, this
     endpoint never creates, advances, or acknowledges anything -- it
@@ -226,11 +229,11 @@ def get_attention() -> dict:
 
     No query parameters: mirrors GET /watchlist, and per the approved
     integration scope this endpoint deliberately does not add
-    pagination, caching, or auth beyond the existing DEMO_USER_ID
-    convention used everywhere else in this router.
+    pagination or caching beyond the anonymous-owner identity resolved
+    by resolve_owner_id and used everywhere else in this router.
     """
     db = get_database()
-    items = AttentionEngine(db).get_ranked_active_items(DEMO_USER_ID)
+    items = AttentionEngine(db).get_ranked_active_items(owner_id)
 
     return {
         "attention_items": [
@@ -253,7 +256,7 @@ def get_attention() -> dict:
 
 
 @router.post("/watchlist/instruments/{instrument_id}/checkpoint")
-def mark_as_seen(instrument_id: str) -> dict:
+def mark_as_seen(instrument_id: str, owner_id: str = Depends(resolve_owner_id)) -> dict:
     """
     Explicit "mark as seen" action for ONE instrument. Fetches the
     CURRENT market data for this instrument and persists it as the new
@@ -262,6 +265,14 @@ def mark_as_seen(instrument_id: str) -> dict:
 
     Path matches architecture.md's documented API contract exactly:
     POST /watchlist/instruments/{id}/checkpoint.
+
+    Ownership check: an owner may only checkpoint an instrument that is
+    actually in their OWN watchlist -- an instrument_id that exists
+    globally but isn't this owner's is rejected with the SAME 404 used
+    for a genuinely nonexistent id, deliberately not a distinct 403.
+    Returning 403 would let a caller distinguish "exists but isn't
+    yours" from "doesn't exist at all," letting them enumerate other
+    owners' instrument_ids by probing; 404 for both leaks nothing.
 
     Ordering note: the checkpoint write happens BEFORE the ChangeEvent
     acknowledgement below, and only unconditionally-successful code runs
@@ -272,6 +283,10 @@ def mark_as_seen(instrument_id: str) -> dict:
     db = get_database()
     instrument_doc = db.instruments.find_one({"_id": _to_object_id(instrument_id)})
     if instrument_doc is None:
+        raise HTTPException(status_code=404, detail="Instrument not found")
+
+    watchlist = get_or_create_watchlist(db, owner_id)
+    if instrument_id not in watchlist.instrument_ids:
         raise HTTPException(status_code=404, detail="Instrument not found")
 
     market_service = MarketDataService(_provider)
@@ -291,12 +306,12 @@ def mark_as_seen(instrument_id: str) -> dict:
     snapshot = snapshots[0]
     checkpoint_service = CheckpointService(db)
     checkpoint = checkpoint_service.create_checkpoint_from_snapshot(
-        DEMO_USER_ID, instrument_id, snapshot
+        owner_id, instrument_id, snapshot
     )
     # The checkpoint write above succeeded -- this instrument's prior
     # baseline is now genuinely superseded, so its active ChangeEvent(s)
     # (if any) are acknowledged.
-    ChangeEventService(db).acknowledge_active(DEMO_USER_ID, instrument_id)
+    ChangeEventService(db).acknowledge_active(owner_id, instrument_id)
 
     return {
         "instrument_id": instrument_id,
@@ -308,17 +323,23 @@ def mark_as_seen(instrument_id: str) -> dict:
 
 
 @router.post("/watchlist/checkpoint")
-def mark_all_as_seen() -> dict:
+def mark_all_as_seen(owner_id: str = Depends(resolve_owner_id)) -> dict:
     """
-    Explicit "mark all as seen" for the whole watchlist. Advances the
-    checkpoint for every instrument that currently has a valid snapshot;
-    instruments without valid current data are skipped safely (not
-    fabricated, not treated as an error for the whole batch) and
-    reported separately in the response so the caller can see exactly
-    what happened.
+    Explicit "mark all as seen" for this owner's whole watchlist.
+    Advances the checkpoint for every instrument that currently has a
+    valid snapshot; instruments without valid current data are skipped
+    safely (not fabricated, not treated as an error for the whole
+    batch) and reported separately in the response so the caller can
+    see exactly what happened.
 
     Path matches architecture.md's documented API contract exactly:
     POST /watchlist/checkpoint.
+
+    No separate ownership check is needed here (unlike the single-
+    instrument endpoint below): `instruments` already comes from
+    get_watchlist_instruments(db, owner_id), i.e. exactly and only this
+    owner's own membership -- there is nothing outside their own
+    watchlist to accidentally reach.
 
     Ordering note: per instrument, the checkpoint write happens BEFORE
     that instrument's ChangeEvent acknowledgement, and a skipped
@@ -327,7 +348,7 @@ def mark_all_as_seen() -> dict:
     untouched, never falsely acknowledged.
     """
     db = get_database()
-    instruments = get_watchlist_instruments(db)
+    instruments = get_watchlist_instruments(db, owner_id)
     market_service = MarketDataService(_provider)
     checkpoint_service = CheckpointService(db)
     change_event_service = ChangeEventService(db)
@@ -353,12 +374,12 @@ def mark_all_as_seen() -> dict:
             continue
 
         checkpoint = checkpoint_service.create_checkpoint_from_snapshot(
-            DEMO_USER_ID, instrument_id, snapshot
+            owner_id, instrument_id, snapshot
         )
         # This instrument's checkpoint write succeeded -- acknowledge
         # its active ChangeEvent(s), if any. Instruments that hit the
         # `continue` above (no valid snapshot) never reach this line.
-        change_event_service.acknowledge_active(DEMO_USER_ID, instrument_id)
+        change_event_service.acknowledge_active(owner_id, instrument_id)
         updated.append(
             {
                 "instrument_id": instrument_id,
@@ -371,38 +392,42 @@ def mark_all_as_seen() -> dict:
 
 
 @router.post("/watchlist/instruments")
-def add_watchlist_instrument(body: Instrument) -> dict:
+def add_watchlist_instrument(
+    body: Instrument, owner_id: str = Depends(resolve_owner_id)
+) -> dict:
     """
-    Explicit "add a new instrument to track" action (Add Stock).
+    Explicit "add a new instrument to track" action (Add Stock), scoped
+    to the calling owner's OWN watchlist membership.
 
     Request body is the existing Instrument model itself (symbol,
     exchange required; company_name/created_at optional and unused by
-    the client) -- FastAPI validates/normalizes it via Instrument's own
-    validators before this handler ever runs, so an invalid exchange or
-    a blank symbol never reaches here at all (FastAPI returns 422
-    automatically). No new/duplicated validation logic.
+    the client, and there is no user_id field on this model at all --
+    ownership is never accepted from the request body) -- FastAPI
+    validates/normalizes it via Instrument's own validators before this
+    handler ever runs, so an invalid exchange or a blank symbol never
+    reaches here at all (FastAPI returns 422 automatically). No new/
+    duplicated validation logic.
 
-    Creates ONLY an Instrument document -- never a Checkpoint, never a
-    ChangeEvent (see watchlist_service.add_instrument's own docstring).
-    A newly added instrument is baseline_pending starting from the very
-    next GET /watchlist, with no special-casing anywhere else in the
-    app -- it is indistinguishable from a seed instrument that has never
-    had a checkpoint.
+    The global Instrument document is reused/created exactly as before
+    -- never a duplicate for the same (symbol, exchange) pair, never
+    owner-specific. What's new is that a successful call also adds the
+    instrument to THIS owner's own Watchlist.instrument_ids (see
+    watchlist_service.add_instrument's own docstring for the 3-case
+    duplicate-add rule). Still creates only Instrument/Watchlist state
+    -- never a Checkpoint, never a ChangeEvent. A newly added instrument
+    is baseline_pending starting from the very next GET /watchlist for
+    this owner, with no special-casing anywhere else in the app.
 
-    Idempotent: adding an already-tracked (symbol, exchange) pair
-    returns the existing instrument (created: false) rather than a
-    duplicate or an error.
-
-    Provider validation: before creating anything, confirms the
-    provider can produce a valid current market snapshot for this
-    instrument. If it cannot, returns 503 and creates nothing -- the
-    exact same "no usable data" rule and status code
+    Provider validation: before creating a brand-new global instrument,
+    confirms the provider can produce a valid current market snapshot
+    for it. If it cannot, returns 503 and creates nothing -- the exact
+    same "no usable data" rule and status code
     POST /watchlist/instruments/{id}/checkpoint already applies, just
     enforced here at add-time instead of checkpoint-time.
     """
     db = get_database()
     try:
-        doc, created = add_instrument(db, _provider, body)
+        doc, created = add_instrument(db, _provider, owner_id, body)
     except ProviderResolutionError:
         raise HTTPException(
             status_code=503,

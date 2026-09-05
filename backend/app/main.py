@@ -35,9 +35,17 @@ app = FastAPI(title="Groww Smart Watchlist", lifespan=lifespan)
 # Without this, the browser blocks the frontend's fetch() calls entirely.
 # Scoped to localhost dev origins only -- this is a local MVP, not a
 # deployed service with a real domain to restrict to.
+#
+# allow_credentials=True is required for the browser to send/accept the
+# anonymous owner cookie (see app/services/identity.py) across this
+# origin split. This must never be combined with a wildcard
+# allow_origins=["*"] -- browsers reject that combination outright, and
+# it would be a real misconfiguration if this list is ever widened for a
+# real deployment; keep it an explicit list of real origins.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )

@@ -1031,3 +1031,345 @@ def test_newly_added_instrument_can_progress_through_checkpoint_and_attention_li
     attention_body = test_client.get("/watchlist/attention").json()
     attention_symbols = {item["symbol"] for item in attention_body["attention_items"]}
     assert "WIPRO" in attention_symbols
+
+
+# --- Persistent Anonymous Watchlist (owner identity + ownership) -----------
+#
+# TestClient (httpx under the hood) persists cookies across calls made on
+# the SAME client instance, exactly like a real browser -- so a bare
+# test_client.get(...) with no explicit `cookies=` naturally simulates
+# "the same browser, again" once a cookie has been issued. Tests that
+# need two DISTINCT owners pass explicit `cookies={"watchlist_owner": ...}`
+# per request instead, for full determinism about which owner each call
+# belongs to.
+
+
+def test_first_request_without_cookie_creates_owner_and_sets_cookie(client):
+    test_client, mock_db = client
+
+    response = test_client.get("/watchlist")
+
+    assert response.status_code == 200
+    set_cookie = response.headers.get("set-cookie")
+    assert set_cookie is not None
+    assert "watchlist_owner=" in set_cookie
+    assert "HttpOnly" in set_cookie
+    assert mock_db.watchlists.count_documents({}) == 1
+
+
+def test_repeat_request_with_same_cookie_resolves_same_owner(client):
+    test_client, mock_db = client
+
+    test_client.get("/watchlist")
+    assert mock_db.watchlists.count_documents({}) == 1
+    owner_id = mock_db.watchlists.find_one({})["user_id"]
+
+    test_client.get("/watchlist")  # same client -> same cookie sent automatically
+
+    assert mock_db.watchlists.count_documents({}) == 1  # still exactly one owner
+    assert mock_db.watchlists.find_one({})["user_id"] == owner_id
+
+
+def test_watchlist_state_survives_between_requests(client, monkeypatch):
+    test_client, mock_db = client
+    monkeypatch.setattr(watchlist_routes, "_provider", FakeProvider(_quotes_with_wipro_added()))
+
+    test_client.post("/watchlist/instruments", json={"symbol": "WIPRO", "exchange": "NSE"})
+    first_symbols = {i["symbol"] for i in test_client.get("/watchlist").json()["instruments"]}
+    second_symbols = {i["symbol"] for i in test_client.get("/watchlist").json()["instruments"]}
+
+    assert "WIPRO" in first_symbols
+    assert first_symbols == second_symbols
+
+
+def test_different_owner_cookies_get_independent_watchlists(client, monkeypatch):
+    test_client, mock_db = client
+    monkeypatch.setattr(watchlist_routes, "_provider", FakeProvider(_quotes_with_wipro_added()))
+
+    test_client.post(
+        "/watchlist/instruments",
+        json={"symbol": "WIPRO", "exchange": "NSE"},
+        cookies={"watchlist_owner": "owner-a"},
+    )
+
+    owner_a = test_client.get("/watchlist", cookies={"watchlist_owner": "owner-a"}).json()
+    owner_b = test_client.get("/watchlist", cookies={"watchlist_owner": "owner-b"}).json()
+
+    assert "WIPRO" in {i["symbol"] for i in owner_a["instruments"]}
+    assert "WIPRO" not in {i["symbol"] for i in owner_b["instruments"]}
+    # Owner B still independently gets the same 5-seed default.
+    assert {i["symbol"] for i in owner_b["instruments"]} == {
+        "RELIANCE",
+        "TCS",
+        "HDFCBANK",
+        "INFY",
+        "ICICIBANK",
+    }
+
+
+def test_add_stock_is_isolated_between_owners(client, monkeypatch):
+    test_client, mock_db = client
+    monkeypatch.setattr(watchlist_routes, "_provider", FakeProvider(_quotes_with_wipro_added()))
+
+    test_client.post(
+        "/watchlist/instruments",
+        json={"symbol": "WIPRO", "exchange": "NSE"},
+        cookies={"watchlist_owner": "owner-a"},
+    )
+
+    wipro_id = mock_db.instruments.find_one({"symbol": "WIPRO"})["_id"]
+    owner_a_doc = mock_db.watchlists.find_one({"user_id": "owner-a"})
+    owner_b_doc = mock_db.watchlists.find_one({"user_id": "owner-b"})
+
+    assert str(wipro_id) in owner_a_doc["instrument_ids"]
+    assert owner_b_doc is None  # owner B has never made a request yet -- no watchlist exists for them at all
+
+
+def test_mark_seen_is_isolated_between_owners(client):
+    test_client, mock_db = client
+
+    first = test_client.get("/watchlist", cookies={"watchlist_owner": "owner-a"}).json()
+    instrument_id = next(i for i in first["instruments"] if i["symbol"] == "RELIANCE")["instrument_id"]
+
+    checkpoint_response = test_client.post(
+        f"/watchlist/instruments/{instrument_id}/checkpoint",
+        cookies={"watchlist_owner": "owner-a"},
+    )
+    assert checkpoint_response.status_code == 200
+
+    owner_b_watchlist = test_client.get("/watchlist", cookies={"watchlist_owner": "owner-b"}).json()
+    reliance_b = next(i for i in owner_b_watchlist["instruments"] if i["symbol"] == "RELIANCE")
+    assert reliance_b["change"]["has_baseline"] is False
+
+    assert mock_db.checkpoints.count_documents({"user_id": "owner-a", "instrument_id": instrument_id}) == 1
+    assert mock_db.checkpoints.count_documents({"user_id": "owner-b", "instrument_id": instrument_id}) == 0
+
+
+def test_attention_is_isolated_between_owners(client, monkeypatch):
+    test_client, mock_db = client
+
+    first = test_client.get("/watchlist", cookies={"watchlist_owner": "owner-a"}).json()
+    instrument_id = next(i for i in first["instruments"] if i["symbol"] == "RELIANCE")["instrument_id"]
+
+    test_client.post(
+        f"/watchlist/instruments/{instrument_id}/checkpoint",
+        cookies={"watchlist_owner": "owner-a"},
+    )
+    monkeypatch.setattr(
+        watchlist_routes, "_provider", FakeProvider(_quotes_with_reliance_price(1400.0))
+    )
+    test_client.get("/watchlist", cookies={"watchlist_owner": "owner-a"})  # creates owner-a's ChangeEvent
+
+    owner_a_attention = test_client.get(
+        "/watchlist/attention", cookies={"watchlist_owner": "owner-a"}
+    ).json()
+    owner_b_attention = test_client.get(
+        "/watchlist/attention", cookies={"watchlist_owner": "owner-b"}
+    ).json()
+
+    assert any(item["symbol"] == "RELIANCE" for item in owner_a_attention["attention_items"])
+    assert owner_b_attention["attention_items"] == []
+
+
+def test_mark_as_seen_rejects_instrument_not_in_owners_watchlist(client, monkeypatch):
+    test_client, mock_db = client
+    monkeypatch.setattr(watchlist_routes, "_provider", FakeProvider(_quotes_with_wipro_added()))
+
+    test_client.post(
+        "/watchlist/instruments",
+        json={"symbol": "WIPRO", "exchange": "NSE"},
+        cookies={"watchlist_owner": "owner-a"},
+    )
+    wipro_id = str(mock_db.instruments.find_one({"symbol": "WIPRO"})["_id"])
+
+    # Owner B never added WIPRO -- must be rejected exactly like a
+    # genuinely nonexistent instrument_id (same 404, see mark_as_seen's
+    # own docstring on why not a distinct 403).
+    response = test_client.post(
+        f"/watchlist/instruments/{wipro_id}/checkpoint",
+        cookies={"watchlist_owner": "owner-b"},
+    )
+
+    assert response.status_code == 404
+    assert mock_db.checkpoints.count_documents({"user_id": "owner-b", "instrument_id": wipro_id}) == 0
+
+
+def test_missing_or_unusual_cookie_never_causes_a_server_error(client):
+    test_client, mock_db = client
+
+    assert test_client.get("/watchlist").status_code == 200
+    assert test_client.get("/watchlist", cookies={"watchlist_owner": ""}).status_code == 200
+
+    response = test_client.get(
+        "/watchlist", cookies={"watchlist_owner": "not-a-real-issued-token"}
+    )
+    assert response.status_code == 200
+    # An unrecognized-but-well-formed value is trusted as its own (new,
+    # currently-empty-until-seeded) owner identity -- never a crash, and
+    # never silently mapped onto a different real owner's data.
+    assert mock_db.watchlists.count_documents({"user_id": "not-a-real-issued-token"}) == 1
+
+
+def test_request_body_user_id_is_ignored_identity_comes_from_cookie(client, monkeypatch):
+    test_client, mock_db = client
+    monkeypatch.setattr(watchlist_routes, "_provider", FakeProvider(_quotes_with_wipro_added()))
+
+    response = test_client.post(
+        "/watchlist/instruments",
+        json={"symbol": "WIPRO", "exchange": "NSE", "user_id": "attacker-chosen-owner"},
+        cookies={"watchlist_owner": "real-cookie-owner"},
+    )
+
+    assert response.status_code == 200
+    # The Instrument model has no user_id field at all -- Pydantic
+    # silently drops the unknown field -- and ownership always comes
+    # from the cookie, never the request body.
+    assert mock_db.watchlists.count_documents({"user_id": "attacker-chosen-owner"}) == 0
+    real_owner_doc = mock_db.watchlists.find_one({"user_id": "real-cookie-owner"})
+    assert real_owner_doc is not None
+    wipro_id = str(mock_db.instruments.find_one({"symbol": "WIPRO"})["_id"])
+    assert wipro_id in real_owner_doc["instrument_ids"]
+
+
+def test_default_seed_watchlist_created_exactly_once_per_owner(client):
+    test_client, mock_db = client
+
+    test_client.get("/watchlist")
+    test_client.get("/watchlist")
+    test_client.get("/watchlist/attention")
+
+    assert mock_db.watchlists.count_documents({}) == 1
+    assert len(mock_db.watchlists.find_one({})["instrument_ids"]) == 5
+
+
+def test_add_stock_reuses_existing_global_instrument_across_owners(client, monkeypatch):
+    test_client, mock_db = client
+    monkeypatch.setattr(watchlist_routes, "_provider", FakeProvider(_quotes_with_wipro_added()))
+
+    test_client.post(
+        "/watchlist/instruments",
+        json={"symbol": "WIPRO", "exchange": "NSE"},
+        cookies={"watchlist_owner": "owner-a"},
+    )
+    test_client.post(
+        "/watchlist/instruments",
+        json={"symbol": "WIPRO", "exchange": "NSE"},
+        cookies={"watchlist_owner": "owner-b"},
+    )
+
+    assert mock_db.instruments.count_documents({"symbol": "WIPRO", "exchange": "NSE"}) == 1
+
+    owner_a = test_client.get("/watchlist", cookies={"watchlist_owner": "owner-a"}).json()
+    owner_b = test_client.get("/watchlist", cookies={"watchlist_owner": "owner-b"}).json()
+    assert "WIPRO" in {i["symbol"] for i in owner_a["instruments"]}
+    assert "WIPRO" in {i["symbol"] for i in owner_b["instruments"]}
+
+
+def test_legacy_demo_user_data_is_never_touched(client):
+    test_client, mock_db = client
+
+    # Simulate pre-existing legacy data from before anonymous identity
+    # existed -- inserted directly, shaped like the real documents
+    # CheckpointService/ChangeEventService already write.
+    mock_db.checkpoints.insert_one(
+        {
+            "id": "legacy-checkpoint-id",
+            "user_id": "demo-user",
+            "instrument_id": "000000000000000000000001",
+            "checkpoint_at": "2026-01-01T00:00:00+00:00",
+            "session_date": "2026-01-01",
+            "baseline_snapshot": {"last_price": 100.0, "volume": 1000, "percent_change": 0.0},
+            "source": "explicit",
+        }
+    )
+    mock_db.change_events.insert_one(
+        {
+            "id": "legacy-change-event-id",
+            "user_id": "demo-user",
+            "instrument_id": "000000000000000000000001",
+            "checkpoint_id": "legacy-checkpoint-id",
+            "detected_at": "2026-01-01T00:00:00+00:00",
+            "signals": {
+                "price_change_pct": 3.0,
+                "volume_acceleration_ratio": None,
+                "volume_acceleration_available": False,
+            },
+            "reason": "Legacy reason",
+            "acknowledged": False,
+        }
+    )
+    legacy_checkpoint_before = mock_db.checkpoints.find_one({"user_id": "demo-user"})
+    legacy_event_before = mock_db.change_events.find_one({"user_id": "demo-user"})
+
+    # A brand-new anonymous owner does a full round of normal activity.
+    test_client.get("/watchlist", cookies={"watchlist_owner": "new-owner"})
+    test_client.get("/watchlist/attention", cookies={"watchlist_owner": "new-owner"})
+    first = test_client.get("/watchlist", cookies={"watchlist_owner": "new-owner"}).json()
+    reliance_id = next(i for i in first["instruments"] if i["symbol"] == "RELIANCE")["instrument_id"]
+    test_client.post(
+        f"/watchlist/instruments/{reliance_id}/checkpoint",
+        cookies={"watchlist_owner": "new-owner"},
+    )
+
+    assert mock_db.checkpoints.find_one({"user_id": "demo-user"}) == legacy_checkpoint_before
+    assert mock_db.change_events.find_one({"user_id": "demo-user"}) == legacy_event_before
+    # The new owner's own checkpoint is genuinely separate.
+    assert mock_db.checkpoints.count_documents({"user_id": "new-owner"}) == 1
+
+
+def test_get_or_create_watchlist_survives_concurrent_creation_race(mock_db, monkeypatch):
+    """
+    Backend-side safety net for the scenario the frontend's own
+    first-request sequencing (see App.jsx's loadAll -- decisions.md's
+    "Persistent anonymous watchlist identity" and its concurrency
+    hardening follow-up) is designed to make rare in practice: two
+    requests for the SAME brand-new owner_id whose Watchlist-creation
+    attempts genuinely interleave (e.g. two browser tabs opened at the
+    exact same first-ever instant, which frontend-side sequencing alone
+    cannot fully prevent, since each tab is an independent JS context).
+
+    This forces that exact interleaving deterministically -- rather than
+    relying on real thread timing, which would make the test flaky --
+    by making get_or_create_watchlist's own find_one miss a document
+    that a "concurrent" request already inserted, so its insert_one
+    hits the real unique index (uniq_user_id, Phase 1) and raises
+    DuplicateKeyError. The function must recover by reading back the
+    document that actually won, never crash, and never create a second
+    Watchlist for the same owner.
+    """
+    from app.services.watchlist_service import ensure_seed_instruments, get_or_create_watchlist
+
+    owner_id = "racing-owner"
+    seed_instruments = ensure_seed_instruments(mock_db)
+
+    # A "concurrent" request for this exact owner_id already won the
+    # race and inserted first.
+    mock_db.watchlists.insert_one(
+        {
+            "user_id": owner_id,
+            "instrument_ids": [str(inst["_id"]) for inst in seed_instruments],
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+        }
+    )
+
+    # This call's OWN find_one is forced to miss that just-inserted
+    # document exactly once (simulating "it checked before the other
+    # request's insert had happened"), so it still proceeds down the
+    # create-a-new-one path.
+    real_find_one = mock_db.watchlists.find_one
+    call_count = {"n": 0}
+
+    def find_one_misses_once(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return None
+        return real_find_one(*args, **kwargs)
+
+    monkeypatch.setattr(mock_db.watchlists, "find_one", find_one_misses_once)
+
+    result = get_or_create_watchlist(mock_db, owner_id)
+
+    assert mock_db.watchlists.count_documents({"user_id": owner_id}) == 1
+    assert result.user_id == owner_id
+    assert len(result.instrument_ids) == 5

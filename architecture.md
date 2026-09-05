@@ -67,6 +67,15 @@ their respective services; they don't flow through the poll loop.
 - **Attention ranking**: never persisted as its own source of truth — it's
   fully derivable from active `ChangeEvent`s at any moment, so persisting
   it would create a second, potentially-stale copy of derivable data.
+- **Owner identity**: `user_id` (used by `Checkpoint`, `ChangeEvent`, and
+  `Watchlist`) is an opaque, server-generated token resolved from an
+  anonymous capability cookie — see decisions.md's "Persistent anonymous
+  watchlist identity." It is never accepted from a request body, query
+  parameter, or header.
+- **Watchlist membership**: `Watchlist.instrument_ids` is the source of
+  truth for which instruments belong to a given owner. `Instrument`
+  documents remain global/shared reference data regardless of who
+  references them.
 
 ## Data Model
 
@@ -94,7 +103,11 @@ symbol to a watchlist.
 }
 ```
 One watchlist per user for the hackathon scope (per CUT: no multi-list
-support in MUST HAVE).
+support in MUST HAVE). This model was defined from Phase 1 but sat
+unused until the Persistent Anonymous Watchlist milestone activated it
+as the real per-owner membership record — see decisions.md.
+`user_id` here is the same anonymous capability-cookie identity used by
+`Checkpoint`/`ChangeEvent`, not a separate account system.
 
 ### MarketSnapshot
 ```
@@ -633,6 +646,14 @@ results in a `MarketSnapshot.status` of `stale`/`invalid`/`unavailable`.
    checkpoint's `session_date` matches the current snapshot's
    `session_date`; otherwise it is explicitly marked unavailable, never
    computed from mismatched-session data.
+9. `user_id` is always resolved server-side from the anonymous capability
+   cookie — never accepted from a request body, query parameter, or
+   header.
+10. An owner may only checkpoint an instrument that is actually in their
+    own `Watchlist.instrument_ids`; an instrument that exists globally
+    but isn't theirs is rejected with the same 404 used for a genuinely
+    nonexistent id, so a caller can never distinguish "not yours" from
+    "doesn't exist."
 
 ## Failure Modes & Responses
 

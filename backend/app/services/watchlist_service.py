@@ -1,25 +1,41 @@
 """
 Watchlist Service.
 
-For this first vertical slice: a single hardcoded watchlist containing
-the 5 specified instruments, shared by a single demo user. Full
-multi-user watchlist CRUD is still not implemented -- there is still no
-real per-user Watchlist.instrument_ids membership and no multi-tenancy
-(see decisions.md) -- but adding a new trackable instrument (Add Stock)
-is now supported: add_instrument() below, plus
-get_watchlist_instruments() so a newly-added instrument actually shows
-up through the normal GET /watchlist path rather than only existing in
-Mongo unseen.
+Ownership model (Persistent Anonymous Watchlist milestone): the
+Watchlist model -- defined since Phase 1 but never previously used, see
+decisions.md -- is now the real per-owner membership record.
+Instrument documents remain GLOBAL reference data, shared and reused
+across every owner (a ticker's metadata isn't "owned" by anyone); only
+WHICH instruments a given owner tracks is owner-scoped, via
+Watchlist.instrument_ids. get_or_create_watchlist() and
+get_watchlist_instruments() below are the two functions that make this
+real; add_instrument() now also updates the calling owner's own
+membership. No second ownership model was introduced -- this activates
+the one that already existed.
 
-This is still a deliberate, disclosed scope reduction from
-architecture.md's full Watchlist Service (which also describes remove
-and per-user lists) -- documented explicitly, not silently omitted.
+`owner_id` here is always the value resolved by
+app.services.identity.resolve_owner_id from the anonymous capability
+cookie -- this module has no opinion about where it came from, exactly
+like CheckpointService/ChangeEventService/AttentionEngine, which have
+always taken user_id as a plain parameter.
+
+DEMO_USER_ID below is now a LEGACY value only: it was the single
+hardcoded user_id every request used before anonymous identity existed.
+It is kept here, unused by any route, purely so the exact string is
+still discoverable in code for anyone who needs to manually inspect
+that pre-existing data later -- see decisions.md's "Legacy demo-user
+data" entry. No code path writes new data under this value anymore, and
+none of the existing data under it is touched, migrated, or deleted by
+this milestone.
 """
 from datetime import datetime, timezone
 
+from bson import ObjectId
 from pymongo.database import Database
+from pymongo.errors import DuplicateKeyError
 
 from app.models.instrument import Exchange, Instrument
+from app.models.watchlist import Watchlist
 from app.providers.base import MarketDataProvider
 from app.services.market_data_service import MarketDataService
 
@@ -73,55 +89,122 @@ def ensure_seed_instruments(db: Database) -> list[dict]:
     return result
 
 
-def get_watchlist_instruments(db: Database) -> list[dict]:
+def get_or_create_watchlist(db: Database, owner_id: str) -> Watchlist:
     """
-    Every instrument currently trackable by the demo user -- the 5
-    original seeds plus anything added via add_instrument() below.
+    Idempotently ensure a Watchlist document exists for this owner,
+    defaulting a brand-new owner's membership to the 5 EXISTING seed
+    instruments (reusing their existing global Instrument documents via
+    ensure_seed_instruments -- never creating new ones). Creates ONLY a
+    Watchlist document -- never a Checkpoint, never a ChangeEvent, so a
+    new owner's seeded instruments start exactly baseline_pending,
+    identical to how the 5 seeds behaved for the original demo user
+    before their first "mark as seen."
+    """
+    doc = db.watchlists.find_one({"user_id": owner_id})
+    if doc is not None:
+        doc.pop("_id", None)
+        return Watchlist(**doc)
 
-    Per the current single-demo-user architecture, "the watchlist" is
-    simply every Instrument document that exists -- there is no real
-    per-user Watchlist.instrument_ids membership in use (see
-    decisions.md), and this deliberately does not introduce one now.
-    ensure_seed_instruments still runs first so the 5 original seeds
-    remain guaranteed present (unchanged, idempotent behavior) before
-    the full collection is read; this is what fixes the previous gap
-    where GET /watchlist only ever resolved the 5 hardcoded seeds by
-    name and could never see a newly-added instrument.
+    seed_instruments = ensure_seed_instruments(db)
+    watchlist = Watchlist(
+        user_id=owner_id,
+        instrument_ids=[str(inst["_id"]) for inst in seed_instruments],
+    )
+    try:
+        db.watchlists.insert_one(watchlist.model_dump(mode="json"))
+    except DuplicateKeyError:
+        # Another concurrent request for this exact owner_id already
+        # created the Watchlist first -- e.g. this app's own frontend
+        # fires GET /watchlist and GET /watchlist/attention concurrently
+        # on first load (see App.jsx's loadAll), and both could resolve
+        # this same brand-new owner_id in the same instant. The unique
+        # index on user_id (Phase 1) is the real source of truth here;
+        # reuse whatever was actually persisted rather than raising or
+        # creating a duplicate.
+        existing = db.watchlists.find_one({"user_id": owner_id})
+        if existing is not None:
+            existing.pop("_id", None)
+            return Watchlist(**existing)
+        raise
+    return watchlist
+
+
+def get_watchlist_instruments(db: Database, owner_id: str) -> list[dict]:
     """
-    ensure_seed_instruments(db)
-    return list(db.instruments.find({}))
+    THIS OWNER'S OWN tracked instruments, resolved via
+    Watchlist.instrument_ids membership -- never "every Instrument
+    document in the collection" (that was the pre-ownership behavior;
+    see decisions.md's "Persistent anonymous watchlist" entry).
+    Instruments themselves remain global/shared reference data; only
+    membership is owner-scoped.
+    """
+    watchlist = get_or_create_watchlist(db, owner_id)
+    if not watchlist.instrument_ids:
+        return []
+
+    object_ids = [ObjectId(iid) for iid in watchlist.instrument_ids]
+    docs_by_id = {
+        str(doc["_id"]): doc for doc in db.instruments.find({"_id": {"$in": object_ids}})
+    }
+    # Preserve the owner's own membership order (append order -- a
+    # newly-added instrument shows up last) rather than whatever
+    # incidental order MongoDB's $in returns. Skips an id defensively if
+    # its Instrument document is ever missing, rather than crashing --
+    # should not happen in practice since instruments are never deleted.
+    return [docs_by_id[iid] for iid in watchlist.instrument_ids if iid in docs_by_id]
+
+
+def _add_instrument_to_watchlist(db: Database, owner_id: str, instrument_id: str) -> None:
+    """
+    Ensures the owner's Watchlist exists, then idempotently adds one
+    instrument id to it. $addToSet makes this safe to call for an
+    instrument the owner already has -- never a duplicate entry in
+    instrument_ids.
+    """
+    get_or_create_watchlist(db, owner_id)
+    db.watchlists.update_one(
+        {"user_id": owner_id},
+        {
+            "$addToSet": {"instrument_ids": instrument_id},
+            "$set": {"updated_at": datetime.now(timezone.utc).isoformat()},
+        },
+    )
 
 
 def add_instrument(
-    db: Database, provider: MarketDataProvider, instrument: Instrument
+    db: Database, provider: MarketDataProvider, owner_id: str, instrument: Instrument
 ) -> tuple[dict, bool]:
     """
-    Add a new trackable instrument. Creates ONLY an Instrument document
-    -- never a Checkpoint, never a ChangeEvent. A newly added instrument
-    is baseline_pending on the very next GET /watchlist for exactly the
-    same reason any seed instrument was before its first "mark as seen":
-    CheckpointService.get_checkpoint returns None for it, so
-    evaluate_change reports has_baseline=False and
-    ChangeEventService.get_or_create_active is a no-op. No special
-    casing for "newly added" is needed anywhere else in the app.
+    Add an instrument to OWNER_ID's own watchlist membership.
 
-    Idempotent: an already-tracked (symbol, exchange) pair returns the
-    existing document with created=False, the same
-    find-before-insert pattern ensure_seed_instruments already uses --
-    never a duplicate, never an error.
+    The global Instrument document is shared/reused exactly as before
+    -- `created` still means "a new global Instrument document was
+    created," unchanged in meaning from before ownership existed. What's
+    new: a successful call also ensures instrument_id is present in
+    THIS owner's own Watchlist.instrument_ids (via $addToSet, so calling
+    this twice for the same owner+instrument is always safe). Never
+    creates a duplicate global Instrument document in any case.
 
-    Before creating anything, confirms the provider can actually produce
-    a valid current MarketSnapshot for this (symbol, exchange) pair, via
-    the exact same MarketDataService/YFinanceProvider path used
-    everywhere else in the app (never a second, ad hoc "can I resolve
-    this symbol" check). Raises ProviderResolutionError -- creating
-    nothing -- if it cannot; the caller (the route) maps that to an
-    HTTP error.
+    Three cases, matching the product's explicit Duplicate Add rule:
+    1. Instrument already exists globally AND is already in this
+       owner's watchlist -- fully idempotent no-op as far as the global
+       collection and provider are concerned (the $addToSet below is a
+       no-op too); no provider call.
+    2. Instrument already exists globally but is NOT yet in this
+       owner's watchlist -- added to this owner's membership only, no
+       provider call. An already-existing global instrument was already
+       validated as resolvable when it was first created by whichever
+       owner added it first; re-validating it for every subsequent
+       owner would be redundant, not a genuine new check.
+    3. Instrument does not exist globally at all -- validated via the
+       provider (as before creating anything), created once, then added
+       to this owner's membership.
     """
     existing = db.instruments.find_one(
         {"symbol": instrument.symbol, "exchange": instrument.exchange.value}
     )
     if existing is not None:
+        _add_instrument_to_watchlist(db, owner_id, str(existing["_id"]))
         return existing, False
 
     ticker = yfinance_ticker_for(instrument.symbol, instrument.exchange.value)
@@ -132,6 +215,7 @@ def add_instrument(
     doc = instrument.model_dump(mode="json")
     insert_result = db.instruments.insert_one(doc)
     doc["_id"] = insert_result.inserted_id
+    _add_instrument_to_watchlist(db, owner_id, str(doc["_id"]))
     return doc, True
 
 

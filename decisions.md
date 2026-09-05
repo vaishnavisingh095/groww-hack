@@ -1596,3 +1596,90 @@ shipping; a change that blurs one of these four distinctions (even
 unintentionally, e.g. through a shared label or a merged visual element)
 should be treated as a product-semantics regression, not a pure style
 change.
+
+---
+
+## Decision: Persistent anonymous watchlist identity
+
+### Problem
+Every request resolved to a single hardcoded `user_id`
+(`DEMO_USER_ID = "demo-user"`), shared by every visitor. A deployed
+instance needs each browser to keep returning to its own customized
+watchlist across refreshes and later visits, without building real
+accounts (no OAuth, no passwords, no login UI — explicitly out of scope
+per plan.md's CUT list, which already anticipated "authentication
+beyond a minimal user identifier" as the boundary not to cross).
+
+### Options
+- Full accounts (email/password or OAuth) with real login.
+- A frontend-generated id (localStorage/sessionStorage), sent to the
+  backend on each request.
+- A server-generated opaque id delivered via a persistent httpOnly
+  cookie — the browser carries it automatically; the server never trusts
+  a client-supplied identity.
+
+### Decision
+The third option: an anonymous, capability-based identity. On first
+visit with no cookie, the backend generates a high-entropy opaque token
+(`secrets.token_urlsafe(32)`, never `random`, never a timestamp or
+sequential id) and sets it as a persistent (~1 year), `httpOnly`,
+`SameSite=Lax` cookie, `Secure` only when `ENVIRONMENT=production` (the
+local dev setup runs over plain HTTP, which rejects `Secure` cookies
+outright). That cookie value *is* the `user_id` used everywhere
+`Checkpoint`/`ChangeEvent`/`Watchlist` already keyed on one — no
+separate "owners" collection, no signature/verification step. This is
+not authentication: there is no password behind it, and it is never
+described as one anywhere in the app or its docs.
+
+MongoDB remains the only persistence layer — no PostgreSQL, no new
+external service. `Checkpoint` and `ChangeEvent` already had a real,
+correctly-indexed `user_id` field since Phase 1; only the *value* fed
+into that existing field changed. The `Watchlist` model was likewise
+already defined (with a unique index on `user_id`) but had sat
+completely unused, since a single implicit user made per-owner
+membership pointless — this milestone activates it as the real
+membership record (`Watchlist.instrument_ids`) rather than inventing a
+second ownership model. `Instrument` documents remain global/shared
+reference data, exactly as before — a ticker's metadata isn't owned by
+anyone; only *which* instruments a given owner tracks is owner-scoped.
+`get_watchlist_instruments()` changed from "every Instrument document
+in the collection" to "resolve via this owner's own membership."
+
+### Why
+This is the smallest change that satisfies "same browser, same
+watchlist, later" without accounts: it reuses MongoDB, reuses two
+already-correctly-indexed models untouched, activates a third that was
+already designed for exactly this, and requires zero changes to
+`CheckpointService`, `ChangeEventService`, `AttentionEngine`, or the
+Meaningful Change Engine (all already took `user_id` as a plain
+parameter, never hardcoded internally).
+
+### Trade-off
+Possession of the capability cookie *is* access to that watchlist —
+there is no password behind it, so a stolen or shared cookie grants full
+read/write access to that anonymous owner's state. This is an accepted,
+disclosed property of anonymous capability-based identity, not an
+oversight; `httpOnly` (no JS access) and `Secure` in production (no
+plaintext network capture) are the mitigations, not a claim that this is
+full authentication.
+
+### Consequence
+The single-instrument checkpoint endpoint
+(`POST /watchlist/instruments/{id}/checkpoint`) now also verifies the
+instrument is actually in the caller's own `Watchlist.instrument_ids`
+before checkpointing it, rejecting with the same 404 used for a
+genuinely nonexistent id (never a distinct 403, which would let a caller
+enumerate other owners' instrument_ids by probing). `main.py`'s CORS
+middleware gained `allow_credentials=True` (with the existing explicit
+origin list preserved — never combined with a wildcard), and `api.js`
+sends `credentials: 'include'` on every call; the frontend never reads,
+stores, or otherwise handles the cookie's value.
+
+**Legacy `demo-user` data**: left completely untouched, not migrated,
+not deleted, not automatically attached to any new anonymous owner.
+`DEMO_USER_ID` remains defined in `watchlist_service.py`, unused by any
+route, solely so the exact legacy string stays discoverable for manual
+inspection later. A new anonymous owner's random token will not collide
+with it, so it simply becomes inert, recoverable-by-hand legacy state,
+not a resource visible to anyone unless they already know that literal
+value.

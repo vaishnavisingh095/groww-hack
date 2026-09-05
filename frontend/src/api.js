@@ -5,6 +5,15 @@
 // fetch() and risks drifting from the real route paths.
 const API_BASE = 'http://127.0.0.1:8000'
 
+// Every call includes the browser's cookies (credentials: 'include') so
+// the backend's anonymous owner cookie (httpOnly, set by
+// app/services/identity.py) is sent/accepted across the frontend/
+// backend origin split. The frontend never reads, stores, or otherwise
+// knows this cookie's value -- it is httpOnly by design -- this app
+// makes no attempt to inspect it; it just needs the browser to keep
+// carrying it on every request, like any other cookie.
+const CREDENTIALED = { credentials: 'include' }
+
 async function parseErrorDetail(response) {
   const body = await response.json().catch(() => ({}))
   // Every existing error this backend raises via HTTPException(detail=...)
@@ -23,7 +32,7 @@ async function parseErrorDetail(response) {
 }
 
 export async function fetchWatchlist() {
-  const response = await fetch(`${API_BASE}/watchlist`)
+  const response = await fetch(`${API_BASE}/watchlist`, CREDENTIALED)
   if (!response.ok) {
     throw new Error(await parseErrorDetail(response))
   }
@@ -32,7 +41,7 @@ export async function fetchWatchlist() {
 }
 
 export async function fetchAttention() {
-  const response = await fetch(`${API_BASE}/watchlist/attention`)
+  const response = await fetch(`${API_BASE}/watchlist/attention`, CREDENTIALED)
   if (!response.ok) {
     throw new Error(await parseErrorDetail(response))
   }
@@ -46,7 +55,7 @@ export async function fetchAttention() {
 export async function markInstrumentAsSeen(instrumentId) {
   const response = await fetch(
     `${API_BASE}/watchlist/instruments/${instrumentId}/checkpoint`,
-    { method: 'POST' }
+    { method: 'POST', ...CREDENTIALED }
   )
   if (!response.ok) {
     throw new Error(await parseErrorDetail(response))
@@ -64,6 +73,7 @@ export async function markInstrumentAsSeen(instrumentId) {
 export async function markAllAsSeen() {
   const response = await fetch(`${API_BASE}/watchlist/checkpoint`, {
     method: 'POST',
+    ...CREDENTIALED,
   })
   if (!response.ok) {
     throw new Error(await parseErrorDetail(response))
@@ -83,6 +93,7 @@ export async function addInstrument(symbol, exchange) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ symbol, exchange }),
+    ...CREDENTIALED,
   })
   if (!response.ok) {
     throw new Error(await parseErrorDetail(response))

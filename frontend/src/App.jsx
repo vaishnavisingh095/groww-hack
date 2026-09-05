@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import './App.css'
 import { addInstrument, fetchAttention, fetchWatchlist, markAllAsSeen, markInstrumentAsSeen } from './api'
 import AttentionSection from './components/AttentionSection'
@@ -56,6 +56,18 @@ const WATCHLIST_FILTERS = [
 // two values the backend will ever accept.
 const EXCHANGE_OPTIONS = ['NSE', 'BSE']
 
+// Same per-promise result shape Promise.allSettled itself produces, so
+// the merge logic in loadAll() below can treat this identically to a
+// real allSettled entry regardless of which code path produced it.
+async function settleFetch(promise) {
+  try {
+    const value = await promise
+    return { status: 'fulfilled', value }
+  } catch (reason) {
+    return { status: 'rejected', reason }
+  }
+}
+
 export default function App() {
   const [instruments, setInstruments] = useState([])
   const [attentionItems, setAttentionItems] = useState([])
@@ -105,11 +117,41 @@ export default function App() {
   // latter is a pure Mongo read), so treating "one failed" as "the
   // backend is unreachable" was itself untruthful -- it discarded real
   // data and blamed the whole backend for a single route's problem.
+  //
+  // hasResolvedIdentity guards a narrower concern: the backend's
+  // anonymous owner cookie (see decisions.md's "Persistent anonymous
+  // watchlist identity") is issued by whichever request reaches the
+  // backend first when no cookie exists yet. Firing both requests
+  // concurrently on the very first load of a fresh browser session
+  // would let each independently generate its OWN new owner token --
+  // whichever response's Set-Cookie the browser processes last would
+  // silently win, orphaning the other's just-created Watchlist. This
+  // frontend cannot check whether a cookie already exists before
+  // fetching (it's httpOnly by design, and must stay that way), so the
+  // first call in a given browser session is resolved alone, letting
+  // its Set-Cookie land before the second request is even sent; every
+  // call after that (this same initial round's second fetch, every
+  // 60s poll, and every action's own follow-up loadAll()) safely
+  // resumes the normal concurrent Promise.allSettled path below, since
+  // a real cookie is already established by then. This costs one extra
+  // sequential round-trip once per page load, never on every render or
+  // poll, and adds no new request.
+  const hasResolvedIdentity = useRef(false)
+
   const loadAll = useCallback(async () => {
-    const [watchlistResult, attentionResult] = await Promise.allSettled([
-      fetchWatchlist(),
-      fetchAttention(),
-    ])
+    let watchlistResult
+    let attentionResult
+
+    if (hasResolvedIdentity.current) {
+      ;[watchlistResult, attentionResult] = await Promise.allSettled([
+        fetchWatchlist(),
+        fetchAttention(),
+      ])
+    } else {
+      watchlistResult = await settleFetch(fetchWatchlist())
+      attentionResult = await settleFetch(fetchAttention())
+      hasResolvedIdentity.current = true
+    }
 
     // Each dataset is only ever replaced by a REAL, successful
     // response -- a failed request leaves whatever was already
