@@ -856,3 +856,178 @@ def test_get_attention_orders_multiple_instruments_by_descending_score(client, m
     assert [item["symbol"] for item in items] == ["TCS", "RELIANCE"]
     assert [item["rank"] for item in items] == [1, 2]
     assert items[0]["attention_score"] > items[1]["attention_score"]
+
+
+# --- POST /watchlist/instruments (Add Stock) --------------------------------
+
+
+def _quotes_with_wipro_added() -> dict:
+    """The default 5 seed quotes plus a 6th (WIPRO) -- used to exercise
+    Add Stock without disturbing the existing seeded instruments'
+    resolvability."""
+    return {
+        "RELIANCE.NS": make_quote("RELIANCE.NS", 1326.4, 1302.6, 9122871),
+        "TCS.NS": make_quote("TCS.NS", 2312.8, 2320.0, 1722049),
+        "HDFCBANK.NS": make_quote("HDFCBANK.NS", 715.6, 706.6, 9937354),
+        "INFY.NS": make_quote("INFY.NS", 1129.0, 1130.3, 3875864),
+        "ICICIBANK.NS": make_quote("ICICIBANK.NS", 1432.5, 1430.0, 4072353),
+        "WIPRO.NS": make_quote("WIPRO.NS", 480.0, 475.0, 5000000),
+    }
+
+
+def test_add_instrument_creates_a_new_trackable_instrument(client, monkeypatch):
+    test_client, mock_db = client
+    monkeypatch.setattr(watchlist_routes, "_provider", FakeProvider(_quotes_with_wipro_added()))
+
+    response = test_client.post("/watchlist/instruments", json={"symbol": "WIPRO", "exchange": "NSE"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["symbol"] == "WIPRO"
+    assert body["exchange"] == "NSE"
+    assert body["created"] is True
+    assert "instrument_id" in body
+
+    doc = mock_db.instruments.find_one({"symbol": "WIPRO", "exchange": "NSE"})
+    assert doc is not None
+    assert str(doc["_id"]) == body["instrument_id"]
+
+
+def test_add_instrument_normalizes_symbol_case(client, monkeypatch):
+    test_client, mock_db = client
+    monkeypatch.setattr(watchlist_routes, "_provider", FakeProvider(_quotes_with_wipro_added()))
+
+    response = test_client.post("/watchlist/instruments", json={"symbol": "wipro", "exchange": "NSE"})
+
+    assert response.status_code == 200
+    assert response.json()["symbol"] == "WIPRO"
+    assert mock_db.instruments.count_documents({"symbol": "WIPRO", "exchange": "NSE"}) == 1
+
+
+def test_add_instrument_is_idempotent_for_a_duplicate(client, monkeypatch):
+    test_client, mock_db = client
+    monkeypatch.setattr(watchlist_routes, "_provider", FakeProvider(_quotes_with_wipro_added()))
+
+    first = test_client.post("/watchlist/instruments", json={"symbol": "WIPRO", "exchange": "NSE"})
+    second = test_client.post("/watchlist/instruments", json={"symbol": "WIPRO", "exchange": "NSE"})
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["created"] is True
+    assert second.json()["created"] is False
+    assert first.json()["instrument_id"] == second.json()["instrument_id"]
+    assert mock_db.instruments.count_documents({"symbol": "WIPRO", "exchange": "NSE"}) == 1
+
+
+def test_add_instrument_rejects_invalid_exchange(client):
+    """Instrument's own Exchange enum, applied automatically by FastAPI
+    on request-body parsing -- no duplicated validation logic in the
+    route, and nothing is ever created for a rejected request."""
+    test_client, mock_db = client
+
+    response = test_client.post("/watchlist/instruments", json={"symbol": "WIPRO", "exchange": "NYSE"})
+
+    assert response.status_code == 422
+    assert mock_db.instruments.count_documents({}) == 0
+
+
+def test_add_instrument_rejects_blank_symbol(client):
+    test_client, mock_db = client
+
+    response = test_client.post("/watchlist/instruments", json={"symbol": "   ", "exchange": "NSE"})
+
+    assert response.status_code == 422
+    assert mock_db.instruments.count_documents({}) == 0
+
+
+def test_add_instrument_returns_503_and_creates_nothing_when_provider_cannot_resolve(client):
+    """The default fixture's FakeProvider only recognizes the 5 seed
+    symbols -- "NOTREAL" falls through to its own "no test data
+    configured" failure quote, exactly like any genuinely unresolvable
+    real-world symbol would."""
+    test_client, mock_db = client
+
+    response = test_client.post("/watchlist/instruments", json={"symbol": "NOTREAL", "exchange": "NSE"})
+
+    assert response.status_code == 503
+    assert mock_db.instruments.count_documents({"symbol": "NOTREAL"}) == 0
+
+
+def test_newly_added_instrument_appears_in_get_watchlist(client, monkeypatch):
+    test_client, mock_db = client
+    monkeypatch.setattr(watchlist_routes, "_provider", FakeProvider(_quotes_with_wipro_added()))
+
+    add_response = test_client.post("/watchlist/instruments", json={"symbol": "WIPRO", "exchange": "NSE"})
+    assert add_response.status_code == 200
+
+    body = test_client.get("/watchlist").json()
+    symbols = {i["symbol"] for i in body["instruments"]}
+
+    assert "WIPRO" in symbols
+    assert len(body["instruments"]) == 6
+
+    wipro = next(i for i in body["instruments"] if i["symbol"] == "WIPRO")
+    assert wipro["price"] == 480.0
+    assert wipro["status"] == "ok"
+
+
+def test_existing_seed_instruments_still_appear_after_add_stock(client, monkeypatch):
+    test_client, mock_db = client
+    monkeypatch.setattr(watchlist_routes, "_provider", FakeProvider(_quotes_with_wipro_added()))
+
+    test_client.post("/watchlist/instruments", json={"symbol": "WIPRO", "exchange": "NSE"})
+
+    body = test_client.get("/watchlist").json()
+    symbols = {i["symbol"] for i in body["instruments"]}
+    assert symbols == {"RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "WIPRO"}
+
+
+def test_newly_added_instrument_has_no_baseline_and_creates_no_attention(client, monkeypatch):
+    test_client, mock_db = client
+    monkeypatch.setattr(watchlist_routes, "_provider", FakeProvider(_quotes_with_wipro_added()))
+
+    test_client.post("/watchlist/instruments", json={"symbol": "WIPRO", "exchange": "NSE"})
+
+    watchlist_body = test_client.get("/watchlist").json()
+    wipro = next(i for i in watchlist_body["instruments"] if i["symbol"] == "WIPRO")
+    assert wipro["change"]["has_baseline"] is False
+    assert "Baseline pending" in wipro["change"]["reason"]
+
+    assert mock_db.change_events.count_documents({"instrument_id": wipro["instrument_id"]}) == 0
+
+    attention_body = test_client.get("/watchlist/attention").json()
+    attention_ids = {item["instrument_id"] for item in attention_body["attention_items"]}
+    assert wipro["instrument_id"] not in attention_ids
+
+
+def test_newly_added_instrument_can_progress_through_checkpoint_and_attention_like_any_seed(
+    client, monkeypatch
+):
+    """Proves Add Stock didn't just avoid breaking existing behavior --
+    a newly added instrument genuinely flows through the SAME
+    checkpoint -> change detection -> attention pipeline as any seed
+    instrument, with no special-casing anywhere in that pipeline."""
+    test_client, mock_db = client
+    monkeypatch.setattr(watchlist_routes, "_provider", FakeProvider(_quotes_with_wipro_added()))
+
+    add_response = test_client.post("/watchlist/instruments", json={"symbol": "WIPRO", "exchange": "NSE"})
+    wipro_id = add_response.json()["instrument_id"]
+
+    # Explicit "mark as seen" establishes a real checkpoint baseline @ 480.0.
+    checkpoint_response = test_client.post(f"/watchlist/instruments/{wipro_id}/checkpoint")
+    assert checkpoint_response.status_code == 200
+
+    # Simulate a real >2% move.
+    moved_quotes = _quotes_with_wipro_added()
+    moved_quotes["WIPRO.NS"] = make_quote("WIPRO.NS", 520.0, 475.0, 5000000)
+    monkeypatch.setattr(watchlist_routes, "_provider", FakeProvider(moved_quotes))
+
+    watchlist_body = test_client.get("/watchlist").json()
+    wipro = next(i for i in watchlist_body["instruments"] if i["symbol"] == "WIPRO")
+    assert wipro["change"]["meaningful_change"] is True
+
+    assert mock_db.change_events.count_documents({"instrument_id": wipro_id}) == 1
+
+    attention_body = test_client.get("/watchlist/attention").json()
+    attention_symbols = {item["symbol"] for item in attention_body["attention_items"]}
+    assert "WIPRO" in attention_symbols

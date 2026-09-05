@@ -672,6 +672,126 @@ button:focus-visible {
   outline-offset: 2px;
 }
 
+/* Add Stock -- a compact toggle that reveals a small inline form
+   alongside the existing filters/search, rather than a modal or a new
+   page. Reuses the same button-language tokens already established:
+   the toggle looks like a filter button (bordered, muted), the actual
+   "Add" submit reuses the same primary-action treatment as Mark as
+   seen / Mark all as seen. */
+.add-stock-toggle {
+  background: var(--color-surface);
+  color: var(--color-text-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-pill);
+  padding: 6px 12px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.add-stock-toggle:hover {
+  border-color: var(--color-text-muted);
+}
+
+/* The control itself stays a normal, in-flow flex item (just the
+   toggle button's width) whether the form is open or closed, so opening
+   it can never push .watchlist-controls to wrap or reorder the
+   filters/search beside it. The open form is a small anchored popover
+   instead of an inline sibling -- positioned relative to this wrapper,
+   right-aligned under the toggle button that opened it. */
+.add-stock-control {
+  position: relative;
+  /* Reserves the toggle button's own footprint so this slot's width
+     never depends on which child (the in-flow button, or the
+     position: absolute form) currently happens to be mounted. Without
+     this, replacing the button with the absolutely-positioned form --
+     which contributes zero intrinsic width to this element -- shrinks
+     .watchlist-controls' own content width on open; because
+     .watchlist-header uses justify-content: space-between, that shrink
+     pulls the whole .watchlist-controls block (filters, search,
+     everything) rightward to stay flush against the header's right
+     edge. Sized with `ch` (scales with the actual font) to comfortably
+     fit "+ Add stock" plus its own horizontal padding -- this reserves
+     space for one small control, it is not a fixed page/layout width. */
+  min-width: calc(12ch + 24px);
+}
+
+.add-stock-form {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  width: max-content;
+  max-width: 320px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-md);
+  padding: 12px;
+}
+
+.add-stock-symbol-input,
+.add-stock-exchange-select {
+  padding: 7px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+  color: var(--color-text-primary);
+  font-size: 0.85rem;
+}
+
+.add-stock-symbol-input {
+  width: 120px;
+}
+
+.add-stock-submit {
+  background: var(--color-primary);
+  color: var(--color-text-on-primary);
+  border: none;
+  padding: 7px 14px;
+  border-radius: var(--radius);
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.add-stock-submit:hover:not(:disabled) {
+  background: var(--color-primary-hover);
+}
+
+.add-stock-submit:disabled {
+  background: var(--color-disabled-bg);
+  color: var(--color-disabled-text);
+  cursor: not-allowed;
+}
+
+.add-stock-cancel {
+  background: transparent;
+  color: var(--color-text-muted);
+  border: none;
+  padding: 7px 4px;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.add-stock-cancel:hover:not(:disabled) {
+  color: var(--color-text-secondary);
+}
+
+/* The shared .action-error class is reused verbatim for color/size --
+   this only makes it wrap onto its own full-width line below the
+   form's inputs instead of squeezing into the same flex row. */
+.add-stock-form .action-error {
+  flex-basis: 100%;
+  margin-top: 0;
+}
+
 .empty-state {
   color: var(--color-text-secondary);
   text-align: center;

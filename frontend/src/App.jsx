@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import './App.css'
-import { fetchAttention, fetchWatchlist, markAllAsSeen, markInstrumentAsSeen } from './api'
+import { addInstrument, fetchAttention, fetchWatchlist, markAllAsSeen, markInstrumentAsSeen } from './api'
 import AttentionSection from './components/AttentionSection'
 import WatchlistTable from './components/WatchlistTable'
 
@@ -52,6 +52,10 @@ const WATCHLIST_FILTERS = [
   { value: 'baseline_pending', label: 'Baseline Pending' },
 ]
 
+// Mirrors app/models/instrument.py's Exchange enum exactly -- the only
+// two values the backend will ever accept.
+const EXCHANGE_OPTIONS = ['NSE', 'BSE']
+
 export default function App() {
   const [instruments, setInstruments] = useState([])
   const [attentionItems, setAttentionItems] = useState([])
@@ -79,6 +83,17 @@ export default function App() {
   const [markAllInFlight, setMarkAllInFlight] = useState(false)
   const [markAllError, setMarkAllError] = useState(null)
   const [markAllPartialMessage, setMarkAllPartialMessage] = useState(null)
+
+  // Add Stock form state -- closed by default; opened by the "+ Add
+  // stock" toggle. addSymbol/addExchange are the controlled form
+  // fields, cleared only after a real, confirmed creation (never
+  // optimistically, and never on failure, so the user can fix and
+  // retry without retyping).
+  const [addFormOpen, setAddFormOpen] = useState(false)
+  const [addSymbol, setAddSymbol] = useState('')
+  const [addExchange, setAddExchange] = useState('NSE')
+  const [addInFlight, setAddInFlight] = useState(false)
+  const [addError, setAddError] = useState(null)
 
   // Both endpoints are fetched together, on the SAME timer -- still
   // exactly one polling interval, not two. They are independent reads,
@@ -193,6 +208,41 @@ export default function App() {
     }
   }, [loadAll])
 
+  const handleAddInstrument = useCallback(
+    async (e) => {
+      e.preventDefault()
+
+      const trimmedSymbol = addSymbol.trim()
+      if (!trimmedSymbol) {
+        setAddError('Enter a symbol.')
+        return
+      }
+
+      setAddInFlight(true)
+      setAddError(null)
+
+      try {
+        // The backend does the real validation/normalization (via the
+        // existing Instrument model) and the provider-resolvability
+        // check -- this call does not duplicate that logic, it just
+        // surfaces whatever truthful error comes back.
+        await addInstrument(trimmedSymbol, addExchange)
+        // Clear the form and re-fetch real server state only after a
+        // confirmed success -- never optimistically add to instruments/
+        // attentionItems, and never touch searchQuery/watchlistFilter.
+        setAddSymbol('')
+        setAddExchange('NSE')
+        setAddFormOpen(false)
+        await loadAll()
+      } catch (err) {
+        setAddError(err.message)
+      } finally {
+        setAddInFlight(false)
+      }
+    },
+    [addSymbol, addExchange, loadAll]
+  )
+
   // Small, simple filter -- the dataset is 5 instruments, not large
   // enough to warrant useMemo. instruments itself is never reassigned or
   // mutated here; this is a new derived array passed only to
@@ -274,6 +324,57 @@ export default function App() {
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                 />
+                <div className="add-stock-control">
+                  {addFormOpen ? (
+                    <form className="add-stock-form" onSubmit={handleAddInstrument}>
+                      <input
+                        type="text"
+                        className="add-stock-symbol-input"
+                        placeholder="Symbol"
+                        aria-label="New instrument symbol"
+                        value={addSymbol}
+                        onChange={(e) => setAddSymbol(e.target.value)}
+                        disabled={addInFlight}
+                      />
+                      <select
+                        className="add-stock-exchange-select"
+                        aria-label="New instrument exchange"
+                        value={addExchange}
+                        onChange={(e) => setAddExchange(e.target.value)}
+                        disabled={addInFlight}
+                      >
+                        {EXCHANGE_OPTIONS.map((exchange) => (
+                          <option key={exchange} value={exchange}>
+                            {exchange}
+                          </option>
+                        ))}
+                      </select>
+                      <button type="submit" className="add-stock-submit" disabled={addInFlight}>
+                        {addInFlight ? 'Adding…' : 'Add'}
+                      </button>
+                      <button
+                        type="button"
+                        className="add-stock-cancel"
+                        disabled={addInFlight}
+                        onClick={() => {
+                          setAddFormOpen(false)
+                          setAddError(null)
+                        }}
+                      >
+                        Cancel
+                      </button>
+                      {addError && <div className="action-error">{addError}</div>}
+                    </form>
+                  ) : (
+                    <button
+                      type="button"
+                      className="add-stock-toggle"
+                      onClick={() => setAddFormOpen(true)}
+                    >
+                      + Add stock
+                    </button>
+                  )}
+                </div>
               </div>
             </div>
             <WatchlistTable

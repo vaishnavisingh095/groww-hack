@@ -14,6 +14,7 @@ from fastapi import APIRouter, HTTPException
 from pymongo.database import Database
 
 from app.db.connection import get_database
+from app.models.instrument import Instrument
 from app.models.market_snapshot import SnapshotStatus
 from app.providers.yfinance_provider import YFinanceProvider
 from app.services.attention_engine import AttentionEngine
@@ -23,7 +24,9 @@ from app.services.checkpoint_service import CheckpointService
 from app.services.market_data_service import MarketDataService
 from app.services.watchlist_service import (
     DEMO_USER_ID,
-    ensure_seed_instruments,
+    ProviderResolutionError,
+    add_instrument,
+    get_watchlist_instruments,
     yfinance_ticker_for,
 )
 
@@ -90,7 +93,7 @@ def get_watchlist() -> dict:
     ChangeEventService.get_or_create_active.
     """
     db = get_database()
-    instruments = ensure_seed_instruments(db)
+    instruments = get_watchlist_instruments(db)
     checkpoint_service = CheckpointService(db)
     change_event_service = ChangeEventService(db)
     market_service = MarketDataService(_provider)
@@ -324,7 +327,7 @@ def mark_all_as_seen() -> dict:
     untouched, never falsely acknowledged.
     """
     db = get_database()
-    instruments = ensure_seed_instruments(db)
+    instruments = get_watchlist_instruments(db)
     market_service = MarketDataService(_provider)
     checkpoint_service = CheckpointService(db)
     change_event_service = ChangeEventService(db)
@@ -365,6 +368,56 @@ def mark_all_as_seen() -> dict:
         )
 
     return {"updated": updated, "skipped": skipped}
+
+
+@router.post("/watchlist/instruments")
+def add_watchlist_instrument(body: Instrument) -> dict:
+    """
+    Explicit "add a new instrument to track" action (Add Stock).
+
+    Request body is the existing Instrument model itself (symbol,
+    exchange required; company_name/created_at optional and unused by
+    the client) -- FastAPI validates/normalizes it via Instrument's own
+    validators before this handler ever runs, so an invalid exchange or
+    a blank symbol never reaches here at all (FastAPI returns 422
+    automatically). No new/duplicated validation logic.
+
+    Creates ONLY an Instrument document -- never a Checkpoint, never a
+    ChangeEvent (see watchlist_service.add_instrument's own docstring).
+    A newly added instrument is baseline_pending starting from the very
+    next GET /watchlist, with no special-casing anywhere else in the
+    app -- it is indistinguishable from a seed instrument that has never
+    had a checkpoint.
+
+    Idempotent: adding an already-tracked (symbol, exchange) pair
+    returns the existing instrument (created: false) rather than a
+    duplicate or an error.
+
+    Provider validation: before creating anything, confirms the
+    provider can produce a valid current market snapshot for this
+    instrument. If it cannot, returns 503 and creates nothing -- the
+    exact same "no usable data" rule and status code
+    POST /watchlist/instruments/{id}/checkpoint already applies, just
+    enforced here at add-time instead of checkpoint-time.
+    """
+    db = get_database()
+    try:
+        doc, created = add_instrument(db, _provider, body)
+    except ProviderResolutionError:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Could not fetch current market data for {body.symbol} "
+                f"({body.exchange.value}) — instrument not added."
+            ),
+        )
+
+    return {
+        "instrument_id": str(doc["_id"]),
+        "symbol": doc["symbol"],
+        "exchange": doc["exchange"],
+        "created": created,
+    }
 
 
 def _to_object_id(instrument_id: str):
