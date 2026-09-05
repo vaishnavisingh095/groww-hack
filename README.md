@@ -6,14 +6,14 @@
 
 ## The Problem
 
-A traditional watchlist shows what your stocks are doing right now.  
-When users return later, they still have to scan the market to understand **what actually changed and what deserves attention**.
+A traditional watchlist shows what stocks are doing right now.  
+When I return later, I still have to scan the market to understand **what actually changed and what deserves attention**.
 
-### Our idea
+### My Idea
 
 **Don't make users monitor the market. Monitor the watchlist for them.**
 
-## What We Built
+## What I Built
 
 **Since You Last Checked** is the core experience.
 
@@ -23,11 +23,11 @@ The system maintains an explicit checkpoint, compares new market observations ag
 
 ---
 
-## Our Key Decisions
+## My Key Decisions
 
 ### 1. What counts as meaningful change?
 
-We use two deterministic signals: **price movement** and **volume acceleration**.
+I use two deterministic signals: **price movement** and **volume acceleration**.
 
 - Price: adaptive threshold based on intraday range, bounded between `0.5%–3%`
 - Fallback: `1%`
@@ -37,35 +37,35 @@ We use two deterministic signals: **price movement** and **volume acceleration**
 
 This makes detection reproducible and explainable.
 
-### 2. What information should we surface?
+### 2. What information should I surface?
 
-We chose an **attention-first** experience centered on **Since You Last Checked**.
+I chose an **attention-first** experience centered on **Since You Last Checked**.
 
 The strongest changes appear first, with explanations showing what changed, which signal triggered, the threshold involved, and the current data status.
 
 ### 3. How does state persist?
 
-Watchlist membership, checkpoints, market snapshots, and detected changes are persisted in **MongoDB**.
+I persist watchlist membership, checkpoints, market snapshots, and detected changes in **MongoDB**.
 
 A persistent `httpOnly` anonymous capability cookie identifies the watchlist owner. Opening or refreshing the application does not silently advance the checkpoint; **Mark as Seen** does.
 
-### 4. How do we handle unreliable data?
+### 4. How do I handle unreliable data?
 
-Market data can be **fresh, stale/delayed, unavailable, or invalid**.
+I treat market data as an external dependency that can be **fresh, stale/delayed, unavailable, or invalid**.
 
-We use a last-known-good snapshot when fresh provider data cannot be obtained, while clearly marking it as stale. Stale or unavailable data cannot silently create a new checkpoint or meaningful-change event.
+I use a last-known-good snapshot when fresh provider data cannot be obtained, while clearly marking it as stale. Stale or unavailable data cannot silently create a new checkpoint or meaningful-change event.
 
-### 5. How does it scale?
+### 5. How does the system scale?
 
-Market data is instrument-level, while watchlists, checkpoints, and change events are user-scoped.
+I separate market data at the instrument level from user-level state.
 
 The current system uses cache-first market reads. At larger scale, shared background polling by distinct instruments would allow many users to consume the same refreshed market snapshots.
 
-### 6. Where do we keep things simple?
+### 6. Where do I keep things simple?
 
-The architecture uses **React + FastAPI + MongoDB + a market-data provider**.
+I use **React + FastAPI + MongoDB + a market-data provider**.
 
-We deliberately avoided Kafka, Redis, WebSockets, Kubernetes, microservices, queues, and LLMs in the detection path because they were not necessary to solve the core problem.
+I deliberately avoided Kafka, Redis, WebSockets, Kubernetes, microservices, queues, and LLMs in the detection path because they were not necessary to solve the core problem.
 
 > **Add complexity only when it solves a demonstrated problem.**
 
@@ -94,7 +94,7 @@ MongoDB stores:
 - **Database:** MongoDB
 - **Market Data:** `yfinance` / Yahoo Finance
 
-We do not claim guaranteed real-time market data. Provider calls are bounded by a 5-second HTTP timeout.
+I do not claim guaranteed real-time market data. Provider calls are bounded by a 5-second HTTP timeout.
 
 ---
 
@@ -108,7 +108,7 @@ Smart Market Watchlist answers:
 
 > **“What meaningfully changed since I last checked, and what deserves my attention?”**
 
-### The principle
+### The Principle
 
 **Persistent checkpoints + deterministic detection + explainable attention + explicit data trust**
 
