@@ -371,6 +371,48 @@ button:focus-visible {
   align-items: start;
 }
 
+/* ===== TEMPORARY DEMO MODE -- screenshot-only layout override =====
+   Forces the (unchanged) High Attention + Worth Checking groups to lay
+   their cards out as ONE horizontal row instead of two stacked groups,
+   for a single hackathon screenshot. Purely presentational: content,
+   ranking, severity, and grouping are all untouched -- .attention-group
+   and .attention-list are collapsed via `display: contents` so their
+   .attention-card children become direct flex items of
+   .demo-attention-row instead, and flex's own default `align-items:
+   stretch` is what gives the three cards consistent height (unlike the
+   grid's deliberate `align-items: start` above, which exists for a
+   different, unrelated reason -- not expanding here, so stretch is
+   safe and is exactly what's wanted for this screenshot). The group
+   headings are hidden rather than squeezed into the same row as
+   differently-sized text items, per the explicit screenshot
+   requirement that the CARDS align, not the labels.
+   REMOVE: delete this whole block, and unwrap the
+   `.demo-attention-row` div back to a bare fragment in
+   AttentionSection.jsx (search "DEMO MODE" in both files). */
+.demo-attention-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.demo-attention-row .attention-group {
+  display: contents;
+}
+
+.demo-attention-row .attention-group-heading {
+  display: none;
+}
+
+.demo-attention-row .attention-list {
+  display: contents;
+}
+
+.demo-attention-row .attention-card {
+  flex: 1 1 260px;
+  max-width: 340px;
+}
+/* ===== END TEMPORARY DEMO MODE ===== */
+
 .attention-card {
   background: var(--color-surface);
   border: 1px solid var(--color-border);

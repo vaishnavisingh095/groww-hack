@@ -538,18 +538,29 @@ export default function AttentionSection({
 
       {items.length > 0 && (
         <>
-          <AttentionGroup
-            title="High Attention"
-            variant="high"
-            groupItems={visibleHighItems}
-            {...groupProps}
-          />
-          <AttentionGroup
-            title="Worth Checking"
-            variant="secondary"
-            groupItems={visibleWorthCheckingItems}
-            {...groupProps}
-          />
+          {/* TEMPORARY DEMO MODE -- screenshot-only layout wrapper. This
+              div adds no content and changes no data/ranking/severity --
+              it exists only so App.css's `.demo-attention-row` rule has
+              a single container to lay the two (unchanged) AttentionGroup
+              renders out as one row of cards for the hackathon
+              screenshot. TO REMOVE: delete this wrapping <div> (keep its
+              children, i.e. go back to the bare <> fragment) and delete
+              the `.demo-attention-row` rule block in App.css (search
+              "DEMO MODE" in both files). */}
+          <div className="demo-attention-row">
+            <AttentionGroup
+              title="High Attention"
+              variant="high"
+              groupItems={visibleHighItems}
+              {...groupProps}
+            />
+            <AttentionGroup
+              title="Worth Checking"
+              variant="secondary"
+              groupItems={visibleWorthCheckingItems}
+              {...groupProps}
+            />
+          </div>
           {/* Truthful, search-scoped empty state -- only shown when real
               attention items exist but none match the current query.
               Never replaces or alters the "caught up" message above,
