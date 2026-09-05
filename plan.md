@@ -31,10 +31,21 @@ explainable change detection, and attention ranking.
   change %, volume) from a real external provider.
 - Explicit checkpoint action ("mark as seen" / equivalent) — the primary
   mechanism per product decision.
-- Implicit checkpoint creation as a secondary mechanism (e.g., first
+- ~~Implicit checkpoint creation as a secondary mechanism (e.g., first
   visit/session creates an initial checkpoint automatically if none
   exists), so the system is usable without the user knowing the explicit
-  action exists on day one.
+  action exists on day one.~~ **Not part of the final shipped
+  implementation.** This was the original MUST HAVE intent, but the
+  checkpoint semantics were later corrected so that `GET /watchlist`
+  (or any read/observation path) never creates or advances a checkpoint
+  under any condition — see `decisions.md`'s "Explicit checkpoints are
+  never silently overwritten by implicit ones." A brand-new instrument
+  now stays `baseline_pending` indefinitely across any number of reads
+  until an **explicit** Mark as Seen / Mark All as Seen action
+  establishes its first real checkpoint. The implicit-creation
+  primitive (`CheckpointService.ensure_initial_checkpoint`) still exists
+  in code as a correct, tested, isolated method, but is called from no
+  production route — see `architecture.md`'s Checkpoint Model section.
 - Deterministic meaningful-change detection using **price movement** and
   **volume anomaly** signals (decided; volatility is explicitly deferred,
   see Should-Have). Volume acceleration is valid **only when comparing
@@ -234,9 +245,13 @@ adversarial-hardening passes (identity/authorization, market-data
 correctness, checkpoint/ChangeEvent lifecycle, MongoDB concurrency,
 API/frontend failure handling, and a final end-to-end regression audit)
 have run against the finished feature set and their fixes are committed
-(`21e45bc fix: harden watchlist state and failure handling`). See
-`decisions.md` for the specific decisions and fixes behind each item
-below.
+(`21e45bc fix: harden watchlist state and failure handling`). Manual
+browser QA after that pass found and fixed four further real bugs (a
+local-dev cookie/SameSite issue, an Attention Engine explanation-wording
+issue, a duplicate-React-key issue, and a grid cross-axis-stretch
+issue — items 23–26 below) and added the Add Stock suggestion dropdown
+(item 21). See `decisions.md` for the specific decisions and fixes
+behind each item below.
 
 **COMPLETED:**
 
@@ -280,11 +295,26 @@ Frontend:
 19. Search (frontend-only, symbol/exchange, case-insensitive).
 20. Watchlist filters (All / Attention / Normal / Baseline Pending —
     frontend-only).
-21. Add Stock (symbol + exchange, with provider-resolution validation).
+21. Add Stock (symbol + exchange, with provider-resolution validation,
+    and a searchable suggestion dropdown backed by a curated static
+    list of 30 NSE + 30 BSE companies — not live/unrestricted market
+    search, see Known Deviations below).
 22. API/frontend failure-state handling — a failed fetch is never
     presented as confirmed-empty or confirmed-caught-up, and a
     malformed-but-200 response can no longer crash the page (P0
     Hardening #6 fixes).
+23. Local-dev cookie/SameSite fix — frontend `API_BASE` changed from
+    `127.0.0.1:8000` to `localhost:8000` so the anonymous owner cookie
+    is actually sent (see `decisions.md`).
+24. Attention Engine explanation-wording fix — the volume-acceleration
+    sentence is no longer shown for an available-but-sub-threshold
+    ratio (e.g. the "accelerated to 0.0×" bug found in QA).
+25. Attention card React-key identity fix — cards are now keyed by
+    `checkpoint_id`, not `instrument_id`, fixing a duplicate-key/
+    stale-DOM-node bug when one instrument has multiple active
+    ChangeEvents.
+26. Attention card grid-alignment fix — `align-items: start` so an
+    expanded card's row-mates no longer stretch to match its height.
 
 **CURRENT (in progress / not yet done):**
 - Deployment configuration (see "Remaining" below) — a pre-deployment
@@ -356,3 +386,10 @@ full reasoning on each):**
   features were actually built as real, scoped features — see
   `decisions.md`'s newer entries, which explicitly mark that
   supersession rather than silently contradicting the earlier ones.
+- Add Stock's suggestion dropdown is a curated, static 30 NSE + 30 BSE
+  list, not live/unrestricted market-wide instrument search — `yfinance`
+  has no documented, reliable way to constrain a search to a specific
+  exchange, so live discovery was deliberately not built rather than
+  shipped on an unverified filter. See decisions.md's "Add Stock curated
+  suggestion dropdown; unrestricted instrument discovery deliberately
+  not implemented" entry.

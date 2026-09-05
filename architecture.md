@@ -633,13 +633,23 @@ volume signal**: `"Trading volume accelerated to {ratio}× the rate
 observed before you last checked."` — never phrased as "{ratio}x normal
 volume" or any wording implying a historical-normal baseline, since the
 signal is a same-session rate comparison, not a measure of what's
-"normal" for the instrument. When `volume_acceleration_available` is
-false, the explanation omits any volume claim entirely rather than
-substituting a placeholder. Price-only example: `"{symbol} moved
-{pct}%."` Combined example: `"{symbol} moved {pct}%. Trading volume
-accelerated to {ratio}× the rate observed before you last checked."` Not
-freeform text, not an LLM call — a deterministic string built from
-numbers we already have.
+"normal" for the instrument. The volume clause is appended **only when
+both** `volume_acceleration_available` is true **and** the ratio itself
+meets `VOLUME_ACCELERATION_THRESHOLD` — available-but-below-threshold
+(e.g. a computed `0.0×` when checkpoint and current volume are equal)
+is not "acceleration" and must never be worded as such; a mere
+`available=true` is not by itself sufficient. This was a real bug found
+during manual browser QA (`AttentionEngine._build_explanation` used to
+gate on availability alone, producing "Trading volume accelerated to
+0.0× the rate observed before you last checked" for a purely
+price-driven event) and fixed — see `decisions.md`'s "Attention Engine
+explanation volume-threshold wording fix." When the volume clause is
+omitted (either because it's unavailable, or available but not
+meaningful), nothing is substituted in its place. Price-only example:
+`"{symbol} moved {pct}%."` Combined example: `"{symbol} moved {pct}%.
+Trading volume accelerated to {ratio}× the rate observed before you
+last checked."` Not freeform text, not an LLM call — a deterministic
+string built from numbers we already have.
 
 ## Freshness Model (hard question D — revised, confirmed by live test)
 
@@ -1110,7 +1120,33 @@ state, applied by pure functions `matchesSearch`/`matchesWatchlistFilter`)
 **Add Stock** — a form (`addSymbol`/`addExchange`/`addFormOpen` state)
 calling `POST /watchlist/instruments`. Clears and re-fetches
 (`loadAll()`) only after a confirmed success; a failure leaves the form
-and existing state untouched (no optimistic membership).
+and existing state untouched (no optimistic membership). A newly added
+instrument never fabricates a meaningful change or a baseline — it
+enters exactly the same `baseline_pending` state as any other
+never-checkpointed instrument, resolved only by a later explicit Mark
+as Seen.
+
+The symbol field is a searchable suggestion dropdown
+(`frontend/src/stockSuggestions.js`), backed by a **frontend-maintained,
+curated static list of exactly 30 NSE and 30 BSE companies** (plain
+`{symbol, name}` pairs, using the same unsuffixed ticker convention
+`yfinance_ticker_for` already expects). Focusing the field shows the
+full curated list for the currently selected exchange; typing filters
+it case-insensitively by symbol or company name. Selecting a suggestion
+fills the field with its canonical symbol; changing NSE ↔ BSE swaps the
+list and clears the typed symbol only if it isn't also valid for the
+newly selected exchange. Submission is rejected client-side (no network
+call) unless the typed text exactly matches a curated entry for the
+current exchange — arbitrary free text can never reach `POST
+/watchlist/instruments`. **This list is intentionally NOT a live,
+market-wide search** — see `decisions.md`'s "Add Stock curated
+suggestion dropdown; unrestricted instrument discovery deliberately not
+implemented" for why: the available provider (`yfinance`) has no
+documented, reliable way to constrain a search to exactly NSE or BSE
+(its `Search`/`Lookup` helpers wrap Yahoo's own undocumented global
+autocomplete endpoint, with no verified exchange-filtering contract),
+so building live discovery on top of it was assessed and deliberately
+not attempted rather than shipping an unverified filter.
 
 **Mark as Seen / Mark All as Seen** — `handleMarkAsSeen`/
 `handleMarkAllAsSeen` call the corresponding backend routes, tracked by
@@ -1132,6 +1168,28 @@ expandable card" decision. Its "Result: Threshold crossed / Below
 threshold" row is a plain `>=` restatement of the same locked 2.0%/2.0×
 constants the backend already used to flag the item meaningful — it
 does not independently decide meaningfulness.
+
+**Attention card identity (React key)** — each rendered `AttentionCard`
+is keyed by `item.checkpoint_id`, not `item.instrument_id`. This matters
+because multiple independent `ChangeEvent`s can legitimately share one
+instrument (different checkpoint versions, both still active/
+unacknowledged) — `checkpoint_id` is the true stable identity of one
+specific attention event, while `instrument_id` only identifies which
+stock it's about. Keying by `instrument_id` caused a real, QA-found bug
+(duplicate React keys, and stale cards left behind in the DOM across a
+re-render when the array shrank) — see `decisions.md`'s "Attention card
+React-key identity fix." The same reasoning applies to `AttentionCard`'s
+`detailsId` (used for the View Details toggle's `aria-controls`), which
+is also derived from `checkpoint_id` for the same uniqueness reason.
+
+**Attention card grid layout** — `.attention-list` is a CSS Grid
+(`repeat(auto-fit, minmax(280px, 360px))`) with `align-items: start`.
+Without this, Grid's default `stretch` cross-axis alignment forces every
+card in a row to match the tallest card's height — so expanding one
+card's View Details panel visibly stretched its collapsed row-mates,
+leaving empty space inside them. `align-items: start` lets each card
+still grow to its own content while no longer dragging its siblings up
+with it — see `decisions.md`'s "Attention card grid stretch fix."
 
 **Failure-state truthfulness** (P0 Hardening #6) — `App.jsx` tracks,
 independently of the single combined `error` banner string, whether
@@ -1181,6 +1239,13 @@ accepted boundaries of this build's scope.
 - **No transaction/distributed-lock layer.** Every write is a
   single-document atomic MongoDB operation; see Database Integrity
   above for why this has been sufficient for every race actually found.
+- **No unrestricted/market-wide instrument discovery.** Add Stock's
+  suggestion dropdown is a curated static list of 30 NSE + 30 BSE
+  companies, not a live search — `yfinance` has no documented, reliable
+  way to constrain a search to a specific exchange, so live discovery
+  was deliberately not built rather than shipped on an unverified
+  filter. See the Frontend Architecture Add Stock section above and
+  `decisions.md`'s corresponding entry.
 - **Hackathon-scale architecture throughout** — a handful of users, a
   handful of instruments, one FastAPI process, one MongoDB database. No
   claim of horizontal scalability, multi-region deployment, or

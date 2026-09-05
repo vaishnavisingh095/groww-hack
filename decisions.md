@@ -1835,9 +1835,13 @@ naively-added API call could risk.
 ### Consequence
 Expanding/collapsing details never calls `loadAll()`, never touches
 `instruments`/`attentionItems`, and survives a polling refresh unchanged
-because `AttentionGroup` keys each card by the stable `item.instrument_id`
-(React preserves the card's local state across re-renders with the same
-key). The "Result: Threshold crossed / Below threshold" row is computed
+because `AttentionGroup` keys each card by a stable identifier (React
+preserves the card's local state across re-renders with the same key —
+this was `item.instrument_id` at the time this decision was made; see
+"Attention card React-key identity fix" later in this log for why and
+how that key later changed to `item.checkpoint_id`, which preserves
+this exact same property, now correctly, even when two cards share an
+instrument). The "Result: Threshold crossed / Below threshold" row is computed
 client-side as a plain `>=` comparison against the same locked 2.0%/2.0×
 constants the backend itself uses (duplicated as literals in
 `AttentionSection.jsx`, since no API field carries them) — this restates
@@ -2156,3 +2160,253 @@ questions requiring a new decision process.
 configuration → deployment → live browser QA → fix only what that QA
 surfaces → final documentation verification → final Git cleanup → push
 → demo prep.
+
+### Update (superseded detail, not the decision itself)
+Manual browser QA (per the ordering above) found a real local-dev bug
+this entry did not anticipate: `API_BASE`'s value of
+`http://127.0.0.1:8000` is no longer current — see "Local dev
+cookie/SameSite fix: frontend API_BASE → localhost" below for why it
+was changed and what broke. The two remaining *production* deployment
+edits this entry originally identified (CORS origin list, `API_BASE`
+pointed at the real deployed backend) are otherwise unchanged and still
+outstanding.
+
+---
+
+## Decision: Local dev cookie/SameSite fix: frontend API_BASE → localhost
+
+### Problem
+Manual browser QA found a real bug: the frontend (`http://localhost:5173`)
+called the backend at `http://127.0.0.1:8000`. `POST
+/watchlist/instruments/{id}/checkpoint` succeeded, but the request
+carried no `Cookie` header at all, and a browser refresh showed the
+just-checkpointed instrument back at `Baseline pending` — the
+`watchlist_owner` cookie was never being sent.
+
+### Why
+Under the `SameSite` cookie spec, `localhost` and `127.0.0.1` are
+different **sites** (a bare IP address and a hostname don't share a
+registrable domain, even resolving to the same machine) — a
+`SameSite=Lax` cookie is only attached to same-site requests or a
+top-level GET navigation, so every `fetch()` call from the `localhost`
+page to the `127.0.0.1` API was a cross-site subresource request, and
+the browser correctly withheld the cookie every time.
+
+### Alternatives considered
+- Loosen the cookie's `SameSite` attribute (e.g. to `None`).
+- Point the frontend's `API_BASE` at the same hostname the page itself
+  is served from (`localhost`), leaving the cookie configuration
+  untouched.
+
+### Why rejected
+Loosening `SameSite` was explicitly out of scope for this fix (the task
+that found this bug explicitly said not to touch cookie configuration
+or backend identity logic) and would have weakened a real CSRF
+mitigation to work around what was actually a same-machine
+hostname-vs-IP mismatch, not a genuine cross-site requirement.
+
+### Consequence
+`frontend/src/api.js`'s `API_BASE` changed from
+`'http://127.0.0.1:8000'` to `'http://localhost:8000'` — the one place
+all five API calls derive their base URL from. Frontend and backend are
+now both `localhost` (same site, different ports only, which
+`SameSite` ignores), so the cookie is attached correctly. No backend
+file, cookie attribute, or CORS entry changed — `http://localhost:5173`
+was already allowlisted. Testing must now use the `localhost:5173`
+frontend URL, not `127.0.0.1:5173`, for the cookie to work.
+
+---
+
+## Decision: Attention Engine explanation volume-threshold wording fix
+
+### Problem
+Manual browser QA surfaced a real attention card reading "RELIANCE
+moved +4.2% since your last check. Trading volume accelerated to 0.0×
+the rate observed before you last checked." `AttentionEngine.
+_build_explanation` appended the volume sentence whenever
+`volume_acceleration_available` was `True`, with no check that the
+ratio actually met `VOLUME_ACCELERATION_THRESHOLD` — an
+available-but-sub-threshold ratio (here, exactly `0.0`, since checkpoint
+and current volume happened to be equal) was worded as "acceleration"
+even though it did not contribute to the item's `attention_score` at
+all (`max(price_strength, 0.0)` — price alone).
+
+### Why
+This directly contradicted the wording this system had already locked
+elsewhere: `change_engine.py`'s own `_build_reason` (the persisted
+`ChangeEvent.reason`) only mentions volume when the signal was actually
+meaningful, never merely computable — the Attention Engine's separate
+explanation template (see the Attention Engine — Design section) had
+drifted from that same rule.
+
+### Alternatives considered
+- Leave the wording as-is (available implies mentionable).
+- Gate the volume clause on both `available` AND `ratio >=
+  VOLUME_ACCELERATION_THRESHOLD`, matching `_build_reason`'s existing
+  rule.
+
+### Why rejected
+Leaving it as-is would keep describing a non-event ("0.0×", or any
+other sub-threshold ratio) as an acceleration, misrepresenting exactly
+the kind of signal this product's core thesis depends on being honest
+about.
+
+### Consequence
+`attention_engine.py`'s `_build_explanation` now requires both
+conditions before appending the volume sentence; the raw
+`volume_acceleration_ratio`/`volume_acceleration_available` API fields
+are unchanged (only the explanation *string* changed). Three regression
+tests were added to `test_attention_engine.py` covering the exact `0.0`
+case, a non-zero sub-threshold case (`1.3`), and confirmation that a
+genuinely meaningful ratio (`>= 2.0`) still produces the volume clause.
+
+---
+
+## Decision: Attention card React-key identity fix
+
+### Problem
+Manual browser QA found `GET /watchlist/attention` correctly returning
+3 `attention_items` while the UI rendered 5 cards, with the browser
+console reporting duplicate React keys. `AttentionGroup` keyed each
+`AttentionCard` by `item.instrument_id`, but multiple independent
+`ChangeEvent`s can legitimately share one instrument (different
+`checkpoint_id`s, both still active) — exactly the case this hardening
+program's own checkpoint-lifecycle work established as correct,
+intended behavior, not a bug in itself.
+
+### Why
+`instrument_id` identifies which stock a card is about; it was never a
+promise of one-item-per-instrument in the `GET /watchlist/attention`
+contract. When two cards shared a key, React's reconciliation across a
+re-render (e.g. after a Mark Seen-triggered `loadAll()` shrank the
+array) could not reliably match old DOM nodes to new ones, leaving
+stale cards behind instead of removing them — a well-documented
+consequence of non-unique React keys, not a new class of bug requiring
+backend investigation.
+
+### Alternatives considered
+- A composite key (`${instrument_id}-${checkpoint_id}`).
+- `item.checkpoint_id` alone.
+
+### Why rejected
+`Checkpoint.id` is already a `uuid4()`-generated string, globally
+unique by construction — a composite key would add complexity for no
+additional safety.
+
+### Consequence
+`AttentionGroup`'s `key` and `AttentionCard`'s `detailsId` (used for the
+View Details toggle's `aria-controls`, which would otherwise also
+collide as a duplicate DOM `id`) both switched from `instrument_id` to
+`checkpoint_id`. This also more correctly serves an existing documented
+intent (`AttentionCard`'s own comment on preserving local `expanded`
+state across polling refreshes "because AttentionGroup keys each card
+by the stable item.instrument_id") — `checkpoint_id` is frozen while an
+event stays active, so that property holds exactly as before, now
+correctly even when two cards share an instrument. No scoring,
+grouping, filtering, API contract, or backend file changed.
+
+---
+
+## Decision: Attention card grid stretch fix
+
+### Problem
+A screenshot from manual QA showed that expanding one `AttentionCard`'s
+View Details section stretched every other card in the same grid row to
+match its height, leaving visible empty space in the collapsed ones.
+
+### Why
+`.attention-list` is `display: grid` with no `align-items` declared;
+CSS Grid's initial value is `stretch`, which fills every grid item to
+the tallest item in its row by default. Nothing in `.attention-card`
+overrode this.
+
+### Alternatives considered
+- Give `.attention-card` a fixed/min height.
+- Set `align-items: start` on the grid container (`.attention-list`).
+
+### Why rejected
+A fixed height would either clip a genuinely long expanded card or
+waste space for short ones; it solves the wrong axis of the problem.
+
+### Consequence
+One property added to `.attention-list`: `align-items: start`. An
+expanded card still grows to fit its own content; a collapsed sibling
+in the same row now sizes to its own natural height instead of
+stretching to match. `grid-template-columns` (the 3-column desktop
+layout and its single-column mobile override), card content, grouping,
+and all JS/JSX behavior are unchanged — this was a CSS-only fix.
+
+---
+
+## Decision: Add Stock curated suggestion dropdown; unrestricted instrument discovery deliberately not implemented
+
+### Problem
+Add Stock's symbol field was a bare text input with no discovery aid.
+The product wanted a searchable suggestion dropdown, but the natural
+follow-up question — should typing beyond a small curated list search a
+broader NSE/BSE instrument universe live? — required checking whether
+the existing market-data provider could actually support that safely
+before building anything.
+
+### Investigation performed
+`yfinance` 1.7.0 (the only provider this app depends on) does expose a
+`Search` class and a `Lookup` class. Both were inspected directly:
+`Search` wraps Yahoo's own undocumented, internal `/v1/finance/search`
+autocomplete endpoint — its `.quotes` property returns whatever raw
+fields Yahoo's JSON response happens to include, filtered only by "has
+a `symbol` key," with no field yfinance itself defines or guarantees
+for reliably filtering to one specific exchange; it is also a **global**
+search across every exchange Yahoo indexes, not one scoped to India.
+`Lookup` categorizes results by *asset type* (stock/etf/future/
+currency/index), not by exchange, and offers no exchange-constraint
+capability either. Neither is a documented, stable primitive for
+"give me only NSE (or only BSE) matches."
+
+### Decision
+Ship a frontend-maintained, curated static list of exactly 30 NSE and
+30 BSE companies (`frontend/src/stockSuggestions.js`) as the Add Stock
+suggestion dropdown — empty-query and substring (symbol or company
+name) search over this fixed list only. Do **not** build live,
+market-wide instrument discovery on top of `yfinance.Search`/`Lookup`.
+
+### Why
+Building discovery on an unofficial, undocumented endpoint with no
+verified exchange-filtering reliability would risk silently leaking a
+non-NSE/BSE match (e.g. a query like "Samsung" incorrectly returning
+some unrelated global result) through an unverified filter — exactly
+the kind of fabricated/assumed reliability this project's provider
+decisions have consistently refused elsewhere (see the original
+`yfinance` GO decision's "no invented rate limits" stance and the
+Freshness Model's "no fabricated exchange constraints" rule). It would
+also require a genuinely new backend capability (a search endpoint,
+since the frontend never talks to the provider directly per
+`architecture.md`'s own standing invariant) — out of proportion to a UI
+discovery aid. A curated list of real, verifiable large-cap symbols is
+honest about exactly what it is: a fast, deliberately small, backend-
+independent suggestion aid, not a claim of comprehensive market
+coverage.
+
+### Alternatives considered
+- Build live search on `yfinance.Search`, best-effort filtering on
+  whatever exchange-like field the response happens to include.
+- Hardcode a much larger (hundreds-of-symbol) static list to make
+  search feel broader.
+- The curated 30+30 list, honestly scoped (chosen).
+
+### Why rejected
+Live search was rejected per the Investigation above — no verified
+reliability to build on. A much larger hardcoded list was rejected
+because it would misrepresent a static list as market coverage without
+actually solving the underlying discovery problem, and was explicitly
+out of scope for this change.
+
+### Consequence
+`findStockSuggestion`/`filterStockSuggestions` (pure, case-insensitive
+helpers) are the only two functions the Add Stock form depends on;
+submission is rejected client-side (never reaching `POST
+/watchlist/instruments`) unless the typed text exactly matches a
+curated entry for the currently selected exchange. If broader discovery
+is wanted later, it is a new, separately-scoped milestone requiring its
+own live-network verification of exchange-filtering reliability (the
+same empirical-first discipline the original `yfinance` GO decision
+already established), not an extension of this curated list.
