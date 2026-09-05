@@ -354,7 +354,17 @@ decision.
   baseline_snapshot: {    # copy of the MarketSnapshot values at
     last_price,           # checkpoint time — frozen, not a live reference
     volume,
-    percent_change
+    percent_change,
+    price_threshold_applied  # the adaptive price threshold, computed
+                              # ONCE from this same snapshot's day_high/
+                              # day_low/previous_close (see Meaningful
+                              # Change Engine — Design) and frozen here
+                              # for this checkpoint's lifetime. float |
+                              # null — null only for a checkpoint written
+                              # before this field existed; a caller
+                              # reading a null value falls back to the
+                              # same 1.0% the Change Engine itself uses
+                              # when a range can't be derived.
   },
   source: "explicit" | "implicit"
 }
@@ -375,6 +385,15 @@ frozen historical baseline, not a pointer to a mutable document.
   detected_at,
   signals: {
     price_change_pct,
+    price_threshold_applied,  # the adaptive threshold actually applied
+                               # when THIS event was detected -- copied
+                               # from the checkpoint's own frozen
+                               # baseline_snapshot.price_threshold_applied
+                               # at detection time, not recomputed here.
+                               # float | null (null only for an event
+                               # created before this field existed; read
+                               # with the same 1.0% compatibility
+                               # fallback as the checkpoint field above).
     volume_acceleration_ratio,   # numeric value, OR null if unavailable
     volume_acceleration_available: bool   # false when checkpoint and
                                             # current snapshot are from
@@ -402,7 +421,14 @@ signals: price movement and volume anomaly.
 ```
 price_change_pct = (current.last_price - baseline.last_price) / baseline.last_price * 100
 ```
-Threshold: `abs(price_change_pct) >= PRICE_THRESHOLD_PCT`
+Threshold: `abs(price_change_pct) >= <this checkpoint's own adaptive
+price threshold>` — **CORRECTED from a fixed constant to a
+stock-adaptive value** (see the new "Adaptive Price Meaningful-Change
+Threshold" subsection immediately below, and `decisions.md`'s "Adaptive
+price meaningful-change threshold" entry for the full reasoning). The
+fixed `PRICE_THRESHOLD_PCT = 2.0` starting value described later in
+this section's original "Tunable parameters" note no longer exists in
+code.
 
 `last_price` is sourced per the confirmed Provider Field Mapping (see
 External Dependency section below): `fast_info.last_price`, with
@@ -417,6 +443,57 @@ current.previous_close * 100`, using `fast_info.previous_close`. We do
 not depend on any unverified provider-supplied percent-change field —
 this keeps the number we display fully traceable to two values we
 explicitly fetched and can verify ourselves.
+
+**Adaptive Price Meaningful-Change Threshold (replaces the original
+fixed 2.0% constant).**
+
+```
+day_range     = day_high - day_low
+range_percent = (day_range / previous_close) * 100
+adaptive_threshold = clamp(0.25 * range_percent, 0.5, 3.0)
+```
+
+`day_high`/`day_low` are today's intraday high/low, derived by
+`YFinanceProvider` from the SAME `history(period="1d", interval="1m")`
+DataFrame already fetched for `last_price`/`volume` — max/min of every
+valid (finite, positive) High/Low bar value, no separate provider call.
+`previous_close` is the existing, already-required `MarketSnapshot`
+field (already validated positive by the model). If `day_high`/`day_low`
+cannot be derived (missing, non-finite, non-positive, or
+`day_low > day_high` — a real impossibility, handled the same way
+negative volume is elsewhere in this design), `adaptive_threshold`
+falls back to a fixed **1.0%** — never a fabricated adaptive value.
+`day_high == day_low` (a genuinely zero observed range, e.g. very early
+in a session) is valid, not an error: `range_percent` is exactly 0 and
+the result correctly clamps to the 0.5% floor. Both clamp bounds
+(0.5%, 3.0%) are inclusive. All arithmetic uses full float precision;
+rounding happens only at display time.
+
+**Frozen per checkpoint, never recomputed from a later, wider range.**
+This is the critical semantic difference from the volume signal below:
+`adaptive_threshold` is computed exactly **once**, at the moment a
+checkpoint is explicitly established (`CheckpointService.
+create_checkpoint_from_snapshot`, from the same `MarketSnapshot` that
+supplies the checkpoint's `baseline_snapshot.last_price`), and persisted
+onto `baseline_snapshot.price_threshold_applied`. Every later
+`GET /watchlist` evaluation against that checkpoint reads this
+already-frozen value — it is never recomputed from the current,
+possibly-wider intraday range. The baseline price and the threshold
+together define the user's fixed "Since You Last Checked" comparison
+window for that checkpoint's lifetime; re-establishing the checkpoint
+(a later explicit Mark as Seen) computes and freezes a new threshold for
+the new version, exactly as the baseline price itself already does. See
+`decisions.md`'s "Adaptive price meaningful-change threshold" entry.
+
+The applied threshold is also persisted onto the resulting
+`ChangeEvent.signals.price_threshold_applied` at detection time (see
+the ChangeEvent Data Model section), so every detected event remains
+explainable using the exact number that made it meaningful — including
+by the Attention Engine's own scoring, see below. This deliberately
+does **not** introduce a Stable/Normal/Volatile classification, ATR,
+beta, historical volatility, or any ML/LLM component — the formula
+above is the entire mechanism, using data already fetched for other
+purposes.
 
 **Signal 2 — Volume anomaly (revised after explicit review, and further
 corrected for session boundaries)**
@@ -547,12 +624,14 @@ meaningful" without either tuning thresholds down or adding a real
 composite model later (explicitly deferred, not attempted now).
 
 **Tunable parameters (named constants, not buried magic numbers):**
-- `PRICE_THRESHOLD_PCT` — starting value: **2%**. Reasoning: Nifty 50
-  large-caps commonly move 0.5–1.5% intraday on ordinary days; 2% is
-  chosen as a starting point that filters routine noise while catching
-  genuine moves, based on typical large-cap daily volatility ranges. This
-  is explicitly a starting point to validate against real data during
-  build, not a value treated as final.
+- ~~`PRICE_THRESHOLD_PCT` — starting value: **2%**...~~ **SUPERSEDED.**
+  The fixed 2% price threshold described here was this section's
+  original starting point, later replaced by a stock-adaptive threshold
+  once real intraday-range data became available — see the "Adaptive
+  Price Meaningful-Change Threshold" subsection above and
+  `decisions.md`'s "Adaptive price meaningful-change threshold" entry.
+  `PRICE_THRESHOLD_PCT`/`PRICE_CHANGE_THRESHOLD_PCT` no longer exist as
+  constants in `change_engine.py`.
 - `VOLUME_RATIO_THRESHOLD` — starting value: **2.0x** acceleration.
   Reasoning: trading at double the rate observed earlier in the same
   session is a conventional, easily-explained "something is happening"
@@ -614,6 +693,23 @@ artificially suppress its rank) or as automatically maximal. No new
 scoring model is introduced; ranking reuses the Change Engine's own
 numbers so the "why is this ranked here" answer is always traceable to the
 same explanation already shown for the change itself.
+
+**Price normalization uses the event's own persisted adaptive
+threshold, never a shared fixed constant.** `normalized_price_signal =
+abs(price_change_pct) / price_threshold_applied`, reading
+`price_threshold_applied` directly off the `ChangeEvent.signals` this
+item was scored from (the value frozen at that event's own checkpoint —
+see the Adaptive Price Meaningful-Change Threshold subsection above).
+This is what makes an event that crossed a narrow 0.5% threshold
+correctly receive `normalized_price_signal >= 1.0` — normalizing against
+a fixed 2.0 constant instead would silently suppress it below the
+`WATCH` floor established below, violating this section's own invariant
+that a real `ChangeEvent`'s score can never legitimately fall below
+1.0. A `ChangeEvent` persisted before this field existed (nullable, for
+backward compatibility) is read with a safe fallback to the same 1.0%
+value the Change Engine itself falls back to when a threshold is
+unavailable, so an old event's score and displayed threshold always
+agree with each other.
 
 **Attention levels** (locked bands, inclusive lower bounds — matching
 the Change Engine's own inclusive `>=` threshold convention): `HIGH` when
@@ -887,6 +983,11 @@ results in a `MarketSnapshot.status` of `stale`/`invalid`/`unavailable`.
     but isn't theirs is rejected with the same 404 used for a genuinely
     nonexistent id, so a caller can never distinguish "not yours" from
     "doesn't exist."
+11. The adaptive price meaningful-change threshold is computed exactly
+    once, at explicit checkpoint creation, and frozen onto
+    `baseline_snapshot.price_threshold_applied` for that checkpoint
+    version's lifetime — it is never recomputed from a later, wider
+    intraday range on a subsequent `GET /watchlist` evaluation.
 
 ## Failure Modes & Responses
 
@@ -1020,6 +1121,7 @@ left untouched).
       "checkpoint_id": "9b8...",
       "detected_at": "2026-09-04T10:15:00+00:00",
       "price_change_pct": 4.2,
+      "price_threshold_applied": 2.5,
       "volume_acceleration_ratio": 2.3,
       "volume_acceleration_available": true,
       "attention_score": 2.1,
@@ -1164,10 +1266,17 @@ instrument was acknowledged.
 (`AttentionSection.jsx`), built entirely from props the card already
 has. No route, no modal, no API call, no checkpoint write, no
 acknowledgement — see `decisions.md`'s "View Details as a local
-expandable card" decision. Its "Result: Threshold crossed / Below
-threshold" row is a plain `>=` restatement of the same locked 2.0%/2.0×
-constants the backend already used to flag the item meaningful — it
-does not independently decide meaningfulness.
+expandable card" decision. Its "Meaningful threshold"/"Result: Threshold
+crossed / Below threshold" rows are a plain `>=` restatement of values
+the backend already computed and returned: the volume side against the
+still-fixed `VOLUME_ACCELERATION_THRESHOLD` (a local literal, unchanged);
+the price side against `item.price_threshold_applied`, the per-event
+adaptive threshold read directly from the API response — **not** a
+frontend constant (the old fixed `PRICE_CHANGE_THRESHOLD_PCT` literal
+this file used to duplicate no longer exists here, see decisions.md's
+"Adaptive price meaningful-change threshold" entry). Neither row
+independently decides meaningfulness or computes a threshold — both are
+comparisons of numbers the backend already supplied.
 
 **Attention card identity (React key)** — each rendered `AttentionCard`
 is keyed by `item.checkpoint_id`, not `item.instrument_id`. This matters

@@ -51,15 +51,26 @@ def make_snapshot(**overrides) -> MarketSnapshot:
     return MarketSnapshot(**defaults)
 
 
-def meaningful_change(checkpoint_price=100.0, current_price=110.0):
-    """10% price move -- well above the 2% threshold, price-only mode
-    (volume signal correctly reported unavailable, never fabricated)."""
-    return evaluate_change(checkpoint_price=checkpoint_price, current_price=current_price)
+def meaningful_change(checkpoint_price=100.0, current_price=110.0, price_threshold=None):
+    """10% price move -- well above any adaptive threshold in this
+    module's tested range (0.5%-3.0%, or the 1.0% fallback when
+    price_threshold is left as None), price-only mode (volume signal
+    correctly reported unavailable, never fabricated)."""
+    return evaluate_change(
+        checkpoint_price=checkpoint_price,
+        checkpoint_price_threshold=price_threshold,
+        current_price=current_price,
+    )
 
 
-def unmeaningful_change(checkpoint_price=100.0, current_price=100.5):
-    """0.5% price move -- below the 2% threshold."""
-    return evaluate_change(checkpoint_price=checkpoint_price, current_price=current_price)
+def unmeaningful_change(checkpoint_price=100.0, current_price=100.5, price_threshold=None):
+    """0.5% price move -- below the 1.0% fallback threshold applied when
+    price_threshold is left as None (the default here)."""
+    return evaluate_change(
+        checkpoint_price=checkpoint_price,
+        checkpoint_price_threshold=price_threshold,
+        current_price=current_price,
+    )
 
 
 # --- A: no checkpoint -> no ChangeEvent ------------------------------------
@@ -103,6 +114,38 @@ def test_explicit_checkpoint_and_meaningful_ok_change_creates_one_event(db):
     assert event.instrument_id == "inst123"
     assert event.acknowledged is False
     assert db.change_events.count_documents({}) == 1
+
+
+def test_created_event_persists_the_checkpoints_own_price_threshold(db):
+    """End-to-end: the checkpoint's OWN frozen price_threshold_applied
+    (computed once at checkpoint creation from make_snapshot()'s
+    day_high/day_low) must be what actually lands on the persisted
+    ChangeEvent.signals -- not a fixed constant, not recomputed here."""
+    snapshot = make_snapshot(day_high=110.0, day_low=100.0, previous_close=100.0)
+    checkpoint = CheckpointService(db).create_checkpoint_from_snapshot(
+        "user1", "inst123", snapshot
+    )
+    assert checkpoint.baseline_snapshot.price_threshold_applied == pytest.approx(2.5)
+
+    change_result = evaluate_change(
+        checkpoint_price=checkpoint.baseline_snapshot.last_price,
+        checkpoint_price_threshold=checkpoint.baseline_snapshot.price_threshold_applied,
+        current_price=checkpoint.baseline_snapshot.last_price * 1.03,  # +3% > 2.5% threshold
+    )
+    assert change_result.meaningful_change is True
+
+    service = ChangeEventService(db)
+    event = service.get_or_create_active(
+        user_id="user1",
+        instrument_id="inst123",
+        checkpoint=checkpoint,
+        snapshot_status=SnapshotStatus.OK,
+        change_result=change_result,
+    )
+
+    assert event.signals.price_threshold_applied == pytest.approx(2.5)
+    stored = db.change_events.find_one({"checkpoint_id": checkpoint.id})
+    assert stored["signals"]["price_threshold_applied"] == pytest.approx(2.5)
 
 
 def test_ok_snapshot_without_meaningful_change_creates_no_event(db):

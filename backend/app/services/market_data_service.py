@@ -140,6 +140,18 @@ class MarketDataService:
         # rather than premature.
         volume = quote.volume if quote.volume is not None and quote.volume >= 0 else 0
 
+        # day_high/day_low: same degrade-gracefully treatment as volume,
+        # for the same reason (feeds a downstream signal -- the adaptive
+        # price threshold -- that already has its own fallback for a
+        # missing/invalid range; must never invalidate the price itself).
+        # day_low > day_high is a real impossibility (like negative
+        # volume), so it is rejected the same way rather than passed
+        # through as a nonsensical range.
+        day_high = self._valid_finite_positive(quote.day_high)
+        day_low = self._valid_finite_positive(quote.day_low)
+        if day_high is not None and day_low is not None and day_low > day_high:
+            day_high, day_low = None, None
+
         status = self._compute_status(quote.fetched_at)
 
         return MarketSnapshot(
@@ -149,10 +161,22 @@ class MarketDataService:
             percent_change=percent_change,
             volume=volume,
             session_date=quote.session_date,
+            day_high=day_high,
+            day_low=day_low,
             fetched_at=quote.fetched_at,
             provider_timestamp=quote.provider_timestamp,
             status=status,
         )
+
+    @staticmethod
+    def _valid_finite_positive(value: float | None) -> float | None:
+        """None-safe finite-and-positive check, shared by the
+        day_high/day_low degrade-gracefully handling above."""
+        if value is None:
+            return None
+        if not math.isfinite(value) or value <= 0:
+            return None
+        return value
 
     @staticmethod
     def _compute_status(fetched_at: datetime) -> SnapshotStatus:

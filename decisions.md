@@ -766,6 +766,15 @@ change be reported correctly even when the volume signal cannot be
 computed, per the Phase 5 requirement that price signal alone is
 sufficient.
 
+### SUPERSEDED (price side only)
+`PRICE_CHANGE_THRESHOLD_PCT = 2.0` was later replaced by a stock-adaptive
+threshold — see "Adaptive price meaningful-change threshold" later in
+this log. `PRICE_CHANGE_THRESHOLD_PCT` no longer exists as a constant in
+`change_engine.py`. **`VOLUME_ACCELERATION_THRESHOLD = 2.0` is
+UNCHANGED and remains locked** — only the price side of this decision
+was superseded; the volume side, and this entry's own reasoning for it,
+still stand exactly as written above.
+
 ---
 
 ## Decision: No microservices, queues, Redis, Kafka, WebSockets, Kubernetes, or LLM in the core detection path
@@ -2410,3 +2419,147 @@ is wanted later, it is a new, separately-scoped milestone requiring its
 own live-network verification of exchange-filtering reliability (the
 same empirical-first discipline the original `yfinance` GO decision
 already established), not an extension of this curated list.
+
+---
+
+## Decision: Adaptive price meaningful-change threshold
+
+### Problem
+`PRICE_CHANGE_THRESHOLD_PCT = 2.0` (see "Locked starting thresholds,"
+marked superseded above) was one fixed percentage applied identically to
+every instrument, regardless of how volatile that specific stock's
+trading day actually was. A stock that typically moves 0.5% intraday and
+one that typically moves 6% intraday were held to the exact same bar —
+meaningful for one could be routine noise for the other, and genuinely
+unusual movement in the calmer stock could sit below the fixed threshold
+and never surface at all.
+
+### Decision
+Replace the fixed price threshold with a stock-adaptive one, computed
+from the instrument's own observed intraday range:
+
+```
+day_range     = day_high - day_low
+range_percent = (day_range / previous_close) * 100
+adaptive_threshold = clamp(0.25 * range_percent, 0.5, 3.0)
+```
+
+Both clamp bounds (0.5%, 3.0%) are inclusive. If `day_high`/`day_low`
+cannot be derived (missing, non-finite, non-positive, or
+`day_low > day_high`), `adaptive_threshold` falls back to a fixed
+**1.0%** — never a fabricated adaptive value. `day_high == day_low` (a
+genuinely zero observed range) is valid, not an error: it correctly
+clamps to the 0.5% floor. All arithmetic uses full float precision;
+rounding happens only at display time. `VOLUME_ACCELERATION_THRESHOLD =
+2.0` is completely unchanged — this decision only replaces the price
+side of the Meaningful Change Engine.
+
+**Frozen at checkpoint creation, never recomputed from a later, wider
+range.** The threshold is computed exactly once, at the moment a
+checkpoint is explicitly established
+(`CheckpointService.create_checkpoint_from_snapshot`, from the SAME
+`MarketSnapshot` that supplies `baseline_snapshot.last_price`), and
+persisted onto `baseline_snapshot.price_threshold_applied`. Every later
+`GET /watchlist` evaluation against that checkpoint reads this
+already-frozen value; it is never recomputed from the current day's
+(necessarily-expanding-as-the-day-progresses) intraday range. This is
+an explicit product requirement, not an implementation detail: the
+baseline price and the threshold together define the user's fixed
+"Since You Last Checked" comparison window for that checkpoint's
+lifetime — exactly the same freezing already applied to the baseline
+price itself (see "Checkpoint baseline stored as a frozen copy, not a
+live reference" earlier in this log). Re-establishing the checkpoint (a
+later explicit Mark as Seen) computes and freezes a new threshold for
+the new version, same as the baseline price does.
+
+The applied threshold is also copied onto the resulting
+`ChangeEvent.signals.price_threshold_applied` at detection time (not
+recomputed there either), so a detected event remains explainable using
+the exact number that made it meaningful, independent of whatever the
+checkpoint that spawned it looks like later.
+
+### Why
+A per-stock adaptive threshold is directly responsive to this product's
+own stated thesis (see "Product thesis" earlier in this log): surfacing
+what's genuinely unusual for *this* instrument, not applying one
+generic bar to every stock regardless of its own typical behavior. The
+`0.25 * range_percent` formula, clamped to [0.5%, 3.0%], keeps the
+result bounded and sane at both extremes (an extremely quiet stock
+still requires a real 0.5% move, not an arbitrarily tiny one; an
+extremely volatile stock is capped at 3.0%, not left unbounded) using
+only data already available — `day_high`/`day_low` come from the exact
+same intraday-bar DataFrame `YFinanceProvider` already fetches for
+`last_price`/`volume`, so this required no new provider call, no new
+network round trip, and no new external dependency. Freezing the
+threshold at checkpoint time (rather than recomputing it live on every
+`GET`) keeps the comparison window the user actually sees stable and
+predictable for as long as their checkpoint stands, instead of silently
+drifting as the trading day's realized range widens.
+
+### Alternatives considered
+- Keep the fixed 2.0% threshold (status quo).
+- An adaptive threshold recomputed fresh on every `GET /watchlist`
+  evaluation from the CURRENT day's day_high/day_low, rather than frozen
+  at checkpoint time.
+- A Stable/Normal/Volatile instrument classification, assigning one of
+  a small set of discrete threshold tiers per stock.
+- ATR (Average True Range), beta, historical volatility, or an ML/LLM-
+  based volatility estimate.
+- The adaptive formula above, frozen once per checkpoint (chosen).
+
+### Why rejected
+The fixed threshold was rejected per the Problem statement above — it
+was never adaptive to begin with, which is the entire gap this decision
+closes. Recomputing live on every `GET` was rejected because it makes
+"was this meaningful" a moving target for the SAME checkpoint across
+different requests, purely as a function of how much of the trading day
+has elapsed rather than anything about the checkpoint or the price
+itself — this directly conflicts with "the baseline and the threshold
+together define the user's fixed comparison window" above. A discrete
+Stable/Normal/Volatile classification was rejected as an unrequested,
+unjustified new abstraction layered on top of a continuous formula that
+already does the job directly — it would also reintroduce exactly the
+"one bucket for every stock in that bucket" coarseness this decision
+exists to remove, just with three buckets instead of one. ATR, beta,
+historical volatility, and ML/LLM approaches were all rejected as
+requiring historical data this system doesn't store (see the existing
+"no tick-level history" trade-off) and/or a new modeling component,
+disproportionate to what a same-day intraday-range formula already
+achieves with data already in hand — consistent with this project's
+standing rule (see "Volume-anomaly signal" and "No LLM..." decisions
+above) that added sophistication must be justified by a concrete,
+demonstrated need, not adopted because it looks more rigorous.
+
+### Consequence
+- `RawQuote`/`MarketSnapshot` gained two nullable fields (`day_high`,
+  `day_low`), derived by `YFinanceProvider` from its existing intraday
+  DataFrame — no new provider method, no new network call.
+- `BaselineSnapshot`/`ChangeSignals` each gained one nullable field
+  (`price_threshold_applied`) — nullable specifically so a
+  pre-migration checkpoint/ChangeEvent document remains readable without
+  a migration script; a missing value is read with a safe compatibility
+  fallback (`ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT = 1.0`) everywhere it
+  matters (change evaluation, attention scoring, frontend display) —
+  never null-propagated into a crash or a silently-wrong comparison.
+- `change_engine.py`'s `_evaluate_price_signal` now takes the resolved
+  threshold as a parameter rather than reading a module constant;
+  `evaluate_change` gained `checkpoint_price_threshold` (optional,
+  falling back to 1.0% when absent/invalid — the same philosophy as
+  this function's existing "does not trust its caller blindly" checks
+  on `checkpoint_price`/`current_price`).
+- `attention_engine.py`'s `_price_strength` now normalizes against the
+  event's own `price_threshold_applied`, not a shared constant — this
+  was REQUIRED, not optional, to preserve this system's own existing
+  invariant that a real `ChangeEvent`'s attention score can never
+  legitimately fall below the `WATCH` floor (1.0): normalizing a
+  0.5%-threshold event against the old fixed 2.0 would have silently
+  suppressed it below that floor.
+- The frontend's View Details panel (`AttentionSection.jsx`) no longer
+  duplicates a fixed `PRICE_CHANGE_THRESHOLD_PCT` literal — it reads
+  `item.price_threshold_applied` directly from the `GET
+  /watchlist/attention` response and only compares it against
+  `item.price_change_pct` (both already backend-provided numbers); no
+  threshold is computed client-side.
+- No Stable/Normal/Volatile classification, ATR, beta, historical
+  volatility, or ML/LLM component was introduced anywhere in this
+  change.

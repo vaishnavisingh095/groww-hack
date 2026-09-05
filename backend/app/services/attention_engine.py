@@ -38,7 +38,7 @@ from enum import Enum
 from bson import ObjectId
 
 from app.models.change_event import ChangeEvent
-from app.services.change_engine import PRICE_CHANGE_THRESHOLD_PCT, VOLUME_ACCELERATION_THRESHOLD
+from app.services.change_engine import ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT, VOLUME_ACCELERATION_THRESHOLD
 
 
 class AttentionLevel(str, Enum):
@@ -54,6 +54,7 @@ class AttentionItem:
     checkpoint_id: str
     detected_at: datetime
     price_change_pct: float
+    price_threshold_applied: float
     volume_acceleration_ratio: float | None
     volume_acceleration_available: bool
     attention_score: float
@@ -62,17 +63,26 @@ class AttentionItem:
     rank: int
 
 
-def _price_strength(price_change_pct: float) -> float:
+def _price_strength(price_change_pct: float, price_threshold_applied: float) -> float:
     """
-    How far past PRICE_CHANGE_THRESHOLD_PCT the move is, as a multiple.
-    Uses the ABSOLUTE value -- price_change_pct is signed (a drop is
-    negative), but "how strong is this signal" is a magnitude question,
-    exactly mirroring change_engine.py's own `abs(price_change_pct) >=
-    PRICE_CHANGE_THRESHOLD_PCT` meaningfulness check. Normalizing on the
-    signed value would rank a -6% move BELOW a +1% move under max(),
-    which is not what "attention-worthy" means.
+    How far past THIS EVENT'S OWN persisted adaptive price threshold the
+    move is, as a multiple. Uses the ABSOLUTE value -- price_change_pct
+    is signed (a drop is negative), but "how strong is this signal" is a
+    magnitude question, exactly mirroring change_engine.py's own
+    `abs(price_change_pct) >= price_threshold` meaningfulness check.
+    Normalizing on the signed value would rank a -6% move BELOW a +1%
+    move under max(), which is not what "attention-worthy" means.
+
+    Deliberately normalizes against `price_threshold_applied` -- the
+    threshold actually persisted on THIS ChangeEvent's own signals, per
+    its own checkpoint -- never a shared fixed constant. Two events can
+    legitimately have different thresholds (different stocks, different
+    observed intraday ranges at checkpoint time); this is what makes an
+    event that crossed a narrow 0.5% threshold correctly receive
+    strength >= 1.0, which a fixed-2.0-denominator normalization would
+    have silently suppressed.
     """
-    return abs(price_change_pct) / PRICE_CHANGE_THRESHOLD_PCT
+    return abs(price_change_pct) / price_threshold_applied
 
 
 def _volume_strength(volume_acceleration_ratio: float) -> float:
@@ -152,7 +162,18 @@ def score_change_event(*, symbol: str, change_event: ChangeEvent) -> AttentionIt
     overwritten by AttentionEngine.get_ranked_active_items.
     """
     signals = change_event.signals
-    strengths = [_price_strength(signals.price_change_pct)]
+    # Safe compatibility fallback for a ChangeEvent persisted before
+    # price_threshold_applied existed (the field is nullable exactly for
+    # this reason) -- resolved ONCE here, so scoring and the value
+    # exposed to the API/frontend below are always the same number,
+    # never silently different.
+    price_threshold_applied = (
+        signals.price_threshold_applied
+        if signals.price_threshold_applied is not None
+        else ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT
+    )
+
+    strengths = [_price_strength(signals.price_change_pct, price_threshold_applied)]
     if signals.volume_acceleration_available:
         strengths.append(_volume_strength(signals.volume_acceleration_ratio))
 
@@ -164,6 +185,7 @@ def score_change_event(*, symbol: str, change_event: ChangeEvent) -> AttentionIt
         checkpoint_id=change_event.checkpoint_id,
         detected_at=change_event.detected_at,
         price_change_pct=signals.price_change_pct,
+        price_threshold_applied=price_threshold_applied,
         volume_acceleration_ratio=signals.volume_acceleration_ratio,
         volume_acceleration_available=signals.volume_acceleration_available,
         attention_score=score,

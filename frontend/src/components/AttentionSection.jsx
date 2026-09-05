@@ -46,19 +46,22 @@ const STATUS_LABELS = {
   invalid: 'Invalid',
 }
 
-// Mirrors app/services/change_engine.py's PRICE_CHANGE_THRESHOLD_PCT and
-// VOLUME_ACCELERATION_THRESHOLD exactly (both locked at 2.0 -- see
-// decisions.md's "Locked starting thresholds"). These are backend-only
-// Python constants: no API response field ever carries them, so there
-// is no shared module to import across the Python/JS boundary without
-// adding a new backend field or a new shared dependency purely for this
-// UI, which is explicitly out of scope for this change. They are
-// duplicated here as plain literals instead, the same pattern this file
-// already uses for LEVEL_LABELS/WHY_IT_MATTERS (mirroring a backend-
-// defined concept locally rather than fetching it). If either backend
-// constant is ever changed, this copy must be updated by hand -- there
-// is no automatic sync.
-const PRICE_CHANGE_THRESHOLD_PCT = 2.0
+// VOLUME_ACCELERATION_THRESHOLD mirrors app/services/change_engine.py's
+// module constant exactly (locked at 2.0 -- see decisions.md's "Locked
+// starting thresholds"). No API response field carries it (it's a
+// fixed, shared constant, never per-event), so it's duplicated here as
+// a plain literal, the same pattern this file already uses for
+// LEVEL_LABELS/WHY_IT_MATTERS. If this backend constant is ever
+// changed, this copy must be updated by hand -- there is no automatic
+// sync.
+//
+// The PRICE threshold is deliberately NOT duplicated here as a
+// constant -- it is no longer fixed (see decisions.md's "Adaptive price
+// meaningful-change threshold" entry): each attention item carries its
+// own backend-computed, backend-persisted price_threshold_applied
+// value, read directly off `item` below. This is not a frontend
+// calculation -- it's the exact number the backend already applied,
+// only ever compared/displayed here, never derived.
 const VOLUME_ACCELERATION_THRESHOLD = 2.0
 
 function AttentionCard({ item, watchlistEntry, onMarkAsSeen, inFlight, actionError }) {
@@ -196,10 +199,15 @@ function AttentionCard({ item, watchlistEntry, onMarkAsSeen, inFlight, actionErr
           This explains HOW the item was detected: the existing
           meaningful-change rule applied to this item's own already-
           known values (never a new rule, never a new score -- "Result"
-          below is a plain >= comparison against the same locked 2.0%/
-          2.0x constants the backend itself uses), plus data-trust facts
-          not already prominent on the card. Built entirely from
-          item/watchlistEntry, already passed into this component. */}
+          below is a plain >= comparison of two already-backend-provided
+          numbers, item.price_change_pct and item.price_threshold_applied
+          -- the price threshold is per-event and adaptive, not a fixed
+          frontend constant, see decisions.md; volume still compares
+          against the locked VOLUME_ACCELERATION_THRESHOLD), plus
+          data-trust facts not already prominent on the card. Built
+          entirely from item/watchlistEntry, already passed into this
+          component -- no new calculation, only a comparison of values
+          the backend already computed. */}
       <button
         type="button"
         className="attention-details-toggle"
@@ -240,15 +248,19 @@ function AttentionCard({ item, watchlistEntry, onMarkAsSeen, inFlight, actionErr
           <div className="attention-details-row">
             <span className="attention-details-label">Meaningful threshold</span>
             <span className="attention-details-value">
-              ≥ {PRICE_CHANGE_THRESHOLD_PCT.toFixed(2)}%
+              {item.price_threshold_applied != null
+                ? `≥ ${item.price_threshold_applied.toFixed(2)}%`
+                : 'Not available'}
             </span>
           </div>
           <div className="attention-details-row">
             <span className="attention-details-label">Result</span>
             <span className="attention-details-value">
-              {Math.abs(item.price_change_pct) >= PRICE_CHANGE_THRESHOLD_PCT
-                ? 'Threshold crossed'
-                : 'Below threshold'}
+              {item.price_threshold_applied != null
+                ? Math.abs(item.price_change_pct) >= item.price_threshold_applied
+                  ? 'Threshold crossed'
+                  : 'Below threshold'
+                : 'Not available'}
             </span>
           </div>
 

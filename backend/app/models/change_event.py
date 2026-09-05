@@ -25,6 +25,15 @@ class ChangeSignals(BaseModel):
     price_change_pct: float
     volume_acceleration_ratio: float | None = None
     volume_acceleration_available: bool
+    # The adaptive price threshold actually applied when this event was
+    # detected (Checkpoint.baseline_snapshot.price_threshold_applied at
+    # that moment) -- persisted so this event's price signal remains
+    # explainable later without needing to re-derive it. Optional/
+    # nullable ONLY for backward compatibility with a ChangeEvent
+    # created before this field existed; a missing value must be read
+    # with a safe compatibility fallback (see attention_engine.py),
+    # never treated as "no threshold was ever applied."
+    price_threshold_applied: float | None = None
 
     @model_validator(mode="after")
     def ratio_presence_must_match_availability(self) -> "ChangeSignals":

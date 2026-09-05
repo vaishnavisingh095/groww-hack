@@ -89,3 +89,35 @@ def test_missing_checkpoint_id_is_rejected():
     del data["checkpoint_id"]
     with pytest.raises(ValidationError):
         ChangeEvent(**data)
+
+
+def test_price_threshold_applied_can_be_set_explicitly():
+    event = ChangeEvent(
+        **base_change_event(
+            signals=ChangeSignals(
+                price_change_pct=1.5,
+                volume_acceleration_ratio=None,
+                volume_acceleration_available=False,
+                price_threshold_applied=1.23,
+            )
+        )
+    )
+    assert event.signals.price_threshold_applied == 1.23
+
+
+def test_price_threshold_applied_defaults_to_none_for_backward_compatibility():
+    """A ChangeEvent/ChangeSignals document written before this field
+    existed must still construct without it -- the key is simply absent
+    from the dict, not merely None, matching how a real legacy MongoDB
+    document would look."""
+    legacy_signals_data = {
+        "price_change_pct": 1.5,
+        "volume_acceleration_ratio": None,
+        "volume_acceleration_available": False,
+        # price_threshold_applied deliberately omitted.
+    }
+    signals = ChangeSignals(**legacy_signals_data)
+    assert signals.price_threshold_applied is None
+
+    event = ChangeEvent(**base_change_event(signals=signals))
+    assert event.signals.price_threshold_applied is None

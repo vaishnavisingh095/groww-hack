@@ -40,6 +40,19 @@ class BaselineSnapshot(BaseModel):
     last_price: float = Field(..., gt=0)
     volume: int = Field(..., ge=0)
     percent_change: float
+    # The adaptive price meaningful-change threshold (see
+    # app.services.change_engine._compute_adaptive_price_threshold),
+    # computed ONCE from the same snapshot that established this
+    # checkpoint's baseline_snapshot.last_price, and frozen here for the
+    # lifetime of this checkpoint version -- future evaluations against
+    # this checkpoint read this value rather than recomputing it from a
+    # later, wider intraday range (see decisions.md's "Adaptive price
+    # meaningful-change threshold" entry for why this must not drift).
+    # Optional/nullable ONLY for backward compatibility with a
+    # checkpoint document written before this field existed; a missing
+    # value is treated as "unknown" by callers, which fall back to
+    # ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT (1.0) -- never fabricated.
+    price_threshold_applied: float | None = None
 
 
 class Checkpoint(BaseModel):

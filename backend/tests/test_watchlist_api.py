@@ -22,7 +22,7 @@ import app.routes.watchlist as watchlist_routes
 from app.db.indexes import ensure_indexes
 from app.main import app
 from app.providers.base import MarketDataProvider, RawQuote
-from app.services.change_engine import PRICE_CHANGE_THRESHOLD_PCT
+from app.services.change_engine import ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT
 
 
 class FakeProvider(MarketDataProvider):
@@ -905,8 +905,13 @@ def test_get_attention_includes_item_for_meaningful_change_with_correct_fields(
     assert item["volume_acceleration_ratio"] is None
     assert item["volume_acceleration_available"] is False
 
-    expected_score = abs(expected_pct) / PRICE_CHANGE_THRESHOLD_PCT
+    # The checkpoint created above was established from a FakeProvider
+    # quote with no day_high/day_low set (day_high/day_low default to
+    # None), so its price_threshold_applied resolved to
+    # ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT (1.0), not the old fixed 2.0.
+    expected_score = abs(expected_pct) / ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT
     assert item["attention_score"] == pytest.approx(expected_score, abs=1e-3)
+    assert item["price_threshold_applied"] == ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT
 
     # Lowercase string, never a Python Enum repr like "AttentionLevel.HIGH".
     assert item["attention_level"] == "high"

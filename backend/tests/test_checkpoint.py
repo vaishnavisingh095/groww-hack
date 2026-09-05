@@ -81,6 +81,35 @@ def test_missing_session_date_is_rejected():
         Checkpoint(**data)
 
 
+def test_baseline_snapshot_price_threshold_applied_defaults_to_none():
+    """Backward compatibility: a BaselineSnapshot/Checkpoint document
+    written before this field existed must still construct successfully
+    -- price_threshold_applied is optional, not required."""
+    baseline = BaselineSnapshot(last_price=100.0, volume=1000, percent_change=0.0)
+    assert baseline.price_threshold_applied is None
+
+
+def test_baseline_snapshot_accepts_explicit_price_threshold_applied():
+    baseline = BaselineSnapshot(
+        last_price=100.0, volume=1000, percent_change=0.0, price_threshold_applied=1.75
+    )
+    assert baseline.price_threshold_applied == 1.75
+
+
+def test_checkpoint_constructs_from_legacy_document_missing_threshold_field():
+    """Simulates reading a real pre-migration checkpoint document straight
+    out of MongoDB -- the key is entirely ABSENT, not merely None."""
+    legacy_data = base_checkpoint()
+    legacy_data["baseline_snapshot"] = {
+        "last_price": 1326.4,
+        "volume": 9122871,
+        "percent_change": 1.83,
+        # price_threshold_applied deliberately omitted.
+    }
+    cp = Checkpoint(**legacy_data)
+    assert cp.baseline_snapshot.price_threshold_applied is None
+
+
 def test_id_defaults_to_a_unique_value_per_instance():
     """Checkpoint.id is the durable, app-assigned identity a ChangeEvent
     references (checkpoint_id) -- distinct from MongoDB's own `_id`,

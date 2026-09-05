@@ -20,6 +20,7 @@ from pymongo.database import Database
 
 from app.models.checkpoint import BaselineSnapshot, Checkpoint, CheckpointSource
 from app.models.market_snapshot import MarketSnapshot
+from app.services.change_engine import _compute_adaptive_price_threshold
 
 
 class CheckpointService:
@@ -105,6 +106,16 @@ class CheckpointService:
         not duplicated between create_checkpoint_from_snapshot and
         ensure_initial_checkpoint.
         """
+        # Computed ONCE, here, from the exact snapshot establishing this
+        # checkpoint -- never recomputed later from a wider intraday
+        # range. This is what "the adaptive threshold must not drift
+        # for an existing checkpoint" means in practice: the value is
+        # frozen into baseline_snapshot alongside last_price/volume, not
+        # derived fresh on every future GET /watchlist evaluation.
+        price_threshold_applied = _compute_adaptive_price_threshold(
+            snapshot.day_high, snapshot.day_low, snapshot.previous_close
+        )
+
         checkpoint = Checkpoint(
             user_id=user_id,
             instrument_id=instrument_id,
@@ -114,6 +125,7 @@ class CheckpointService:
                 last_price=snapshot.last_price,
                 volume=snapshot.volume,
                 percent_change=snapshot.percent_change,
+                price_threshold_applied=price_threshold_applied,
             ),
             source=source,
         )

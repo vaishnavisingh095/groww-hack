@@ -1,32 +1,52 @@
 """
-Meaningful Change Engine — Phase 5.
+Meaningful Change Engine — Phase 5 (price threshold later made adaptive).
 
 Deterministic, explainable, no LLM. Combines two independent signals:
 
-1. Price movement: abs(price_change_pct) >= PRICE_CHANGE_THRESHOLD_PCT
+1. Price movement: abs(price_change_pct) >= an ADAPTIVE per-checkpoint
+   threshold, derived from the stock's own observed intraday range at
+   the moment the checkpoint was established (see
+   _compute_adaptive_price_threshold below and decisions.md's "Adaptive
+   price meaningful-change threshold" entry). This replaces the earlier
+   fixed PRICE_CHANGE_THRESHOLD_PCT = 2.0 constant, which no longer
+   exists in this module -- see that same decisions.md entry for why.
 2. Volume-rate acceleration (same trading session only):
-   volume_acceleration_ratio >= VOLUME_ACCELERATION_THRESHOLD
+   volume_acceleration_ratio >= VOLUME_ACCELERATION_THRESHOLD (UNCHANGED,
+   still locked at 2.0 -- this feature only replaces the price side).
 
-Formulas are exactly as specified in architecture.md's "Meaningful
-Change Engine — Design" section (price formula) and its "REQUIRED
-CORRECTION — Same-Session Volume Semantics" / rate-based volume
-definition (volume formula) -- this module implements that already-
-approved design, it does not introduce a new one.
+The volume formula is exactly as specified in architecture.md's
+"Meaningful Change Engine — Design" section's "REQUIRED CORRECTION —
+Same-Session Volume Semantics" / rate-based volume definition -- this
+module implements that already-approved design, it does not introduce
+a new one.
 
 Both signals are evaluated against the FROZEN checkpoint baseline
 (Checkpoint.baseline_snapshot), never against a live/mutable
 MarketSnapshot document, per architecture.md's frozen-copy rationale.
-This module does not read or write Checkpoint/MarketSnapshot documents
-itself -- it is a pure function of the values passed in, so it can be
-tested without MongoDB or network access.
+The adaptive price threshold is likewise frozen onto the checkpoint at
+the moment it is established (see checkpoint_service.py) and simply
+READ here, never recomputed from the current day's (expanding) range --
+this module does not read or write Checkpoint/MarketSnapshot documents
+itself, and remains a pure function of the values passed in, so it can
+be tested without MongoDB or network access.
 """
 import math
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
 from zoneinfo import ZoneInfo
 
-PRICE_CHANGE_THRESHOLD_PCT = 2.0
 VOLUME_ACCELERATION_THRESHOLD = 2.0
+
+# Adaptive price meaningful-change threshold (replaces the old fixed
+# PRICE_CHANGE_THRESHOLD_PCT = 2.0 -- see decisions.md). Named bounds,
+# not buried magic numbers, per this module's own existing convention.
+ADAPTIVE_PRICE_THRESHOLD_RANGE_MULTIPLIER = 0.25
+ADAPTIVE_PRICE_THRESHOLD_FLOOR_PCT = 0.5
+ADAPTIVE_PRICE_THRESHOLD_CEILING_PCT = 3.0
+# Used whenever a checkpoint's own day_high/day_low could not be
+# derived (missing, invalid, or day_low > day_high) at the moment that
+# checkpoint was established -- never a fabricated adaptive value.
+ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT = 1.0
 
 # NSE/BSE market open, per architecture.md's confirmed constant.
 _IST = ZoneInfo("Asia/Kolkata")
@@ -44,6 +64,12 @@ class PriceSignal:
     available: bool
     price_change_pct: float | None
     meaningful: bool
+    # The adaptive threshold actually applied to produce `meaningful`
+    # above -- None only on the early-return "no baseline"/"invalid
+    # current price" paths in evaluate_change, where no threshold was
+    # ever evaluated at all. Always populated (never None) whenever
+    # `available` is True.
+    threshold: float | None = None
 
 
 @dataclass
@@ -92,15 +118,63 @@ def _is_finite(value: float | None) -> bool:
     return math.isfinite(f)
 
 
-def _evaluate_price_signal(checkpoint_price: float, current_price: float) -> PriceSignal:
+def _compute_adaptive_price_threshold(
+    day_high: float | None, day_low: float | None, previous_close: float | None
+) -> float:
+    """
+    adaptive_threshold = clamp(0.25 * range_percent, 0.5, 3.0)
+    range_percent = (day_high - day_low) / previous_close * 100
+
+    Pure, deterministic, full-precision (no rounding until display).
+    Returns ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT (1.0) whenever the
+    inputs cannot support a defensible range calculation -- missing,
+    non-finite, non-positive day_high/day_low/previous_close, or
+    day_low > day_high (a real impossibility, like negative volume
+    elsewhere in this module) -- never a fabricated adaptive value.
+    day_high == day_low (a genuinely zero observed range, e.g. very
+    early in a session) is valid, not an error: range_percent is 0 and
+    the result correctly clamps to the 0.5% floor.
+
+    Deliberately called from checkpoint_service.py at checkpoint-
+    creation time (not from evaluate_change below) -- the resulting
+    value is frozen onto the checkpoint's own baseline and never
+    recomputed from a later, wider intraday range. See this module's
+    own docstring and decisions.md for why.
+    """
+    if (
+        not _is_finite_positive(day_high)
+        or not _is_finite_positive(day_low)
+        or not _is_finite_positive(previous_close)
+        or day_low > day_high
+    ):
+        return ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT
+
+    range_percent = (day_high - day_low) / previous_close * 100
+    return min(
+        max(ADAPTIVE_PRICE_THRESHOLD_RANGE_MULTIPLIER * range_percent, ADAPTIVE_PRICE_THRESHOLD_FLOOR_PCT),
+        ADAPTIVE_PRICE_THRESHOLD_CEILING_PCT,
+    )
+
+
+def _evaluate_price_signal(
+    checkpoint_price: float, current_price: float, price_threshold: float
+) -> PriceSignal:
     """
     price_change_pct = ((current_price - checkpoint_price) / checkpoint_price) * 100
     Threshold check uses the ABSOLUTE value; the signed value is kept
-    for the explanation/direction.
+    for the explanation/direction. `price_threshold` is the checkpoint's
+    own already-frozen adaptive threshold (see
+    _compute_adaptive_price_threshold) -- this function does not compute
+    or look up a threshold itself, only applies the one it's given.
     """
     price_change_pct = (current_price - checkpoint_price) / checkpoint_price * 100
-    meaningful = abs(price_change_pct) >= PRICE_CHANGE_THRESHOLD_PCT
-    return PriceSignal(available=True, price_change_pct=price_change_pct, meaningful=meaningful)
+    meaningful = abs(price_change_pct) >= price_threshold
+    return PriceSignal(
+        available=True,
+        price_change_pct=price_change_pct,
+        meaningful=meaningful,
+        threshold=price_threshold,
+    )
 
 
 def _evaluate_volume_signal(
@@ -226,16 +300,19 @@ def _build_reason(
     if price_meaningful and volume_meaningful:
         price_pct = price_signal.price_change_pct
         sign = "+" if price_pct >= 0 else ""
+        threshold = price_signal.threshold
         ratio = volume_signal.volume_acceleration_ratio
         return (
-            f"Price moved {sign}{price_pct:.1f}% and trading activity "
-            f"accelerated to {ratio:.1f}× its baseline rate."
+            f"Price moved {sign}{price_pct:.1f}%, exceeding the {threshold:.2f}% "
+            f"threshold, and trading activity accelerated to {ratio:.1f}× its "
+            f"baseline rate."
         )
 
     if price_meaningful:
         pct = price_signal.price_change_pct
         sign = "+" if pct >= 0 else ""
-        return f"Price moved {sign}{pct:.1f}% since your last check."
+        threshold = price_signal.threshold
+        return f"Price moved {sign}{pct:.1f}%, exceeding the {threshold:.2f}% threshold."
 
     ratio = volume_signal.volume_acceleration_ratio
     return f"Trading activity accelerated to {ratio:.1f}× its baseline rate."
@@ -244,6 +321,7 @@ def _build_reason(
 def evaluate_change(
     *,
     checkpoint_price: float | None,
+    checkpoint_price_threshold: float | None = None,
     checkpoint_volume: int | None = None,
     checkpoint_at: datetime | None = None,
     checkpoint_session_date: date | None = None,
@@ -254,6 +332,18 @@ def evaluate_change(
 ) -> ChangeResult:
     """
     Evaluate meaningful change against a frozen checkpoint baseline.
+
+    checkpoint_price_threshold is the checkpoint's own already-frozen
+    adaptive price threshold (Checkpoint.baseline_snapshot.
+    price_threshold_applied, computed once by
+    _compute_adaptive_price_threshold at checkpoint-creation time --
+    never recomputed here from a later, wider intraday range). If
+    omitted, None, or not a finite positive number, this function does
+    not trust its caller blindly (same philosophy as the checkpoint/
+    current price checks below) and falls back to
+    ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT -- this is also the safe
+    compatibility path for a checkpoint written before this field
+    existed.
 
     Price-only usage remains supported: if only checkpoint_price and
     current_price are given (volume/timestamp args left as None), the
@@ -306,7 +396,12 @@ def evaluate_change(
             reason="No meaningful change since your last check.",
         )
 
-    price_signal = _evaluate_price_signal(checkpoint_price, current_price)
+    resolved_price_threshold = (
+        checkpoint_price_threshold
+        if _is_finite_positive(checkpoint_price_threshold)
+        else ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT
+    )
+    price_signal = _evaluate_price_signal(checkpoint_price, current_price, resolved_price_threshold)
 
     volume_inputs_present = (
         checkpoint_volume is not None

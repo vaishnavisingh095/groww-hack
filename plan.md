@@ -262,8 +262,13 @@ Backend:
    CSPRNG-generated owner token — not an account/login system).
 3. Owner-scoped watchlist membership (`Watchlist.instrument_ids`
    activated as the real per-owner record; `Instrument` remains global).
-4. Deterministic price + volume meaningful-change engine (2.0% price /
-   2.0× volume-acceleration thresholds, locked).
+4. Deterministic price + volume meaningful-change engine. Volume
+   remains a locked 2.0× acceleration threshold. **Price is no longer a
+   fixed 2.0% threshold** — it's a stock-adaptive threshold
+   (`clamp(0.25 * intraday_range_pct, 0.5%, 3.0%)`, 1.0% fallback when
+   the range is unavailable/invalid), computed once at checkpoint
+   creation and frozen for that checkpoint's lifetime — see
+   `decisions.md`'s "Adaptive price meaningful-change threshold" entry.
 5. Session-aware volume acceleration (same-session only; cross-session
    comparisons explicitly unavailable, never fabricated).
 6. Checkpoint semantics (explicit-only advancement — observation never
@@ -315,6 +320,20 @@ Frontend:
     ChangeEvents.
 26. Attention card grid-alignment fix — `align-items: start` so an
     expanded card's row-mates no longer stretch to match its height.
+27. Frontend deployment configuration — `VITE_API_BASE_URL` env var
+    (Vite build-time, falls back to `localhost:8000`) and backend CORS/
+    cookie changes for the Vercel↔Render cross-site topology
+    (`SameSite=None; Secure` in production, `SameSite=Lax` unchanged in
+    local dev).
+28. Adaptive price meaningful-change threshold — replaces the fixed
+    2.0% price threshold with a stock-adaptive one derived from each
+    instrument's own observed intraday range, frozen per checkpoint at
+    the moment it's explicitly established (never recomputed from a
+    later, wider range); attention scoring updated to normalize against
+    each event's own persisted threshold; View Details now shows the
+    real per-event threshold instead of a hardcoded frontend constant.
+    See `decisions.md`'s "Adaptive price meaningful-change threshold"
+    entry for the full formula, bounds, and reasoning.
 
 **CURRENT (in progress / not yet done):**
 - Deployment configuration (see "Remaining" below) — a pre-deployment

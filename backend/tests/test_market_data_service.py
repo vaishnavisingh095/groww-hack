@@ -286,6 +286,70 @@ def test_negative_volume_from_provider_is_not_passed_through_as_negative():
     assert snapshots[0].volume == 0
 
 
+def test_valid_day_high_low_pass_through_unchanged():
+    provider = FakeProvider([make_quote(day_high=1340.0, day_low=1310.0)])
+    service = MarketDataService(provider)
+
+    snapshots = service.fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    assert snapshots[0].day_high == 1340.0
+    assert snapshots[0].day_low == 1310.0
+
+
+def test_missing_day_high_low_degrades_gracefully_price_still_usable():
+    """Per this feature's own requirement: missing range data must NOT
+    invalidate an otherwise-valid snapshot -- mirrors the existing
+    missing-volume behavior exactly."""
+    provider = FakeProvider([make_quote(day_high=None, day_low=None)])
+    service = MarketDataService(provider)
+
+    snapshots = service.fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    assert len(snapshots) == 1
+    assert snapshots[0].last_price == 1326.4
+    assert snapshots[0].day_high is None
+    assert snapshots[0].day_low is None
+
+
+def test_day_low_greater_than_day_high_degrades_to_none_not_invalidated():
+    """A real impossibility (like negative volume) -- must be rejected
+    rather than passed through as a nonsensical range, but must NOT
+    invalidate the otherwise-valid price."""
+    provider = FakeProvider([make_quote(day_high=100.0, day_low=110.0)])
+    service = MarketDataService(provider)
+
+    snapshots = service.fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    assert len(snapshots) == 1
+    assert snapshots[0].last_price == 1326.4
+    assert snapshots[0].day_high is None
+    assert snapshots[0].day_low is None
+
+
+def test_non_finite_day_high_low_degrades_to_none_not_invalidated():
+    provider = FakeProvider(
+        [make_quote(day_high=float("nan"), day_low=float("inf"))]
+    )
+    service = MarketDataService(provider)
+
+    snapshots = service.fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    assert len(snapshots) == 1
+    assert snapshots[0].day_high is None
+    assert snapshots[0].day_low is None
+
+
+def test_negative_or_zero_day_high_low_degrades_to_none_not_invalidated():
+    provider = FakeProvider([make_quote(day_high=0.0, day_low=-5.0)])
+    service = MarketDataService(provider)
+
+    snapshots = service.fetch_snapshots({"RELIANCE.NS": "inst123"})
+
+    assert len(snapshots) == 1
+    assert snapshots[0].day_high is None
+    assert snapshots[0].day_low is None
+
+
 def test_provider_total_failure_does_not_crash_service():
     """Simulates the provider returning a failed RawQuote for every
     symbol (e.g., total outage) -- must return an empty list, not raise."""

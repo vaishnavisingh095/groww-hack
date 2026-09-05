@@ -52,6 +52,15 @@ class MarketSnapshot(BaseModel):
 
     session_date: date
 
+    # Today's intraday high/low, feeding the adaptive price
+    # meaningful-change threshold (see change_engine.py). Nullable and
+    # deliberately unvalidated beyond typing here -- a missing or
+    # invalid range must degrade gracefully (the threshold computation
+    # has its own documented fallback) rather than invalidating an
+    # otherwise-valid snapshot, matching how `volume` already degrades.
+    day_high: float | None = None
+    day_low: float | None = None
+
     fetched_at: datetime
     provider_timestamp: int | None = Field(
         default=None,

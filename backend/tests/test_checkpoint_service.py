@@ -35,6 +35,66 @@ def make_snapshot(**overrides) -> MarketSnapshot:
     return MarketSnapshot(**defaults)
 
 
+def test_create_checkpoint_computes_and_persists_adaptive_price_threshold(db):
+    """The adaptive price threshold is computed ONCE, from the exact
+    snapshot establishing this checkpoint (day_high=110, day_low=100,
+    previous_close=100 -> range_percent=10.0 -> 0.25*10.0=2.5), and
+    persisted onto baseline_snapshot.price_threshold_applied."""
+    service = CheckpointService(db)
+    snapshot = make_snapshot(day_high=110.0, day_low=100.0, previous_close=100.0)
+
+    checkpoint = service.create_checkpoint_from_snapshot("user1", "inst123", snapshot)
+
+    assert checkpoint.baseline_snapshot.price_threshold_applied == pytest.approx(2.5)
+    fetched = service.get_checkpoint("user1", "inst123")
+    assert fetched.baseline_snapshot.price_threshold_applied == pytest.approx(2.5)
+
+
+def test_create_checkpoint_with_missing_range_falls_back_to_default_threshold(db):
+    """A snapshot with no day_high/day_low (the common case today, since
+    not every provider path populates them) must not fail checkpoint
+    creation -- falls back to ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT."""
+    from app.services.change_engine import ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT
+
+    service = CheckpointService(db)
+    snapshot = make_snapshot()  # day_high/day_low default to None
+
+    checkpoint = service.create_checkpoint_from_snapshot("user1", "inst123", snapshot)
+
+    assert checkpoint.baseline_snapshot.price_threshold_applied == ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT
+
+
+def test_checkpoint_threshold_does_not_drift_when_replaced_with_wider_range(db):
+    """CRITICAL invariant (explicit product requirement): re-establishing
+    a checkpoint with a DIFFERENT observed range produces a NEW, distinct
+    threshold on the NEW checkpoint version -- but the value is frozen
+    per checkpoint VERSION, never silently recomputed in place. This
+    proves the mechanism (computed fresh only at explicit
+    create/replace time, not on any read), which is what
+    'the threshold must not drift from a later, wider range' means: it
+    only changes when the user explicitly re-acknowledges, exactly like
+    baseline_snapshot.last_price itself already does."""
+    service = CheckpointService(db)
+
+    narrow_snapshot = make_snapshot(day_high=100.4, day_low=100.0, previous_close=100.0)
+    first = service.create_checkpoint_from_snapshot("user1", "inst123", narrow_snapshot)
+    assert first.baseline_snapshot.price_threshold_applied == pytest.approx(0.5)  # clamped to floor
+
+    # The SAME (user, instrument) checkpoint is explicitly re-established
+    # later in the day, once the observed range has widened considerably.
+    wide_snapshot = make_snapshot(day_high=150.0, day_low=100.0, previous_close=100.0)
+    second = service.create_checkpoint_from_snapshot("user1", "inst123", wide_snapshot)
+    assert second.baseline_snapshot.price_threshold_applied == pytest.approx(3.0)  # clamped to ceiling
+
+    # Only the latest (explicitly re-established) version is stored --
+    # this is the SAME "advancing replaces, never adds" behavior already
+    # exercised by test_creating_checkpoint_twice_replaces_not_duplicates,
+    # now also proven for the threshold field specifically.
+    fetched = service.get_checkpoint("user1", "inst123")
+    assert fetched.baseline_snapshot.price_threshold_applied == pytest.approx(3.0)
+    assert fetched.id == second.id
+
+
 def test_get_checkpoint_returns_none_when_none_exists(db):
     service = CheckpointService(db)
     result = service.get_checkpoint("user1", "inst123")

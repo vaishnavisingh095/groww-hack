@@ -86,9 +86,14 @@ class YFinanceProvider(MarketDataProvider):
         try:
             ticker = yf.Ticker(symbol)
 
-            last_price, volume, session_date, intraday_error = self._get_intraday_price_and_volume(
-                ticker
-            )
+            (
+                last_price,
+                volume,
+                session_date,
+                day_high,
+                day_low,
+                intraday_error,
+            ) = self._get_intraday_price_and_volume(ticker)
 
             previous_close, previous_close_error = self._get_previous_close(ticker)
 
@@ -127,6 +132,8 @@ class YFinanceProvider(MarketDataProvider):
                 fetched_at=fetched_at,
                 fetch_succeeded=True,
                 session_date=session_date,
+                day_high=day_high,
+                day_low=day_low,
             )
 
         except Exception as e:
@@ -149,7 +156,7 @@ class YFinanceProvider(MarketDataProvider):
 
     def _get_intraday_price_and_volume(
         self, ticker: "yf.Ticker"
-    ) -> tuple[float | None, int | None, date | None, str | None]:
+    ) -> tuple[float | None, int | None, date | None, float | None, float | None, str | None]:
         """
         Fetch the most recent 1-minute intraday bars and derive:
           - last_price: the latest bar with a valid (finite, positive) Close.
@@ -163,12 +170,19 @@ class YFinanceProvider(MarketDataProvider):
             most recently COMPLETED session's bars when the market is
             closed, so the bars' own date is not guaranteed to be
             "today."
+          - day_high / day_low: the max/min of every valid (finite,
+            positive) High/Low value across the SAME bars -- no separate
+            provider call. Independently optional: a price/volume/
+            session_date fetch can still succeed even when a valid
+            day_high/day_low cannot be derived, since the adaptive price
+            threshold this feeds has its own documented fallback for
+            exactly that case.
 
-        Returns (last_price, volume, session_date, error_message). Never
-        raises; empty/malformed data results in
-        (None, None, None, <reason>), which the caller treats as a
-        failed fetch for this symbol -- never a fabricated price,
-        volume, or session date.
+        Returns (last_price, volume, session_date, day_high, day_low,
+        error_message). Never raises; a failed PRICE fetch results in
+        (None, None, None, None, None, <reason>), which the caller
+        treats as a failed fetch for this symbol -- never a fabricated
+        price, volume, session date, or range.
 
         Conservative handling of malformed bars: a bar with a
         NaN/inf/non-positive Close is skipped when searching for the
@@ -178,22 +192,23 @@ class YFinanceProvider(MarketDataProvider):
         NaN/negative Volume is excluded from the sum rather than
         treated as zero or aborting the whole calculation -- one bad
         minute must not zero out or invalidate the entire session's
-        volume figure.
+        volume figure. The same conservative filtering applies to
+        High/Low when computing day_high/day_low.
         """
         try:
             bars = ticker.history(period="1d", interval="1m")
         except Exception as e:
-            return None, None, None, f"history() fetch failed: {type(e).__name__}: {e}"
+            return None, None, None, None, None, f"history() fetch failed: {type(e).__name__}: {e}"
 
         if bars is None or bars.empty:
-            return None, None, None, "history() returned no intraday bars"
+            return None, None, None, None, None, "history() returned no intraday bars"
 
         if "Close" not in bars.columns or "Volume" not in bars.columns:
-            return None, None, None, "history() response missing Close/Volume columns"
+            return None, None, None, None, None, "history() response missing Close/Volume columns"
 
         latest_valid = self._latest_valid_close(bars)
         if latest_valid is None:
-            return None, None, None, "no bar had a valid (finite, positive) Close"
+            return None, None, None, None, None, "no bar had a valid (finite, positive) Close"
         last_price, session_date = latest_valid
 
         volume = self._sum_valid_volume(bars)
@@ -203,7 +218,40 @@ class YFinanceProvider(MarketDataProvider):
         # the whole fetch, per the existing "missing/invalid PRICE
         # invalidates the update; volume degrades gracefully" rule
         # preserved from market_data_service.py's Invalid Data Rules.
-        return last_price, volume, session_date, None
+        day_high, day_low = self._day_high_low(bars)
+        return last_price, volume, session_date, day_high, day_low, None
+
+    @staticmethod
+    def _day_high_low(bars) -> tuple[float | None, float | None]:
+        """Max/min of every valid (finite, positive) High/Low value
+        across the given bars. Returns (None, None) if the columns are
+        missing or no bar has a valid value -- never a fabricated range,
+        and never raises (a missing/invalid range must not affect the
+        price/volume fetch this is derived alongside)."""
+        if "High" not in bars.columns or "Low" not in bars.columns:
+            return None, None
+
+        valid_highs = []
+        for v in bars["High"].tolist():
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(f) and f > 0:
+                valid_highs.append(f)
+
+        valid_lows = []
+        for v in bars["Low"].tolist():
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(f) and f > 0:
+                valid_lows.append(f)
+
+        if not valid_highs or not valid_lows:
+            return None, None
+        return max(valid_highs), min(valid_lows)
 
     @staticmethod
     def _latest_valid_close(bars) -> tuple[float, date] | None:

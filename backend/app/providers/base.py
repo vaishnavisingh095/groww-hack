@@ -44,6 +44,16 @@ class RawQuote:
     # was found (fetch_succeeded=False).
     session_date: date | None = None
 
+    # Today's intraday high/low, for the adaptive price meaningful-change
+    # threshold (see change_engine.py's _compute_adaptive_price_threshold).
+    # Derived from the SAME intraday bar data last_price/volume already
+    # come from -- no separate provider call. None when unavailable or
+    # not derivable; a missing/invalid range must degrade gracefully
+    # (fall back to a fixed threshold), never invalidate an otherwise
+    # valid quote.
+    day_high: float | None = None
+    day_low: float | None = None
+
 
 class MarketDataProvider(ABC):
     """

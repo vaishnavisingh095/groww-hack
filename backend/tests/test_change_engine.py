@@ -1,10 +1,23 @@
 """
-Tests for the Phase 5 Meaningful Change Engine.
+Tests for the Meaningful Change Engine.
 
-All tests are pure unit tests against evaluate_change() -- no MongoDB,
-no network, no live Yahoo Finance. Timestamps are constructed explicitly
-so every test is fully deterministic (see the rehearsal's own lesson:
-tests must prove the formula, not just "look plausible").
+All tests are pure unit tests against evaluate_change() / the adaptive
+price-threshold helper -- no MongoDB, no network, no live Yahoo Finance.
+Timestamps are constructed explicitly so every test is fully
+deterministic (see the rehearsal's own lesson: tests must prove the
+formula, not just "look plausible").
+
+Price threshold history: this module originally locked
+PRICE_CHANGE_THRESHOLD_PCT = 2.0 as a fixed constant. It has since been
+replaced by a stock-adaptive threshold (see
+_compute_adaptive_price_threshold and decisions.md's "Adaptive price
+meaningful-change threshold" entry) -- PRICE_CHANGE_THRESHOLD_PCT no
+longer exists in change_engine.py. The price-boundary tests below that
+predate this change now pass an EXPLICIT price_threshold to
+price_only()/with_volume() (defaulting to 2.0, the old locked value, so
+their original numeric intent and names are preserved unchanged) rather
+than relying on a module constant. VOLUME_ACCELERATION_THRESHOLD is
+UNCHANGED and remains a real module constant throughout.
 """
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -12,8 +25,12 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from app.services.change_engine import (
-    PRICE_CHANGE_THRESHOLD_PCT,
+    ADAPTIVE_PRICE_THRESHOLD_CEILING_PCT,
+    ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT,
+    ADAPTIVE_PRICE_THRESHOLD_FLOOR_PCT,
+    ADAPTIVE_PRICE_THRESHOLD_RANGE_MULTIPLIER,
     VOLUME_ACCELERATION_THRESHOLD,
+    _compute_adaptive_price_threshold,
     evaluate_change,
 )
 
@@ -35,20 +52,41 @@ def ist_time_on_session(hour: int, minute: int) -> datetime:
 CHECKPOINT_AT = ist_time_on_session(10, 15)
 CHECKPOINT_VOLUME = 60_000  # 60 minutes since open -> rate_before = 1000/min
 
+# The old locked constant's value, kept here ONLY as a literal default
+# for tests below that predate the adaptive threshold and were written
+# reasoning about "the 2% threshold" -- not a reintroduction of the
+# removed module constant.
+_LEGACY_PRICE_THRESHOLD_PCT = 2.0
 
-def price_only(checkpoint_price, current_price):
+
+def price_only(checkpoint_price, current_price, price_threshold=_LEGACY_PRICE_THRESHOLD_PCT):
     """Call evaluate_change with price args only -- volume signal must
-    be reported unavailable, never fabricated, in this mode."""
-    return evaluate_change(checkpoint_price=checkpoint_price, current_price=current_price)
+    be reported unavailable, never fabricated, in this mode. Defaults
+    price_threshold to the old locked 2.0 value so existing call sites
+    below need no other changes; pass an explicit value to test a
+    specific adaptive threshold, or None to exercise the real
+    ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT fallback path."""
+    return evaluate_change(
+        checkpoint_price=checkpoint_price,
+        checkpoint_price_threshold=price_threshold,
+        current_price=current_price,
+    )
 
 
-def with_volume(checkpoint_price, current_price, current_volume, minutes_after_checkpoint):
+def with_volume(
+    checkpoint_price,
+    current_price,
+    current_volume,
+    minutes_after_checkpoint,
+    price_threshold=_LEGACY_PRICE_THRESHOLD_PCT,
+):
     """Call evaluate_change with full price+volume+timing args. Volume
     delta and elapsed time are chosen by the caller; current_fetched_at
     is derived from CHECKPOINT_AT + minutes_after_checkpoint."""
     current_fetched_at = CHECKPOINT_AT + timedelta(minutes=minutes_after_checkpoint)
     return evaluate_change(
         checkpoint_price=checkpoint_price,
+        checkpoint_price_threshold=price_threshold,
         checkpoint_volume=CHECKPOINT_VOLUME,
         checkpoint_at=CHECKPOINT_AT,
         checkpoint_session_date=SESSION_DATE,
@@ -57,6 +95,118 @@ def with_volume(checkpoint_price, current_price, current_volume, minutes_after_c
         current_fetched_at=current_fetched_at,
         current_session_date=SESSION_DATE,
     )
+
+
+# ============================================================
+# _compute_adaptive_price_threshold -- pure formula tests
+# ============================================================
+
+
+def test_adaptive_threshold_normal_calculation():
+    """day_high=110, day_low=100, previous_close=100 -> range_percent =
+    (10/100)*100 = 10.0 -> 0.25*10.0 = 2.5, within [0.5, 3.0] -> 2.5."""
+    result = _compute_adaptive_price_threshold(day_high=110.0, day_low=100.0, previous_close=100.0)
+    assert result == pytest.approx(2.5, abs=1e-9)
+
+
+def test_adaptive_threshold_exactly_at_floor():
+    """A very narrow range should clamp UP to exactly 0.5%, inclusive."""
+    # range_percent = (100.4 - 100.0)/100 * 100 = 0.4 -> 0.25*0.4 = 0.1 -> clamps to 0.5
+    result = _compute_adaptive_price_threshold(day_high=100.4, day_low=100.0, previous_close=100.0)
+    assert result == pytest.approx(ADAPTIVE_PRICE_THRESHOLD_FLOOR_PCT, abs=1e-9)
+
+
+def test_adaptive_threshold_exactly_at_ceiling():
+    """A wide range should clamp DOWN to exactly 3.0%, inclusive."""
+    # range_percent = (150 - 100)/100 * 100 = 50 -> 0.25*50 = 12.5 -> clamps to 3.0
+    result = _compute_adaptive_price_threshold(day_high=150.0, day_low=100.0, previous_close=100.0)
+    assert result == pytest.approx(ADAPTIVE_PRICE_THRESHOLD_CEILING_PCT, abs=1e-9)
+
+
+def test_adaptive_threshold_computed_value_below_floor_clamps_up():
+    """0.25 * range_percent landing below 0.5 must clamp UP, never be
+    returned as-is."""
+    # range_percent = 1.0 -> 0.25*1.0 = 0.25 < 0.5 floor
+    result = _compute_adaptive_price_threshold(day_high=101.0, day_low=100.0, previous_close=100.0)
+    assert result == pytest.approx(ADAPTIVE_PRICE_THRESHOLD_FLOOR_PCT, abs=1e-9)
+
+
+def test_adaptive_threshold_computed_value_above_ceiling_clamps_down():
+    """0.25 * range_percent landing above 3.0 must clamp DOWN, never be
+    returned as-is."""
+    # range_percent = 20 -> 0.25*20 = 5.0 > 3.0 ceiling
+    result = _compute_adaptive_price_threshold(day_high=120.0, day_low=100.0, previous_close=100.0)
+    assert result == pytest.approx(ADAPTIVE_PRICE_THRESHOLD_CEILING_PCT, abs=1e-9)
+
+
+def test_adaptive_threshold_day_high_equals_day_low_is_valid_zero_range():
+    """A genuinely zero observed intraday range (e.g. very early in a
+    session) is valid, not an error -- range_percent is exactly 0 and
+    the result correctly clamps to the 0.5% floor, never treated as
+    unavailable/invalid."""
+    result = _compute_adaptive_price_threshold(day_high=100.0, day_low=100.0, previous_close=100.0)
+    assert result == pytest.approx(ADAPTIVE_PRICE_THRESHOLD_FLOOR_PCT, abs=1e-9)
+
+
+def test_adaptive_threshold_day_low_greater_than_day_high_is_invalid_fallback():
+    """A real impossibility (like negative volume elsewhere in this
+    module) -- must fall back, never produce a negative range_percent."""
+    result = _compute_adaptive_price_threshold(day_high=99.0, day_low=100.0, previous_close=100.0)
+    assert result == ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT
+
+
+@pytest.mark.parametrize(
+    "day_high,day_low,previous_close",
+    [
+        (None, 100.0, 100.0),
+        (110.0, None, 100.0),
+        (110.0, 100.0, None),
+        (None, None, None),
+    ],
+)
+def test_adaptive_threshold_none_range_values_fall_back(day_high, day_low, previous_close):
+    result = _compute_adaptive_price_threshold(day_high, day_low, previous_close)
+    assert result == ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT
+
+
+@pytest.mark.parametrize(
+    "day_high,day_low,previous_close",
+    [
+        (float("nan"), 100.0, 100.0),
+        (110.0, float("nan"), 100.0),
+        (110.0, 100.0, float("nan")),
+        (float("inf"), 100.0, 100.0),
+        (110.0, float("-inf"), 100.0),
+        (110.0, 100.0, float("inf")),
+    ],
+)
+def test_adaptive_threshold_nan_or_infinite_inputs_fall_back(day_high, day_low, previous_close):
+    result = _compute_adaptive_price_threshold(day_high, day_low, previous_close)
+    assert result == ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT
+
+
+def test_adaptive_threshold_zero_or_negative_previous_close_falls_back():
+    """previous_close is already validated positive by MarketSnapshot in
+    production, but this pure function does not trust its caller
+    blindly (same philosophy as the rest of this module)."""
+    assert _compute_adaptive_price_threshold(110.0, 100.0, 0.0) == ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT
+    assert _compute_adaptive_price_threshold(110.0, 100.0, -50.0) == ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT
+
+
+def test_adaptive_threshold_uses_full_precision_not_rounded():
+    """The formula itself must not round intermediate values -- only a
+    UI display boundary may round."""
+    # range_percent = (101.0 - 100.0)/137.0 * 100 = 0.729927007...
+    # 0.25 * that = 0.182481752... -> clamps to the 0.5 floor either way,
+    # so instead pick inputs that land BETWEEN the clamp bounds to prove
+    # the raw computed value (not a rounded one) is what's returned.
+    day_high, day_low, previous_close = 106.3, 100.0, 100.0
+    expected_range_percent = (day_high - day_low) / previous_close * 100  # 6.3
+    expected = ADAPTIVE_PRICE_THRESHOLD_RANGE_MULTIPLIER * expected_range_percent  # 1.575
+    assert 0.5 < expected < 3.0  # sanity: genuinely between the clamp bounds
+    result = _compute_adaptive_price_threshold(day_high, day_low, previous_close)
+    assert result == pytest.approx(expected, abs=1e-12)
+    assert result == pytest.approx(1.575, abs=1e-9)
 
 
 # ---------- 1. No checkpoint ----------
@@ -72,7 +222,7 @@ def test_no_checkpoint_is_baseline_pending_not_meaningful():
     assert result.reason == "Baseline pending — no previous check to compare against."
 
 
-# ---------- 2-6. Price signal boundaries and direction ----------
+# ---------- 2-6. Price signal boundaries and direction (explicit 2.0% threshold) ----------
 
 
 def test_price_plus_1_9_percent_is_not_meaningful():
@@ -116,7 +266,83 @@ def test_price_minus_2_4_percent_meaningful_with_negative_explanation():
     assert result.price_change_pct == pytest.approx(-2.4, abs=0.001)
 
 
-# ---------- 7-9. Volume signal boundaries ----------
+# ---------- Adaptive-threshold-specific price meaningfulness ----------
+
+
+def test_0_6_percent_move_meaningful_with_0_5_percent_threshold():
+    """New adaptive-specific case: a move well below the OLD fixed 2.0%
+    is correctly meaningful against a narrow adaptive threshold."""
+    result = price_only(checkpoint_price=100.0, current_price=100.6, price_threshold=0.5)
+
+    assert result.price_signal.meaningful is True
+    assert result.meaningful_change is True
+    assert result.price_signal.threshold == 0.5
+
+
+def test_2_5_percent_move_not_meaningful_with_3_0_percent_threshold():
+    """New adaptive-specific case: a move that WOULD have been
+    meaningful against the old fixed 2.0% is correctly NOT meaningful
+    against a wide adaptive threshold."""
+    result = price_only(checkpoint_price=100.0, current_price=102.5, price_threshold=3.0)
+
+    assert result.price_signal.meaningful is False
+    assert result.meaningful_change is False
+    assert result.price_signal.threshold == 3.0
+
+
+def test_price_threshold_inclusive_at_an_arbitrary_adaptive_value():
+    """Exactly-at-threshold inclusivity must hold for ANY threshold
+    value, not just the old fixed 2.0 -- proven here at 1.23%."""
+    result = price_only(checkpoint_price=100.0, current_price=101.23, price_threshold=1.23)
+
+    assert result.price_signal.meaningful is True
+    assert result.meaningful_change is True
+
+
+def test_negative_price_movement_uses_absolute_value_against_adaptive_threshold():
+    result = price_only(checkpoint_price=100.0, current_price=98.77, price_threshold=1.23)
+
+    assert result.price_change_pct == pytest.approx(-1.23, abs=1e-9)
+    assert result.price_signal.meaningful is True  # abs(-1.23) >= 1.23
+
+
+def test_price_signal_comparison_uses_full_precision():
+    """A price move that rounds to a boundary value at low precision but
+    is NOT actually at/past the threshold at full precision must not be
+    misjudged -- proves the comparison itself is not performed on a
+    rounded value."""
+    # 100.6999999 vs threshold 0.7 -> price_change_pct is very slightly
+    # BELOW 0.7, not meaningful, even though it would round to "0.7%" at
+    # 1-decimal display precision.
+    result = price_only(checkpoint_price=100.0, current_price=100.6999999, price_threshold=0.7)
+    assert result.price_change_pct < 0.7
+    assert result.price_signal.meaningful is False
+
+
+def test_no_explicit_threshold_uses_adaptive_fallback():
+    """Omitting checkpoint_price_threshold entirely (None) must resolve
+    to ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT, the same safe-compatibility
+    path a checkpoint written before this field existed takes. 0.6% is
+    below the 1.0% fallback, so it's correctly NOT meaningful here --
+    proving the fallback value is actually being applied, not silently
+    ignored (a bug that would make this move meaningful against a
+    smaller/zero effective threshold)."""
+    result = price_only(checkpoint_price=100.0, current_price=100.6, price_threshold=None)
+
+    assert result.price_signal.threshold == ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT
+    assert result.price_signal.meaningful is False
+
+
+def test_invalid_supplied_threshold_falls_back_to_adaptive_default():
+    """A non-finite or non-positive checkpoint_price_threshold must not
+    be trusted -- this function does not trust its caller blindly, same
+    as checkpoint_price/current_price themselves."""
+    for bad_threshold in [0.0, -1.0, float("nan"), float("inf")]:
+        result = price_only(checkpoint_price=100.0, current_price=100.6, price_threshold=bad_threshold)
+        assert result.price_signal.threshold == ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT
+
+
+# ---------- 7-9. Volume signal boundaries (unchanged) ----------
 
 
 def test_volume_acceleration_1_9x_is_not_meaningful():
@@ -164,13 +390,17 @@ def test_volume_acceleration_above_2x_is_meaningful():
     assert result.meaningful_change is True
 
 
-# ---------- 10-14. Combination logic ----------
+def test_volume_acceleration_threshold_constant_unchanged():
+    assert VOLUME_ACCELERATION_THRESHOLD == 2.0
+
+
+# ---------- 10-14. Combination logic (explicit 2.0% price threshold) ----------
 
 
 def test_price_below_and_volume_below_threshold_is_not_meaningful():
     result = with_volume(
         checkpoint_price=100.0,
-        current_price=101.0,  # +1.0%, below threshold
+        current_price=101.0,  # +1.0%, below the 2.0% threshold
         current_volume=CHECKPOINT_VOLUME + 30_000,  # 1.0x, below threshold
         minutes_after_checkpoint=30,
     )
@@ -184,7 +414,7 @@ def test_price_below_and_volume_below_threshold_is_not_meaningful():
 def test_price_below_and_volume_above_threshold_is_meaningful():
     result = with_volume(
         checkpoint_price=100.0,
-        current_price=101.0,  # +1.0%, below threshold
+        current_price=101.0,  # +1.0%, below the 2.0% threshold
         current_volume=CHECKPOINT_VOLUME + 90_000,  # 3.0x, above threshold
         minutes_after_checkpoint=30,
     )
@@ -205,10 +435,11 @@ def test_price_above_threshold_with_volume_unavailable_is_still_meaningful():
     assert result.volume_signal.available is False
     assert result.meaningful_change is True
     assert "3.0%" in result.reason
+    assert "2.00%" in result.reason  # the threshold is now named in the reason
 
 
 def test_price_below_threshold_with_volume_unavailable_is_not_meaningful():
-    result = price_only(checkpoint_price=100.0, current_price=101.0)
+    result = price_only(checkpoint_price=100.0, current_price=101.0)  # +1.0%, below 2.0%
 
     assert result.price_signal.meaningful is False
     assert result.volume_signal.available is False
@@ -219,7 +450,7 @@ def test_price_below_threshold_with_volume_unavailable_is_not_meaningful():
 def test_both_signals_above_threshold_reason_mentions_both():
     result = with_volume(
         checkpoint_price=100.0,
-        current_price=103.0,  # +3.0%, above threshold
+        current_price=103.0,  # +3.0%, above the 2.0% threshold
         current_volume=CHECKPOINT_VOLUME + 90_000,  # 3.0x, above threshold
         minutes_after_checkpoint=30,
     )
@@ -255,7 +486,7 @@ def test_volume_exactly_at_threshold_with_price_below_threshold_is_meaningful():
     alone must still be sufficient."""
     result = with_volume(
         checkpoint_price=100.0,
-        current_price=101.0,  # +1.0%, below threshold
+        current_price=101.0,  # +1.0%, below the 2.0% threshold
         current_volume=CHECKPOINT_VOLUME + 60_000,  # exactly 2.0x
         minutes_after_checkpoint=30,
     )
@@ -371,7 +602,8 @@ def test_current_volume_lower_than_checkpoint_volume_is_treated_as_bad_data():
 
 def test_cross_session_volume_is_unavailable_never_computed():
     """Session-boundary rule: a checkpoint from a different trading day
-    must never have its volume compared against today's."""
+    must never have its volume compared against today's. UNCHANGED by
+    the adaptive price threshold -- this is a volume-signal-only test."""
     prior_session = date(2026, 9, 3)
     prior_local = datetime.combine(prior_session, time(10, 15), tzinfo=IST)
     prior_checkpoint_at = prior_local.astimezone(timezone.utc)
@@ -395,7 +627,8 @@ def test_cross_session_volume_is_unavailable_never_computed():
 
 def test_checkpoint_too_close_to_market_open_is_unavailable():
     """Near-market-open guard: a checkpoint 1 minute after open must not
-    produce a wild/meaningless rate."""
+    produce a wild/meaningless rate. UNCHANGED by the adaptive price
+    threshold."""
     checkpoint_near_open = ist_time_on_session(9, 16)  # 1 minute after 9:15 open
 
     result = evaluate_change(
@@ -490,5 +723,11 @@ def test_frozen_checkpoint_values_are_not_mutated_by_evaluation():
 
 
 def test_threshold_constants_match_locked_product_decision():
-    assert PRICE_CHANGE_THRESHOLD_PCT == 2.0
+    """PRICE_CHANGE_THRESHOLD_PCT no longer exists (replaced by the
+    adaptive threshold below) -- VOLUME_ACCELERATION_THRESHOLD remains
+    the one still-locked fixed constant."""
     assert VOLUME_ACCELERATION_THRESHOLD == 2.0
+    assert ADAPTIVE_PRICE_THRESHOLD_RANGE_MULTIPLIER == 0.25
+    assert ADAPTIVE_PRICE_THRESHOLD_FLOOR_PCT == 0.5
+    assert ADAPTIVE_PRICE_THRESHOLD_CEILING_PCT == 3.0
+    assert ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT == 1.0

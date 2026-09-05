@@ -260,6 +260,102 @@ def test_zero_total_volume_is_a_valid_sum_not_a_failure():
     assert quotes[0].volume == 0
 
 
+# ---------- 2b. day_high/day_low derivation (adaptive price threshold) ----------
+#
+# Derived from the SAME intraday-history DataFrame already fetched for
+# price/volume above -- no separate network request. These tests build
+# their own DataFrame directly (rather than via make_intraday_bars,
+# which sets High/Low == Close for every row, since that's irrelevant
+# to price/volume derivation) so High/Low can genuinely differ from
+# Close and from each other.
+
+
+def _make_bars_with_range(rows):
+    """rows: list of (close, volume, high, low) tuples, oldest first."""
+    index = pd.date_range("2026-09-04 09:15", periods=len(rows), freq="1min", tz="Asia/Kolkata")
+    return pd.DataFrame(
+        {
+            "Open": [r[0] for r in rows],
+            "High": [r[2] for r in rows],
+            "Low": [r[3] for r in rows],
+            "Close": [r[0] for r in rows],
+            "Volume": [r[1] for r in rows],
+        },
+        index=index,
+    )
+
+
+def test_day_high_low_derived_from_max_min_across_all_bars():
+    bars = _make_bars_with_range(
+        [
+            (1300.0, 1000, 1302.0, 1298.0),
+            (1310.0, 1500, 1315.0, 1305.0),  # highest High
+            (1305.0, 800, 1308.0, 1290.0),  # lowest Low
+        ]
+    )
+    fake_ticker = make_fake_ticker(bars=bars, info={"regularMarketPreviousClose": 1290.0})
+
+    with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
+        quotes = YFinanceProvider().get_quotes(["RELIANCE.NS"])
+
+    assert quotes[0].day_high == 1315.0
+    assert quotes[0].day_low == 1290.0
+
+
+def test_day_high_low_excludes_invalid_bars_without_aborting():
+    """A NaN/non-positive High or Low in one bar must be excluded from
+    the max/min, never abort or corrupt the whole calculation -- mirrors
+    the existing volume-sum exclusion behavior."""
+    bars = _make_bars_with_range(
+        [
+            (1300.0, 1000, 1302.0, 1298.0),
+            (1310.0, 1500, float("nan"), 1305.0),  # invalid High excluded
+            (1305.0, 800, 1308.0, -5.0),  # invalid (negative) Low excluded
+        ]
+    )
+    fake_ticker = make_fake_ticker(bars=bars, info={"regularMarketPreviousClose": 1290.0})
+
+    with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
+        quotes = YFinanceProvider().get_quotes(["RELIANCE.NS"])
+
+    assert quotes[0].day_high == 1308.0  # max of the two VALID highs (1302.0, 1308.0)
+    assert quotes[0].day_low == 1298.0  # min of the two VALID lows (1298.0, 1305.0)
+
+
+def test_day_high_low_missing_columns_does_not_fail_the_quote():
+    """Independently optional: a price/volume/session_date fetch can
+    still succeed even when day_high/day_low cannot be derived at all
+    (e.g. missing High/Low columns)."""
+    bars = make_intraday_bars([(1300.0, 1000), (1310.0, 1500)])
+    bars = bars.drop(columns=["High", "Low"])
+    fake_ticker = make_fake_ticker(bars=bars, info={"regularMarketPreviousClose": 1290.0})
+
+    with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
+        quotes = YFinanceProvider().get_quotes(["RELIANCE.NS"])
+
+    assert quotes[0].fetch_succeeded is True  # price/volume unaffected
+    assert quotes[0].last_price == 1310.0
+    assert quotes[0].day_high is None
+    assert quotes[0].day_low is None
+
+
+def test_day_high_low_all_bars_invalid_produces_none_not_a_fabricated_range():
+    bars = _make_bars_with_range(
+        [
+            (1300.0, 1000, float("nan"), float("nan")),
+            (1310.0, 1500, -1.0, -1.0),
+        ]
+    )
+    fake_ticker = make_fake_ticker(bars=bars, info={"regularMarketPreviousClose": 1290.0})
+
+    with patch("app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker):
+        quotes = YFinanceProvider().get_quotes(["RELIANCE.NS"])
+
+    assert quotes[0].fetch_succeeded is True  # price/volume still fine
+    assert quotes[0].day_high is None
+    assert quotes[0].day_low is None
+
+
 # ---------- 3. Empty intraday history ----------
 
 

@@ -155,6 +155,7 @@ def get_watchlist(owner_id: str = Depends(resolve_owner_id)) -> dict:
         if checkpoint is not None:
             change_result = evaluate_change(
                 checkpoint_price=checkpoint.baseline_snapshot.last_price,
+                checkpoint_price_threshold=checkpoint.baseline_snapshot.price_threshold_applied,
                 checkpoint_volume=checkpoint.baseline_snapshot.volume,
                 checkpoint_at=checkpoint.checkpoint_at,
                 checkpoint_session_date=checkpoint.session_date,
@@ -243,6 +244,7 @@ def get_attention(owner_id: str = Depends(resolve_owner_id)) -> dict:
                 "checkpoint_id": item.checkpoint_id,
                 "detected_at": item.detected_at.isoformat(),
                 "price_change_pct": item.price_change_pct,
+                "price_threshold_applied": item.price_threshold_applied,
                 "volume_acceleration_ratio": item.volume_acceleration_ratio,
                 "volume_acceleration_available": item.volume_acceleration_available,
                 "attention_score": item.attention_score,

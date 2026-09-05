@@ -106,6 +106,7 @@ class ChangeEventService:
                 price_change_pct=change_result.price_change_pct,
                 volume_acceleration_ratio=change_result.volume_acceleration_ratio,
                 volume_acceleration_available=change_result.volume_signal.available,
+                price_threshold_applied=change_result.price_signal.threshold,
             ),
             reason=change_result.reason,
         )

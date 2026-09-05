@@ -16,14 +16,27 @@ import pytest
 
 from app.db.indexes import ensure_indexes
 from app.models.change_event import ChangeEvent, ChangeSignals
-from app.services.attention_engine import AttentionEngine, AttentionLevel, score_change_event
+from app.services.attention_engine import (
+    ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT,
+    AttentionEngine,
+    AttentionLevel,
+    score_change_event,
+)
+
+# The old locked PRICE_CHANGE_THRESHOLD_PCT value, kept here ONLY as a
+# literal default for make_signals below so every pre-existing test in
+# this file needs no other change -- price_threshold_applied is now a
+# real per-event persisted field (see decisions.md's "Adaptive price
+# meaningful-change threshold" entry), not a shared module constant.
+_LEGACY_PRICE_THRESHOLD_PCT = 2.0
 
 
-def make_signals(price_change_pct, ratio=None, available=False):
+def make_signals(price_change_pct, ratio=None, available=False, threshold=_LEGACY_PRICE_THRESHOLD_PCT):
     return ChangeSignals(
         price_change_pct=price_change_pct,
         volume_acceleration_ratio=ratio,
         volume_acceleration_available=available,
+        price_threshold_applied=threshold,
     )
 
 
@@ -168,7 +181,7 @@ def test_unavailable_volume_never_contributes_to_score_or_explanation():
 
 
 def test_price_strength_exactly_at_threshold_is_1_0():
-    event = make_change_event(signals=make_signals(2.0))  # == PRICE_CHANGE_THRESHOLD_PCT
+    event = make_change_event(signals=make_signals(2.0))  # == the event's own price_threshold_applied (2.0)
     item = score_change_event(symbol="X", change_event=event)
     assert item.attention_score == pytest.approx(1.0)
 
@@ -201,6 +214,76 @@ def test_attention_level_boundaries(price_change_pct, expected_score, expected_l
 
     assert item.attention_score == pytest.approx(expected_score)
     assert item.attention_level == expected_level
+
+
+# --- Per-event adaptive price threshold (REQUIRED) ----------------------------
+
+
+def test_attention_score_uses_persisted_per_event_threshold():
+    """An event that crossed a narrow 0.5% threshold must correctly
+    receive strength >= 1.0 -- this would be silently suppressed
+    (0.6/2.0 = 0.3, below the WATCH floor) if scoring still normalized
+    against a shared fixed constant instead of this event's own
+    persisted price_threshold_applied."""
+    event = make_change_event(signals=make_signals(0.6, threshold=0.5))
+    item = score_change_event(symbol="RELIANCE", change_event=event)
+
+    assert item.price_threshold_applied == 0.5
+    assert item.attention_score == pytest.approx(1.2)  # 0.6 / 0.5
+    assert item.attention_level == AttentionLevel.WATCH  # >= 1.0
+
+
+def test_two_events_with_different_thresholds_produce_independent_scores():
+    """Two events with the SAME price_change_pct but DIFFERENT persisted
+    thresholds must score independently -- proves normalization reads
+    each event's own field, never a shared constant or the other
+    event's value."""
+    narrow = make_change_event(
+        instrument_id="inst-narrow", signals=make_signals(1.5, threshold=0.5)
+    )
+    wide = make_change_event(instrument_id="inst-wide", signals=make_signals(1.5, threshold=3.0))
+
+    narrow_item = score_change_event(symbol="NARROW", change_event=narrow)
+    wide_item = score_change_event(symbol="WIDE", change_event=wide)
+
+    assert narrow_item.attention_score == pytest.approx(3.0)  # 1.5 / 0.5
+    assert narrow_item.attention_level == AttentionLevel.HIGH
+    assert wide_item.attention_score == pytest.approx(0.5)  # 1.5 / 3.0
+    # Note: a score this low should never occur for a REAL ChangeEvent
+    # (one only exists when meaningful_change was true at detection,
+    # i.e. some signal was already >= its own threshold) -- this case is
+    # constructed directly to isolate and prove the per-event
+    # normalization math itself, independent of that invariant.
+
+
+def test_old_change_event_missing_threshold_field_uses_compatibility_fallback():
+    """A ChangeEvent persisted before price_threshold_applied existed
+    (the field absent from the stored document entirely, not merely
+    None) must still be readable and scoreable -- falls back to
+    ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT, never raises, never silently
+    divides by zero/None."""
+    legacy_doc = {
+        "user_id": "user1",
+        "instrument_id": "inst123",
+        "checkpoint_id": "cp-legacy",
+        "detected_at": datetime(2026, 9, 4, 10, 0, tzinfo=timezone.utc).isoformat(),
+        "signals": {
+            "price_change_pct": 1.5,
+            "volume_acceleration_ratio": None,
+            "volume_acceleration_available": False,
+            # price_threshold_applied deliberately OMITTED -- simulates
+            # a document written before this migration.
+        },
+        "reason": "legacy reason text",
+        "acknowledged": False,
+    }
+    event = ChangeEvent(**legacy_doc)
+    assert event.signals.price_threshold_applied is None  # confirms the omission actually took effect
+
+    item = score_change_event(symbol="RELIANCE", change_event=event)
+
+    assert item.price_threshold_applied == ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT
+    assert item.attention_score == pytest.approx(1.5 / ADAPTIVE_PRICE_THRESHOLD_FALLBACK_PCT)
 
 
 # --- Determinism ---------------------------------------------------------------
@@ -243,12 +326,13 @@ def insert_change_event(
     ratio=None,
     available=False,
     acknowledged=False,
+    threshold=_LEGACY_PRICE_THRESHOLD_PCT,
 ):
     event = ChangeEvent(
         user_id=user_id,
         instrument_id=instrument_id,
         checkpoint_id=checkpoint_id,
-        signals=make_signals(price_change_pct, ratio, available),
+        signals=make_signals(price_change_pct, ratio, available, threshold),
         reason="irrelevant to the Attention Engine",
         acknowledged=acknowledged,
     )
