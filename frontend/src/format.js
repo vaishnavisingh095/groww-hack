@@ -56,9 +56,9 @@ function formatBarTime(isoString) {
 // own clock.
 function formatAgeSuffix(status, dataAgeSeconds) {
   if (dataAgeSeconds === null || dataAgeSeconds === undefined) return null
-  if (status === 'ok') return `${dataAgeSeconds}s ago`
+  if (status === 'ok') return `fetched ${dataAgeSeconds}s ago`
   const minutes = Math.floor(dataAgeSeconds / 60)
-  return minutes >= 1 ? `${minutes}m ago` : `${dataAgeSeconds}s ago`
+  return minutes >= 1 ? `fetched ${minutes}m ago` : `fetched ${dataAgeSeconds}s ago`
 }
 
 // Market-data freshness label for the watchlist/attention views.

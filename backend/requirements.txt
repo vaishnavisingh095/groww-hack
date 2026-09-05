@@ -7,6 +7,15 @@ pydantic-settings==2.15.0
 # Phase 2 (this slice) additions.
 yfinance==1.7.0
 uvicorn==0.52.4
+# Already an installed transitive dependency of yfinance -- pinned
+# explicitly now that yfinance_provider.py imports and uses it directly
+# (a bounded-timeout requests.Session/HTTPAdapter passed to
+# yf.Ticker(..., session=...), per its own documented "Custom requests
+# session" parameter -- see decisions.md's "Provider network timeout"
+# entry). No new capability is being introduced; this is the same
+# library yfinance itself already depends on and would otherwise use by
+# default.
+requests==2.34.2
 
 # Test-only dependencies below this line.
 pytest==9.1.1

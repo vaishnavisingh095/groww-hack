@@ -25,8 +25,14 @@ from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import requests
+from requests.adapters import HTTPAdapter
 
-from app.providers.yfinance_provider import YFinanceProvider
+from app.providers.yfinance_provider import (
+    _PROVIDER_REQUEST_TIMEOUT_SECONDS,
+    _TimeoutEnforcingAdapter,
+    YFinanceProvider,
+)
 
 
 # ---------- Fakes ----------
@@ -115,6 +121,83 @@ def make_fake_ticker(
         fake.fast_info = FakeFastInfo(previous_close=fast_info_previous_close)
 
     return fake
+
+
+# ---------- 0. Provider network timeout ----------
+#
+# yfinance has no public per-call timeout parameter for .info/.fast_info
+# (only .history() exposes one), so the provider builds its own bounded-
+# timeout session and passes it to every yf.Ticker(...) construction --
+# see yfinance_provider.py's _TimeoutEnforcingAdapter docstring for the
+# full reasoning. These tests prove the mechanism is actually configured
+# and used, not that a real network call times out (that would require a
+# real, slow/hanging network -- not deterministic or appropriate here).
+
+
+def test_provider_builds_a_session_with_the_timeout_adapter_mounted():
+    """The provider must construct its own requests.Session with
+    _TimeoutEnforcingAdapter mounted on BOTH schemes -- yfinance's own
+    default session (used when none is supplied) has no bounded timeout
+    for .info/.fast_info, so relying on it would silently reintroduce
+    the exact problem this fix closes."""
+    provider = YFinanceProvider()
+
+    assert isinstance(provider._session, requests.Session)
+    assert isinstance(provider._session.get_adapter("https://example.com"), _TimeoutEnforcingAdapter)
+    assert isinstance(provider._session.get_adapter("http://example.com"), _TimeoutEnforcingAdapter)
+
+
+def test_get_quotes_passes_the_bounded_session_to_every_ticker():
+    """Every yf.Ticker(...) construction inside get_quotes must use the
+    provider's own bounded-timeout session (session=self._session) --
+    this is the one mechanism that covers ticker.history(), ticker.info,
+    AND ticker.fast_info uniformly, since they all route through the
+    same underlying YfData built from that session."""
+    fake_ticker = make_fake_ticker(
+        bars=make_intraday_bars([(1300.0, 1000)]),
+        info={"regularMarketPreviousClose": 1290.0},
+    )
+    provider = YFinanceProvider()
+
+    with patch(
+        "app.providers.yfinance_provider.yf.Ticker", return_value=fake_ticker
+    ) as mock_ticker_cls:
+        provider.get_quotes(["RELIANCE.NS", "TCS.NS"])
+
+    assert mock_ticker_cls.call_args_list == [
+        (("RELIANCE.NS",), {"session": provider._session}),
+        (("TCS.NS",), {"session": provider._session}),
+    ]
+
+
+def test_timeout_enforcing_adapter_clamps_the_timeout_on_send():
+    """Proves the actual mechanism: regardless of what timeout value a
+    caller (e.g. yfinance's own internal _make_request, which always
+    supplies its own 30s/10s default explicitly) tries to pass,
+    _TimeoutEnforcingAdapter.send() overrides it with
+    _PROVIDER_REQUEST_TIMEOUT_SECONDS before delegating to the real
+    HTTPAdapter.send() -- the actual point a request hits the wire."""
+    adapter = _TimeoutEnforcingAdapter()
+    captured_kwargs = {}
+
+    def fake_super_send(self, request, **kwargs):
+        captured_kwargs.update(kwargs)
+        return MagicMock()
+
+    with patch.object(HTTPAdapter, "send", fake_super_send):
+        adapter.send(MagicMock(), timeout=9999)  # a caller-supplied, much larger value
+
+    assert captured_kwargs["timeout"] == _PROVIDER_REQUEST_TIMEOUT_SECONDS
+    assert captured_kwargs["timeout"] != 9999
+
+
+def test_provider_timeout_constant_is_short_and_bounded():
+    """Pins the chosen value -- short relative to yfinance's own 10s/30s
+    internal defaults, but not so aggressive it would misfire under
+    ordinary (not-hanging) network latency. A regression here (e.g.
+    someone accidentally reverting to a much larger value) should be
+    caught explicitly, not silently."""
+    assert 0 < _PROVIDER_REQUEST_TIMEOUT_SECONDS <= 10
 
 
 # ---------- 1. Valid intraday bars produce the latest price ----------

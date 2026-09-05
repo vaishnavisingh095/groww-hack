@@ -53,14 +53,79 @@ import logging
 import math
 from datetime import date, datetime, timezone
 
+import requests
 import yfinance as yf
+from requests.adapters import HTTPAdapter
 
 from app.providers.base import MarketDataProvider, RawQuote
 
 logger = logging.getLogger(__name__)
 
+# Explicit, short, bounded timeout for EVERY yfinance network call this
+# provider makes (ticker.history(), ticker.info, ticker.fast_info) --
+# see _TimeoutEnforcingAdapter below for why a session-level override is
+# the only mechanism that covers all three uniformly. yfinance's own
+# internal defaults (10s for history(), 30s for info/fast_info's
+# underlying YfData.get/get_raw_json) are otherwise inherited silently
+# and are not coordinated across the up to 5 sequential per-symbol
+# fetches get_quotes() below performs -- see decisions.md's "Provider
+# network timeout" entry. 5s comfortably exceeds a healthy real
+# yfinance call (typically well under 2s) while still bounding the
+# worst-case total wait for a full watchlist refresh to a handful of
+# seconds per symbol instead of tens of seconds.
+_PROVIDER_REQUEST_TIMEOUT_SECONDS = 5
+
+
+class _TimeoutEnforcingAdapter(HTTPAdapter):
+    """
+    requests.Session has no native "default timeout" concept -- every
+    request needs an explicit timeout= kwarg per call, or it can block
+    indefinitely (documented `requests` behavior, not a yfinance quirk).
+    yfinance's own internal code always supplies ITS OWN timeout
+    explicitly (_make_request's own 30s default for info/fast_info,
+    history()'s own 10s default) but exposes no public parameter for a
+    caller to override that default for .info/.fast_info specifically
+    -- only history() has its own timeout= kwarg, and there is no
+    equivalent for Ticker.info/Ticker.fast_info anywhere in the public
+    API (confirmed by inspecting the installed yfinance==1.7.0 source:
+    Quote._fetch_info/_fetch_additional_info call self._data.get/
+    get_raw_json with no caller-supplied timeout at all).
+
+    Overriding HTTPAdapter.send() -- the actual point where a prepared
+    request is finally sent over the wire -- is the standard, documented
+    `requests` pattern for enforcing a session-wide timeout ceiling
+    regardless of what any caller passes in (see requests' own
+    "Advanced Usage: Timeouts" documentation). This CLAMPS whatever
+    timeout yfinance itself tries to use down to
+    _PROVIDER_REQUEST_TIMEOUT_SECONDS, so one mechanism -- mounting this
+    adapter on a session passed to yf.Ticker(symbol, session=...), which
+    TickerBase.__init__'s own docstring documents as a supported
+    "Custom requests session" -- covers ticker.history(), ticker.info,
+    AND ticker.fast_info uniformly (all three route through the same
+    underlying YfData instance built from that one session; confirmed
+    by inspecting TickerBase.__init__ and FastInfo.__init__ in the
+    installed source).
+    """
+
+    def send(self, request, **kwargs):
+        kwargs["timeout"] = _PROVIDER_REQUEST_TIMEOUT_SECONDS
+        return super().send(request, **kwargs)
+
 
 class YFinanceProvider(MarketDataProvider):
+    def __init__(self):
+        # One shared, timeout-bounded session, built once and reused for
+        # every get_quotes() call for this provider's lifetime -- this
+        # matches the existing lifetime of the provider itself (a single
+        # module-level `_provider` instance reused across requests, see
+        # routes/watchlist.py), and keeps requests' own connection
+        # pooling working across calls rather than paying a fresh
+        # session's setup cost per symbol.
+        self._session = requests.Session()
+        timeout_adapter = _TimeoutEnforcingAdapter()
+        self._session.mount("https://", timeout_adapter)
+        self._session.mount("http://", timeout_adapter)
+
     def get_quotes(self, symbols: list[str]) -> list[RawQuote]:
         """
         Fetch one symbol at a time via yf.Ticker rather than yf.download's
@@ -84,7 +149,7 @@ class YFinanceProvider(MarketDataProvider):
     def _get_single_quote(self, symbol: str) -> RawQuote:
         fetched_at = datetime.now(timezone.utc)
         try:
-            ticker = yf.Ticker(symbol)
+            ticker = yf.Ticker(symbol, session=self._session)
 
             (
                 last_price,
