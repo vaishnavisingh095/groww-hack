@@ -3,7 +3,7 @@
 // thing that talks to the market data provider. One place for the base
 // URL and every backend call, so nothing else in the app hand-rolls a
 // fetch() and risks drifting from the real route paths.
-const API_BASE = 'http://127.0.0.1:8000'
+const API_BASE = 'http://localhost:8000'
 
 // Every call includes the browser's cookies (credentials: 'include') so
 // the backend's anonymous owner cookie (httpOnly, set by

@@ -96,6 +96,61 @@ def test_both_price_and_volume_produce_one_item_scored_by_the_stronger_signal():
     )
 
 
+# --- Available but sub-threshold volume (REGRESSION) -------------------------
+#
+# Bug found during manual browser QA: _build_explanation used to append the
+# volume clause whenever volume_acceleration_available was True, with no
+# check that the ratio actually met VOLUME_ACCELERATION_THRESHOLD -- an
+# available-but-sub-threshold ratio (e.g. 0.0x, computed when checkpoint and
+# current volume are equal) produced "Trading volume accelerated to 0.0x
+# the rate observed before you last checked," describing a non-event as an
+# acceleration. This must never contribute to the score (already correct,
+# unchanged by this fix) OR to the explanation text (the actual bug).
+
+
+def test_meaningful_price_with_zero_volume_ratio_has_no_acceleration_claim():
+    """Exact bug scenario: a price-driven event where volume is available
+    but computed as exactly 0.0x (no volume accumulated since checkpoint).
+    The explanation must read as price-only -- no "Trading volume" clause,
+    no mention of "0.0" or "accelerated" -- even though
+    volume_acceleration_available is True."""
+    event = make_change_event(signals=make_signals(4.2, ratio=0.0, available=True))
+    item = score_change_event(symbol="RELIANCE", change_event=event)
+
+    assert item.attention_score == pytest.approx(2.1)  # price alone: 4.2 / 2.0
+    assert item.explanation == "RELIANCE moved +4.2% since your last check."
+    assert "Trading volume" not in item.explanation
+    assert "accelerated" not in item.explanation
+    # The raw signal fields themselves are untouched by this fix -- only
+    # the explanation TEXT changed, never the API/data fields.
+    assert item.volume_acceleration_ratio == 0.0
+    assert item.volume_acceleration_available is True
+
+
+def test_meaningful_price_with_sub_threshold_volume_has_no_acceleration_claim():
+    """Same gap, a non-zero but still below-threshold ratio (1.3x) -- not
+    just the 0.0x edge case from the bug report."""
+    event = make_change_event(signals=make_signals(3.0, ratio=1.3, available=True))
+    item = score_change_event(symbol="TCS", change_event=event)
+
+    assert item.attention_score == pytest.approx(1.5)  # price alone: 3.0 / 2.0
+    assert item.explanation == "TCS moved +3.0% since your last check."
+    assert "Trading volume" not in item.explanation
+
+
+def test_meaningful_price_with_meaningful_volume_keeps_acceleration_claim():
+    """Required regression: once the ratio actually meets
+    VOLUME_ACCELERATION_THRESHOLD (inclusive), the volume clause must still
+    appear -- this fix must not suppress a genuinely meaningful signal."""
+    event = make_change_event(signals=make_signals(3.0, ratio=2.0, available=True))
+    item = score_change_event(symbol="HDFCBANK", change_event=event)
+
+    assert item.explanation == (
+        "HDFCBANK moved +3.0% since your last check. Trading volume "
+        "accelerated to 2.0× the rate observed before you last checked."
+    )
+
+
 # --- Unavailable volume -------------------------------------------------------
 
 

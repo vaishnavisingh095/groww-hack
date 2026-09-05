@@ -94,9 +94,11 @@ function AttentionCard({ item, watchlistEntry, onMarkAsSeen, inFlight, actionErr
   // checkpoint or acknowledges anything, and never affects
   // searchQuery/watchlistFilter. React preserves this state across
   // polling refreshes because AttentionGroup keys each card by the
-  // stable item.instrument_id.
+  // stable item.checkpoint_id -- not item.instrument_id, since multiple
+  // independent attention events (different checkpoint_id) can
+  // legitimately share the same instrument_id.
   const [expanded, setExpanded] = useState(false)
-  const detailsId = `attention-details-${item.instrument_id}`
+  const detailsId = `attention-details-${item.checkpoint_id}`
 
   return (
     <li className={`attention-card attention-level-${item.attention_level}`}>
@@ -366,7 +368,7 @@ function AttentionGroup({
       <ul className="attention-list">
         {groupItems.map((item) => (
           <AttentionCard
-            key={item.instrument_id}
+            key={item.checkpoint_id}
             item={item}
             watchlistEntry={instrumentsById.get(item.instrument_id)}
             onMarkAsSeen={onMarkAsSeen}
@@ -443,7 +445,7 @@ export default function AttentionSection({
           highItems.length / worthCheckingItems.length, the exact same
           arrays (same filters, same source order) the groups below are
           already built from. No new count logic, no new grouping rule. */}
-      <div className="attention-banner">
+      <div className={`attention-banner${items.length === 0 ? ' attention-banner-compact' : ''}`}>
         <h2 className="attention-heading">Since You Last Checked</h2>
 
         {items.length === 0 ? (

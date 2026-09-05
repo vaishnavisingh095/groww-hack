@@ -120,16 +120,21 @@ def _build_explanation(
     concern per this phase's explicit instruction), never an LLM call.
 
     Price clause always communicates the SIGNED movement (a drop reads
-    as "-5.0%", not "5.0%"). Volume clause is appended only when
-    available, using architecture.md's locked required wording
-    ("...the rate observed before you last checked", never "x normal
-    volume", since the signal is a same-session rate comparison, not a
+    as "-5.0%", not "5.0%"). Volume clause is appended only when the
+    ratio is actually available AND meets VOLUME_ACCELERATION_THRESHOLD
+    -- available-but-below-threshold (e.g. a computed 0.0x or 1.3x) is
+    not "acceleration" and must not be described as such; this mirrors
+    change_engine.py's own _build_reason, which only mentions volume
+    when its signal was actually meaningful, never merely computable.
+    Wording itself is architecture.md's locked required text ("...the
+    rate observed before you last checked", never "x normal volume",
+    since the signal is a same-session rate comparison, not a
     historical-normal baseline).
     """
     sign = "+" if price_change_pct >= 0 else ""
     explanation = f"{symbol} moved {sign}{price_change_pct:.1f}% since your last check."
 
-    if volume_acceleration_available:
+    if volume_acceleration_available and volume_acceleration_ratio >= VOLUME_ACCELERATION_THRESHOLD:
         explanation += (
             f" Trading volume accelerated to {volume_acceleration_ratio:.1f}× "
             "the rate observed before you last checked."

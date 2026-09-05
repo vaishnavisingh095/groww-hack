@@ -332,11 +332,8 @@ export default function App() {
   return (
     <div className="app">
       <header className="app-header">
-        <h1>Smart Market Watchlist</h1>
-        <p className="app-tagline">Your market, filtered for attention.</p>
-        <p className="app-subtitle">
-          See what meaningfully changed in your watchlist while you were away.
-        </p>
+        <h1>Watchly</h1>
+        <p className="app-subtitle">See what meaningfully changed while you were away.</p>
       </header>
 
       {error && <div className="error-banner">{error}</div>}
