@@ -24,16 +24,46 @@ function matchesSearch(symbol, exchange, query) {
   )
 }
 
+// Watchlist-table-only classification, over already-fetched data --
+// no new fields, no backend call. "attention" mirrors exactly which
+// instruments are currently represented in attentionItems (the same
+// membership test AttentionSection's own `attentionIds` set already
+// performs, just recomputed here from the same source array rather than
+// threaded through as a prop); "baseline_pending" and "normal" read the
+// existing change.has_baseline flag GET /watchlist already returns.
+function matchesWatchlistFilter(instrument, filter, attentionInstrumentIds) {
+  switch (filter) {
+    case 'attention':
+      return attentionInstrumentIds.has(instrument.instrument_id)
+    case 'baseline_pending':
+      return !instrument.change.has_baseline
+    case 'normal':
+      return instrument.change.has_baseline && !attentionInstrumentIds.has(instrument.instrument_id)
+    case 'all':
+    default:
+      return true
+  }
+}
+
+const WATCHLIST_FILTERS = [
+  { value: 'all', label: 'All' },
+  { value: 'attention', label: 'Attention' },
+  { value: 'normal', label: 'Normal' },
+  { value: 'baseline_pending', label: 'Baseline Pending' },
+]
+
 export default function App() {
   const [instruments, setInstruments] = useState([])
   const [attentionItems, setAttentionItems] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
 
-  // Pure presentation filter -- never touches instruments/attentionItems
-  // themselves, never affects loadAll(), polling, or any acknowledgement
-  // handler below.
+  // Pure presentation filters -- neither ever touches instruments/
+  // attentionItems themselves, never affects loadAll(), polling, or any
+  // acknowledgement handler below. watchlistFilter only affects what
+  // WatchlistTable renders, never AttentionSection.
   const [searchQuery, setSearchQuery] = useState('')
+  const [watchlistFilter, setWatchlistFilter] = useState('all')
 
   // Per-instrument action state, not global -- an instrument can now be
   // acted on from two places (its watchlist row AND, if active, its
@@ -166,9 +196,14 @@ export default function App() {
   // Small, simple filter -- the dataset is 5 instruments, not large
   // enough to warrant useMemo. instruments itself is never reassigned or
   // mutated here; this is a new derived array passed only to
-  // WatchlistTable below.
-  const filteredInstruments = instruments.filter((inst) =>
-    matchesSearch(inst.symbol, inst.exchange, searchQuery)
+  // WatchlistTable below. attentionInstrumentIds is recomputed from the
+  // FULL attentionItems array (never a filtered one), so "Attention"/
+  // "Normal" classification is always correct regardless of search.
+  const attentionInstrumentIds = new Set(attentionItems.map((item) => item.instrument_id))
+  const filteredInstruments = instruments.filter(
+    (inst) =>
+      matchesSearch(inst.symbol, inst.exchange, searchQuery) &&
+      matchesWatchlistFilter(inst, watchlistFilter, attentionInstrumentIds)
   )
 
   return (
@@ -179,16 +214,6 @@ export default function App() {
         <p className="app-subtitle">
           See what meaningfully changed in your watchlist while you were away.
         </p>
-        <div className="search-control">
-          <input
-            type="search"
-            className="search-input"
-            placeholder="Search your watchlist..."
-            aria-label="Search your watchlist"
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-          />
-        </div>
       </header>
 
       {error && <div className="error-banner">{error}</div>}
@@ -213,10 +238,43 @@ export default function App() {
 
           <section className="watchlist-section">
             <div className="watchlist-header">
-              <h2 className="section-title">Your Watchlist</h2>
-              <p className="watchlist-subtitle">
-                The complete list, including instruments with no meaningful change right now.
-              </p>
+              <div className="watchlist-header-text">
+                <h2 className="section-title">Your Watchlist</h2>
+                <p className="watchlist-subtitle">
+                  The complete list, including instruments with no meaningful change right now.
+                </p>
+              </div>
+              {/* Search belongs to this section, not the page header --
+                  it's a control over the watchlist, not part of the
+                  product's identity/positioning copy above. Same
+                  searchQuery state, same matchesSearch function, same
+                  input -- only its position in the tree moved. */}
+              <div className="watchlist-controls">
+                <div className="watchlist-filter-group" role="group" aria-label="Filter your watchlist">
+                  {WATCHLIST_FILTERS.map((filter) => (
+                    <button
+                      key={filter.value}
+                      type="button"
+                      className={
+                        'watchlist-filter-button' +
+                        (watchlistFilter === filter.value ? ' watchlist-filter-button-active' : '')
+                      }
+                      aria-pressed={watchlistFilter === filter.value}
+                      onClick={() => setWatchlistFilter(filter.value)}
+                    >
+                      {filter.label}
+                    </button>
+                  ))}
+                </div>
+                <input
+                  type="search"
+                  className="search-input"
+                  placeholder="Search your watchlist..."
+                  aria-label="Search your watchlist"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                />
+              </div>
             </div>
             <WatchlistTable
               instruments={filteredInstruments}
