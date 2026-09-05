@@ -1408,6 +1408,17 @@ contains only the heading, count, and high/worth-checking breakdown —
 no button. `POST /watchlist/checkpoint` remains implemented on the
 backend and unused by the frontend, exactly as before this pass.
 
+### SUPERSEDED
+This decision was scoped specifically to the UI-polish pass it was made
+during — "not now, not in this pass." Mark All as Seen was later built
+as its own scoped feature (a real `markAllAsSeen()` call in `api.js`,
+wired to the existing `POST /watchlist/checkpoint` endpoint, with its
+own in-flight/error/partial-failure UI state in `App.jsx` and a real
+"Mark all as seen" button in the banner). See the "Mark All as Seen"
+entry later in this log for that decision's own reasoning. This entry
+is preserved as the historical record of why it wasn't done *at that
+time*, not as a statement of current behavior.
+
 ---
 
 ## Decision: No "View details" action added during UI polish
@@ -1442,6 +1453,14 @@ matching what the product actually supports today.
 `AttentionCard` in `AttentionSection.jsx` renders a single action
 (`onMarkAsSeen`). Adding a real details view remains a legitimate future
 feature, not addressed by this decision.
+
+### SUPERSEDED
+Like the Mark All decision above, this was scoped to "not in this
+UI-polish pass," not "never." View Details was later built as a local,
+expandable card section (no route, no modal, no API call) — see the
+"View Details as a local expandable card" entry later in this log. This
+entry is preserved as the historical record of the original polish-pass
+scoping decision, not as a statement of current behavior.
 
 ---
 
@@ -1683,3 +1702,457 @@ inspection later. A new anonymous owner's random token will not collide
 with it, so it simply becomes inert, recoverable-by-hand legacy state,
 not a resource visible to anyone unless they already know that literal
 value.
+
+---
+
+## Decision: First-load sequential identity resolution to avoid a cookie race
+
+### Problem
+`App.jsx`'s `loadAll()` fires `GET /watchlist` and `GET /watchlist/attention`
+together. On a brand-new browser session (no cookie yet), both requests
+would independently reach `resolve_owner_id` with no existing cookie, and
+each would generate its OWN new owner token and its own `Set-Cookie`
+response — whichever response the browser processed last would silently
+win, orphaning the other request's just-created `Watchlist` under a
+token nobody would ever use again.
+
+### Options
+- Fire both requests concurrently on every load, including the first.
+- Resolve identity with a single request first, then let all following
+  requests (the second half of the first load, every poll, every
+  action's own follow-up `loadAll()`) run concurrently as before.
+- Have the frontend pre-check for a cookie before fetching.
+
+### Decision
+The second option: `loadAll()` tracks whether identity has ever been
+resolved in this browser session (`hasResolvedIdentity`, a `useRef`).
+While `false`, `fetchWatchlist()` and `fetchAttention()` are awaited
+sequentially (the first call's `Set-Cookie` lands before the second
+request is even sent), and the flag is set `true` immediately after.
+Every subsequent call to `loadAll()` — the rest of that first load, every
+60-second poll, and every action's own re-fetch — uses the normal
+concurrent `Promise.allSettled` path.
+
+### Why
+Pre-checking for a cookie client-side was rejected because the cookie is
+`httpOnly` by design (see the Persistent Anonymous Watchlist Identity
+decision) — JavaScript cannot read it, and must not be given a way to.
+Sequencing only the very first pair of requests costs exactly one extra
+round-trip, once per browser session, and never on any later poll or
+action — the cheapest fix that actually closes the race rather than
+narrowing it.
+
+### Consequence
+A true multi-tab race (two browser tabs opened at the exact same first
+instant) is still theoretically possible, since each tab is an
+independent JS context with its own `hasResolvedIdentity` ref — this is
+why `get_or_create_watchlist`'s own `DuplicateKeyError` recovery (see
+the Persistent Anonymous Watchlist Identity decision) exists as the
+backend-side safety net, not as redundant defense. See
+`test_get_or_create_watchlist_survives_concurrent_creation_race` in
+`test_watchlist_api.py` for that backend-side guarantee, and
+`App.jsx`'s own `hasResolvedIdentity` comment for the frontend-side
+mitigation.
+
+---
+
+## Decision: Add Stock's three-case duplicate-add rule
+
+### Problem
+Once Watchlist membership was owner-scoped, "Add Stock" needed a precise
+rule for what happens when the requested `(symbol, exchange)` already
+exists globally, may or may not already be in the calling owner's own
+membership, and may or may not have ever been provider-validated.
+
+### Options
+- Always call the provider to re-validate resolvability, even for an
+  already-existing global `Instrument`, before adding membership.
+- Only call the provider when the global `Instrument` does not exist yet
+  (brand new); reuse an existing global `Instrument` for a different
+  owner's membership with no re-validation.
+
+### Decision
+The latter, as three explicit cases in `watchlist_service.add_instrument`:
+(1) already exists globally AND already in this owner's watchlist —
+idempotent no-op, no provider call; (2) already exists globally but not
+yet in this owner's watchlist — added to this owner's membership only,
+no provider call; (3) does not exist globally at all — validated via the
+provider, created once, then added to this owner's membership.
+
+### Why
+An existing global `Instrument` was already confirmed resolvable by
+whichever owner first added it — re-validating it for every subsequent
+owner would be a redundant provider call for a fact already established,
+not a genuine new check. `created` in the response continues to mean
+exactly what it meant before ownership existed ("a new global Instrument
+document was created"), so no existing caller's understanding of that
+field needed to change.
+
+### Consequence
+Adding an already-tracked instrument is always fast and provider-call-free
+for every owner after the first; only a genuinely brand-new
+`(symbol, exchange)` pair triggers a live provider check. See
+`test_add_stock_reuses_existing_global_instrument_across_owners` in
+`test_watchlist_api.py`.
+
+---
+
+## Decision: View Details as a local expandable card, not a route/modal/API call
+
+### Problem
+Once the attention card's core content ("What changed / Why it matters /
+Signals") was stable, a "View details" action was wanted to surface
+detection-basis facts (the exact threshold comparison, volume-signal
+availability, data status) without cluttering the primary card. The
+earlier UI-polish-era decision to omit any such action (see "No 'View
+details' action added during UI polish," marked superseded above) no
+longer reflected the intended scope once this was picked up as its own
+feature.
+
+### Options
+- A route/page per instrument (`/instruments/{id}`), requiring a router
+  dependency the frontend doesn't otherwise have.
+- A modal dialog, requiring focus-trap/overlay state management.
+- A local, in-card expand/collapse toggle, built entirely from data the
+  card's own props already carry.
+
+### Decision
+A local expand/collapse toggle (`useState` inside `AttentionCard`). No
+route, no modal, no new API call, no prop threaded up to `App.jsx`.
+
+### Why
+Every value the expanded section shows (`detected_at`, the price/volume
+threshold comparison, `volume_acceleration_available`, `status`,
+`freshness_label`) is already present on `item`/`watchlistEntry`, the
+same props the collapsed card already renders from. Adding a route or
+modal would introduce real infrastructure (routing, overlay/focus
+management) to display data that requires no additional fetch — a
+violation of not adding abstractions the actual requirement doesn't
+need. Being purely local state also means toggling it can never
+accidentally create a checkpoint or acknowledge anything, which a
+naively-added API call could risk.
+
+### Consequence
+Expanding/collapsing details never calls `loadAll()`, never touches
+`instruments`/`attentionItems`, and survives a polling refresh unchanged
+because `AttentionGroup` keys each card by the stable `item.instrument_id`
+(React preserves the card's local state across re-renders with the same
+key). The "Result: Threshold crossed / Below threshold" row is computed
+client-side as a plain `>=` comparison against the same locked 2.0%/2.0×
+constants the backend itself uses (duplicated as literals in
+`AttentionSection.jsx`, since no API field carries them) — this restates
+an already-known verdict for a value already flagged meaningful; it does
+not independently decide meaningfulness (see the "No 'strongest signal'
+attribution added" decision for the adjacent line this does NOT cross).
+
+---
+
+## Decision: Mark All as Seen
+
+### Problem
+The backend has always had `POST /watchlist/checkpoint` (whole-watchlist
+acknowledgement) with no frontend caller (see "No 'Mark all as seen' CTA
+introduced during UI polish," marked superseded above, which deferred
+this specifically as out of scope for a visual-polish pass, not as a
+permanent decision not to build it).
+
+### Options
+- Leave it backend-only, as the earlier UI-polish decision left it.
+- Build it as its own scoped feature: a real `markAllAsSeen()` call, a
+  banner button, and dedicated in-flight/error/partial-result UI state.
+
+### Decision
+Build it. `handleMarkAllAsSeen` in `App.jsx` calls `markAllAsSeen()`
+(`api.js`), tracked by its own `markAllInFlight`/`markAllError`/
+`markAllPartialMessage` state — deliberately separate from the
+per-instrument `inFlightIds`/`actionErrors`, since this is one action
+affecting many instruments at once, not an instance of the same
+single-instrument action.
+
+### Why
+The backend endpoint already reports exactly which instruments were
+skipped (`{"updated": [...], "skipped": [...]}`) for instruments with no
+valid current snapshot — the frontend's job is to surface that truthfully
+(a `markAllPartialMessage` when `skipped` is non-empty), never to imply
+every instrument was acknowledged when some were not. After success, the
+same `loadAll()` used everywhere else re-fetches authoritative state, so
+the UI never has to locally guess which attention items disappeared.
+
+### Consequence
+A failed `markAllAsSeen()` call never touches `instruments`/
+`attentionItems` — only `markAllError` is set, per the same
+"no optimistic acknowledgement" discipline already followed by the
+per-instrument Mark as Seen handler. See P0 Hardening #6's audit of this
+exact invariant (Mark Seen/Mark All failure matrix) for the regression
+reasoning that confirmed this holds.
+
+---
+
+## Decision: Market-data batch failure isolation (P0 Hardening #2)
+
+### Problem
+`MarketDataService._assemble_snapshot` had no guard against a
+non-finite or non-positive `last_price`/`previous_close` surviving an
+otherwise `fetch_succeeded=True` `RawQuote`. `previous_close == 0` raised
+an unhandled `ZeroDivisionError`; `last_price <= 0` or
+`previous_close < 0` raised an unhandled `pydantic.ValidationError` at
+`MarketSnapshot` construction. `fetch_snapshots`'s loop over quotes has
+no per-quote `try`/`except`, so this crashed the entire batch fetch —
+taking down every OTHER instrument's snapshot in the same
+`GET /watchlist` call, not just the malformed one.
+
+### Options
+- Add a per-quote `try`/`except` around the whole assembly step.
+- Add a targeted guard rejecting non-finite/non-positive prices before
+  the division/construction that actually fails, reusing the function's
+  existing "no usable price → no snapshot" contract.
+
+### Decision
+The targeted guard: `_assemble_snapshot` now rejects a non-finite or
+non-positive `last_price`/`previous_close` the same way it already
+rejects a missing one — no snapshot for that instrument, no exception
+raised.
+
+### Why
+This keeps the fix scoped to the exact failure mode found, reusing an
+existing code path rather than adding a broad exception-swallowing layer
+that could hide a genuinely unexpected bug in the same function. The
+real `YFinanceProvider` already guards `last_price` this way when
+scanning bars, but the assembly boundary should not rely on any one
+`MarketDataProvider` implementation being that careful — this is a
+defense-in-depth fix at the layer every provider implementation passes
+through.
+
+### Consequence
+One instrument's malformed quote now degrades to `unavailable` for that
+instrument alone; every sibling instrument's snapshot in the same batch
+is unaffected. See `test_one_instrument_with_zero_previous_close_does_not_corrupt_sibling`
+in `test_market_data_service.py` and the corresponding API-level test in
+`test_watchlist_api.py`.
+
+---
+
+## Decision: ChangeEvent creation revalidates checkpoint currency (P0 Hardening #3)
+
+### Problem
+`ChangeEventService.get_or_create_active` trusted the `checkpoint`
+argument passed in by its caller without re-checking it was still the
+CURRENT checkpoint at write time. A `GET /watchlist` request reads
+checkpoint C1, then spends real time fetching live market data; a
+concurrent explicit Mark as Seen on the same instrument can advance the
+checkpoint to C2 (and acknowledge whatever was active at that moment —
+nothing yet, since the GET's event hadn't been inserted) before the GET
+resumes. The GET then persists a brand-new, unacknowledged `ChangeEvent`
+tied to the now-superseded C1 — a market state the user had just
+explicitly acknowledged could resurface as a fresh, unacknowledged
+attention item.
+
+### Options
+- Accept the race as a narrow, self-healing edge case (the next Mark
+  Seen acknowledges by `(user, instrument)`, not by `checkpoint_id`, so
+  it would eventually catch the stale event too).
+- Re-read the CURRENT checkpoint immediately before persisting, and
+  no-op if it no longer matches the checkpoint this evaluation was
+  computed against.
+
+### Decision
+The latter. `get_or_create_active` now re-fetches the current checkpoint
+document for `(user_id, instrument_id)` and compares its `id` against
+the `checkpoint` argument's `id` right before the find-before-insert
+check; a mismatch means this evaluation is stale and the function
+returns `None`.
+
+### Why
+This task's entire hardening scope is exactly the checkpoint/ChangeEvent
+lifecycle's integrity — leaving a known, reproducible way for an
+observation to outlive its own acknowledgement (even temporarily) would
+directly contradict the "observation never becomes false acknowledged
+state" invariant this whole product is built around, even though the
+window is narrow. The fix needs no lock or transaction: a single
+additional indexed read on the existing unique-keyed `checkpoints`
+collection shrinks the race window from the whole request's duration
+down to just this function's own insert.
+
+### Trade-off
+A sub-millisecond window remains between this re-check and the
+subsequent insert — not closeable without a lock/transaction, which this
+project's standing rule reserves for a demonstrated need stronger than
+this. The existing unique index remains the actual source of truth
+preventing any duplicate document regardless of how that residual window
+resolves.
+
+### Consequence
+See `test_evaluation_against_a_superseded_checkpoint_creates_no_orphaned_event`
+in `test_change_event_service.py`, which reproduces the exact race
+deterministically (construct C1, then C2, then evaluate against C1) and
+confirms the pre-fix code inserted the orphaned event while the post-fix
+code correctly no-ops.
+
+---
+
+## Decision: DuplicateKeyError recovery extended to Add Stock and seed-instrument creation (P0 Hardening #4/#5)
+
+### Problem
+`get_or_create_watchlist` already had a `DuplicateKeyError`
+catch-and-recover path for its own find-then-insert race (see the
+Persistent Anonymous Watchlist Identity decision). Two sibling code
+paths used the exact same vulnerable find-then-insert pattern on the
+`instruments` collection without the same recovery: `add_instrument`
+(two different owners racing to Add Stock the same brand-new
+`(symbol, exchange)` pair) and `ensure_seed_instruments` (two different
+brand-new owners' first-ever requests racing to seed the same
+not-yet-created seed symbol on a fresh database). Both raised an
+unhandled `DuplicateKeyError` (500) for the losing request under real
+concurrency.
+
+### Options
+- Leave both as-is; treat the race as acceptably rare.
+- Extend the exact same recovery pattern already proven for
+  `get_or_create_watchlist` to both sites.
+
+### Decision
+The latter. Both `add_instrument` and `ensure_seed_instruments` now wrap
+their `insert_one` call in `try`/`except DuplicateKeyError`, re-fetch the
+winning request's document, and — for `add_instrument` — still add it to
+the calling owner's own membership rather than leaving that owner with
+no membership at all.
+
+### Why
+This is the same class of race, on the same collection, with the same
+unique index (`uniq_symbol_exchange`) already providing the real
+source-of-truth guarantee — reusing the exact pattern already validated
+for `Watchlist` creation is more consistent and lower-risk than inventing
+a different mechanism for the same problem shape.
+
+### Consequence
+Both races are now reproduced deterministically (not via real threads)
+using the same "force `find_one` to miss a document a concurrent request
+already inserted" technique already established for the `Watchlist`
+race — see `test_add_instrument_survives_concurrent_creation_race_for_same_new_symbol`
+and `test_ensure_seed_instruments_survives_concurrent_seeding_race` in
+`test_watchlist_api.py`.
+
+---
+
+## Decision: Frontend failure-state truthfulness hardening (P0 Hardening #6)
+
+### Problem
+Two related truthfulness gaps were found in the frontend's handling of
+failed/malformed API responses. First: `instruments`/`attentionItems`
+default to `[]` on mount, and a request that had never yet succeeded
+(e.g., failing on the very first load) left them at that default — the
+UI then rendered its normal empty-state copy ("Your watchlist is
+empty.", "You're all caught up...") as if the backend had *confirmed*
+an empty/caught-up state, when it had actually never returned anything
+at all. `WatchlistTable` additionally conflated this with a THIRD case:
+a non-empty watchlist whose current search/filter matched nothing.
+Second: a 200 response with an unexpected shape (`null` body, a missing
+or non-array `instruments`/`attention_items` field) would let
+`undefined` flow into `.filter()`/`.map()` calls downstream and crash
+the page.
+
+### Options
+- Leave the default empty-state copy as the fallback for "never
+  loaded," accepting the false-positive framing.
+- Track whether each feed has ever genuinely succeeded, and branch the
+  empty-state copy on that; validate response shape before returning it
+  from `api.js`.
+
+### Decision
+The latter, for both. `App.jsx` gained `hasLoadedWatchlistOnce`/
+`hasLoadedAttentionOnce` refs and `watchlistUnavailable`/
+`attentionUnavailable` state, set `true` only while a feed has never
+succeeded and the current attempt also failed; `AttentionSection`/
+`WatchlistTable` branch their empty-state message on these flags (and,
+for `WatchlistTable`, on the real unfiltered `totalCount` to distinguish
+"no search/filter match" from "genuinely empty"). `api.js`'s
+`fetchWatchlist`/`fetchAttention` now `throw` on a non-array
+`instruments`/`attention_items` field, routing a malformed-but-200
+response through the exact same failure-handling path (keep last known
+good data, show a truthful error) already used for network/HTTP errors.
+
+### Why
+Once a feed has succeeded even once, a later transient failure should
+keep showing the last real data — the existing "never let a failed read
+wipe good previous data" behavior was already correct and is preserved
+unchanged; the fix only closes the gap that existed *before* the first
+success. Treating a malformed 200 as a thrown error (rather than
+silently defaulting to `[]`) reuses already-correct machinery instead of
+inventing a second, parallel "malformed" state with its own handling.
+
+### Consequence
+See P0 Hardening #6's full audit for the state matrix this closes
+(`AttentionSection.jsx`, `WatchlistTable.jsx`, `api.js`, `App.jsx` — all
+four files changed together in the cumulative hardening commit
+`21e45bc`). No test framework exists for the frontend (see Known
+Limitations in `architecture.md`); these fixes were verified by direct
+code tracing and `npm run build`/`npm run lint`, not by an automated
+frontend test suite.
+
+---
+
+## Decision: Conclusion of the P0 hardening program
+
+### Decision
+Seven dedicated adversarial-hardening passes were run in sequence over
+the finished feature set: (1) observation-vs-acknowledgement, (2)
+market-data correctness/provider-failure isolation, (3) checkpoint/
+ChangeEvent lifecycle, (4) anonymous identity/authorization, (5) MongoDB
+integrity/concurrency, (6) API/frontend failure handling, and (7) a
+final end-to-end adversarial regression audit treating the whole system
+as one stateful lifecycle rather than isolated components. All fixes
+from all seven passes are committed together as one cumulative commit
+(`21e45bc fix: harden watchlist state and failure handling`), covering
+exactly four production files (`market_data_service.py`,
+`change_event_service.py`, `watchlist_service.py`, and the four frontend
+files above) plus their regression tests — no unrelated refactoring, no
+new infrastructure, no product-semantics change.
+
+### Why
+Treating hardening as a dedicated, adversarial pass over an
+already-feature-complete system — rather than folding correctness
+review into each feature's own implementation — surfaced several real
+bugs (see above) that inspection-while-building had not caught,
+specifically around concurrency and cross-request timing, which are
+exactly the class of bug that's easy to miss when building one request
+at a time.
+
+### Consequence
+A subsequent pre-deployment Git review (inspection-only) confirmed the
+cumulative diff contains exactly the fixes and tests described above and
+nothing else — no debug logging, no secrets, no unrelated files. This is
+the state the project is in as of this entry: hardening is concluded,
+not open-ended; any further change should be evaluated as its own new,
+scoped decision, not folded silently into "more hardening."
+
+---
+
+## Decision: Proceed to deployment configuration and live QA
+
+### Decision
+With the hardening program concluded, the next work is deployment
+configuration and live-environment QA, not further feature work or
+further hardening passes. A dedicated pre-deployment environment
+inspection (inspection-only, no code changes) has already identified
+the exact two hardcoded-origin edits required before a real deployment
+will function: `app/main.py`'s CORS `allow_origins` list (currently
+`localhost`-only) must include the real production frontend origin, and
+`frontend/src/api.js`'s `API_BASE` constant (currently
+`http://127.0.0.1:8000`) must point at the real deployed backend origin
+before the production frontend build is made. Neither edit has been
+made yet — this entry only records the decision to make deployment the
+next scoped piece of work, not the edits themselves.
+
+### Why
+Everything else already inspected (identity/authorization, checkpoint/
+ChangeEvent lifecycle, MongoDB concurrency, provider-failure isolation,
+frontend truthfulness) is genuinely deployment-ready per the hardening
+program's own final verdict; the two remaining items are small,
+mechanical, already-identified configuration edits, not open design
+questions requiring a new decision process.
+
+### Consequence
+`plan.md`'s "Remaining" sequence reflects this ordering: deployment
+configuration → deployment → live browser QA → fix only what that QA
+surfaces → final documentation verification → final Git cleanup → push
+→ demo prep.

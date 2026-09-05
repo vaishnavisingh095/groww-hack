@@ -4,11 +4,14 @@
 
 | Component | Responsibility | Owns |
 |---|---|---|
-| Watchlist Service | CRUD for user watchlists and instrument membership | Watchlist documents |
-| Market Data Service | Talks to the external provider, runs the shared poll loop, maintains the current-snapshot cache, computes freshness | MarketSnapshot documents |
-| Checkpoint Service | Creates/advances user checkpoints (explicit + implicit) | Checkpoint documents |
-| Meaningful Change Engine | Compares a checkpoint's baseline snapshot to the current snapshot using fixed deterministic rules; persists resulting events | ChangeEvent documents |
+| Anonymous Identity (`identity.py`) | Resolves/issues the per-browser anonymous capability cookie; the one place `user_id` is ever derived | Nothing persisted — the cookie value itself, set on the HTTP response |
+| Watchlist Service | Owner-scoped watchlist membership; global Instrument creation/reuse; Add Stock | Instrument (global), Watchlist (owner-scoped) documents |
+| Market Data Service | Talks to the external provider and assembles snapshots; **as currently implemented, fetches live on demand per request rather than via a background poll loop** (see Data Flow above) | Nothing persisted — in-memory `MarketSnapshot` value objects per request |
+| Checkpoint Service | Creates/advances user checkpoints (explicit only in practice — see Checkpoint Model below) | Checkpoint documents |
+| Meaningful Change Engine | Compares a checkpoint's baseline snapshot to the current snapshot using fixed deterministic rules | Nothing persisted — a pure function of the values passed in |
+| ChangeEvent Service | Persists/dedupes ChangeEvents from the Change Engine's output; acknowledges them on explicit action | ChangeEvent documents |
 | Attention Engine | Ranks active (unacknowledged) change events per user; generates explanations | Nothing persisted — pure computation over ChangeEvents |
+| Frontend presentation/state layer | Renders backend-derived state truthfully; owns only local UI state (search, filters, View Details expansion, in-flight/error flags) | Nothing backend-relevant — no owner identity, no business state |
 
 No queues, no message bus, no microservices — all five are modules within
 one FastAPI application. See `decisions.md` for why.
@@ -40,14 +43,59 @@ one FastAPI application. See `decisions.md` for why.
 User-initiated writes (add to watchlist, mark checkpoint) go directly to
 their respective services; they don't flow through the poll loop.
 
+**CURRENT IMPLEMENTATION NOTE — this diagram describes the originally
+designed data flow, not what actually runs today.** There is no
+standalone backend poll loop and no persisted `MarketSnapshot` document.
+`MarketDataService.fetch_snapshots` is called synchronously, live,
+inside `GET /watchlist`'s (and the two Mark Seen/Mark All routes')
+own request handler, every time one of those routes is called — the
+"poll" a user experiences is the **frontend's** own client-side
+`setInterval` re-calling `GET /watchlist`/`GET /watchlist/attention`
+every 60 seconds, not a backend process. The real, current data flow is:
+
+```
+[Frontend poll / user action]
+        |
+        v
+GET /watchlist  (or a Mark Seen/Mark All route)
+        |
+        v
+MarketDataService.fetch_snapshots  --(live call, every invocation)--> [External Provider]
+        |
+   in-memory MarketSnapshot value objects (never written to Mongo)
+        |
+        v
+[Checkpoint] (Mongo, read-only on this path) ---compare---> [Meaningful Change Engine]
+        |
+   writes (if a real checkpoint exists, snapshot status is OK, and the
+   change is meaningful)
+        v
+[ChangeEvent] (Mongo)
+        |
+   read at request time (a separate request, GET /watchlist/attention)
+        v
+[Attention Engine] --ranked + explained--> [Frontend]
+```
+
+This is a documented, deliberate sequencing choice (the on-demand
+approach reuses the same `MarketDataService`/`MarketDataProvider`
+abstraction the background loop would have used), not an unnoticed gap
+— see `decisions.md`'s "On-demand fetch per request, not a separate
+background poll process" entry for the full reasoning and its known
+trade-off: N concurrent users currently cause N concurrent provider
+fetches for the same instrument, not one shared fetch.
+
 ## API Boundaries
 
 - Frontend never talks to the external market-data provider directly —
   always through the backend, so freshness/staleness logic is enforced in
   one place.
-- The poll loop is the only writer of `MarketSnapshot`. Request-time reads
-  never trigger a live provider call (this is what keeps the fan-out
-  bounded — see `decisions.md`).
+- **As currently implemented**, the Market Data Service is called
+  directly from three request handlers (`GET /watchlist`, the two Mark
+  Seen/Mark All routes) — there is no separate poll process, and no
+  fan-out deduplication across concurrent requests yet (see the
+  Current Implementation Note above). The originally-designed
+  poll-loop-is-the-only-writer property does not currently hold.
 - The Meaningful Change Engine only runs comparisons when a checkpoint
   exists; it never invents a baseline.
 
@@ -56,9 +104,15 @@ their respective services; they don't flow through the poll loop.
 - **Instrument identity & metadata**: our own `Instrument` collection is
   the source of truth for what's trackable; the provider is the source of
   truth for price/volume values only.
-- **Current market state**: `MarketSnapshot` — always the latest fetched
-  value per instrument, overwritten each poll cycle. This is a cache of
-  external truth, not our own truth.
+- **Current market state**: `MarketSnapshot` — the latest fetched value
+  per instrument, but **as currently implemented, this is an in-memory
+  value object computed fresh on every request, never written to
+  MongoDB** (see the Current Implementation Note under Data Flow above).
+  The `market_snapshots` collection and its unique index on
+  `instrument_id` exist (see Database Integrity below) but no code path
+  writes to that collection today — it is dormant infrastructure, kept
+  for the originally-designed persisted-poll-loop model, not currently
+  load-bearing.
 - **What the user has seen**: `Checkpoint` — entirely our own state, never
   derived from the provider.
 - **What changed**: `ChangeEvent` — computed once by us, then persisted as
@@ -71,11 +125,120 @@ their respective services; they don't flow through the poll loop.
   `Watchlist`) is an opaque, server-generated token resolved from an
   anonymous capability cookie — see decisions.md's "Persistent anonymous
   watchlist identity." It is never accepted from a request body, query
-  parameter, or header.
+  parameter, or header. See "Anonymous Identity" below for the full
+  mechanism.
 - **Watchlist membership**: `Watchlist.instrument_ids` is the source of
   truth for which instruments belong to a given owner. `Instrument`
   documents remain global/shared reference data regardless of who
   references them.
+
+**Ownership scope, at a glance:**
+
+| Collection | Scope |
+|---|---|
+| `Instrument` | GLOBAL — shared reference data, not owned by anyone |
+| `Watchlist` | OWNER-SCOPED — one document per anonymous owner |
+| `Checkpoint` | OWNER + INSTRUMENT — one active document per pair |
+| `ChangeEvent` | OWNER + INSTRUMENT + CHECKPOINT — see Database Integrity |
+| Attention | DERIVED AT REQUEST TIME from active `ChangeEvent`s — never persisted |
+
+A global `Instrument` document existing in MongoDB does **not** mean
+every owner watches it — membership is exclusively determined by
+`Watchlist.instrument_ids`, checked per owner on every read.
+
+## Anonymous Identity
+
+**This is anonymous, capability-based identity for the hackathon — it
+is explicitly NOT full authentication and is never described as one
+anywhere in this app or its docs.** There are no accounts, no
+passwords, and no login flow.
+
+- `app/services/identity.py`'s `resolve_owner_id` is the single FastAPI
+  dependency every route uses to obtain `user_id` — no route reads it
+  any other way.
+- On a request with no existing cookie (or an empty one), the backend
+  generates a token via `secrets.token_urlsafe(32)` (256 bits,
+  cryptographically secure — never `random`, never a timestamp or
+  sequential id) and sets it as the `watchlist_owner` cookie.
+- On a request with an existing, non-empty cookie value, that value is
+  trusted **as-is** as the `user_id` — there is no database lookup to
+  "validate" it, no separate `owners` collection, and no
+  signature/verification step. An unissued/garbage value simply becomes
+  its own fresh, currently-empty owner identity; by construction (the
+  token's entropy), it can never collide with a real existing owner.
+- Cookie attributes: `httponly=True` (always — the frontend cannot read
+  this cookie via JavaScript and never attempts to), `samesite="lax"`
+  (always), `secure=True` only when `settings.environment == "production"`
+  (an exact string match — local development runs over plain HTTP,
+  which rejects `Secure` cookies outright), `max_age` ≈ 1 year (a flat
+  expiry, not sliding), `path="/"`.
+- The frontend never receives this value in any response body, never
+  stores an owner id anywhere itself (no `localStorage`, no
+  `sessionStorage`), and `api.js` sends `credentials: 'include'` on
+  every call so the browser carries the cookie automatically. CORS
+  (`app/main.py`) has `allow_credentials=True` paired with an explicit
+  origin list — never a wildcard, which browsers reject outright when
+  combined with credentials.
+- **Accepted limitation, disclosed, not an oversight**: possession of
+  the cookie *is* access to that owner's watchlist — there is no
+  password behind it, so a stolen or shared cookie grants full
+  read/write access to that anonymous owner's state. `httpOnly` (no JS
+  exfiltration via a script) and `Secure` in production (no plaintext
+  network capture) are the mitigations, not a claim of stronger
+  protection. This is not intended as production-grade identity
+  management for a real financial product; see `decisions.md`'s
+  "Persistent anonymous watchlist identity" decision for the full
+  reasoning.
+
+## Database Integrity
+
+Verified, actual MongoDB indexes (`app/db/indexes.py`, applied
+idempotently on every app startup):
+
+| Collection | Unique index | Enforces |
+|---|---|---|
+| `instruments` | `(symbol, exchange)` | One global Instrument per tradeable listing |
+| `watchlists` | `(user_id)` | One Watchlist per owner |
+| `checkpoints` | `(user_id, instrument_id)` | One active checkpoint per owner+instrument — advancing replaces it |
+| `change_events` | `(user_id, instrument_id, checkpoint_id)` | At most one ChangeEvent per checkpoint version (`acknowledged` deliberately excluded from this key — an event transitions in place, never duplicates because of that transition) |
+
+`change_events` additionally has a non-unique `(user_id, acknowledged)`
+index for the Attention Engine's "active events for this user" query.
+
+**Concurrency strategy — no transactions, no distributed locks.**
+Every write in this codebase is a single-document MongoDB operation
+(`insert_one`, `update_one`/`update_many`, or `replace_one` with
+`upsert=True`), each of which is already atomic at the document level
+without needing a transaction. Two categories of race are handled, both
+without new infrastructure:
+- **Find-then-insert races** (checking a document doesn't exist, then
+  inserting it) — `Watchlist` creation, Add Stock's `Instrument`
+  creation, and first-owner seed `Instrument` creation all catch
+  `DuplicateKeyError` and recover by re-fetching the document the
+  winning concurrent request actually persisted, rather than raising.
+  The unique index is the real source of truth under concurrency; the
+  service's own find-before-insert check is only the common-case fast
+  path.
+- **Membership updates** use `$addToSet` (atomic, never a lost update
+  from a concurrent addition of a *different* instrument to the same
+  owner's watchlist), never `$push` (which would not itself cause
+  duplicates here, but doesn't express the "no duplicate membership"
+  intent) and never a read-modify-write `replace_one` (which could lose
+  a concurrent sibling update).
+- **ChangeEvent creation** additionally re-validates the checkpoint it
+  was evaluated against is still current before persisting (P0
+  Hardening #3's fix) — this is a correctness guard against stale data,
+  not a concurrency-control mechanism in itself.
+
+**Why no transaction/lock layer was introduced**: every race actually
+identified and reproduced during hardening was fully resolved by an
+existing unique constraint plus an atomic single-document operation
+(and, where a find-then-insert gap existed, a `DuplicateKeyError`
+recovery path). No demonstrated correctness problem in this codebase
+requires cross-document atomicity — introducing transactions or
+distributed locks for a problem already solved at the single-document
+level would be exactly the kind of unjustified infrastructure this
+project's engineering rules explicitly warn against.
 
 ## Data Model
 
@@ -143,15 +306,40 @@ as the real per-owner membership record — see decisions.md.
   status: "ok" | "stale" | "invalid" | "unavailable"
 }
 ```
-One document per instrument, upserted every poll cycle (not an
-append-only history — see `decisions.md` on why we don't keep tick
-history for the hackathon scope).
+This is the originally designed shape: one document per instrument,
+upserted every poll cycle (not an append-only history — see
+`decisions.md` on why we don't keep tick history for the hackathon
+scope). **As currently implemented, this shape exists as a Pydantic
+value object (`app/models/market_snapshot.py`) constructed fresh inside
+each request that needs it and never persisted to MongoDB** — see the
+Current Implementation Note under Data Flow above. The
+`market_snapshots` collection/index described elsewhere in this
+document is real (index creation is idempotent and runs on every
+startup) but currently unused by any write path.
 
 `status` is computed at write time from `fetched_at` (see Freshness Model
 below), not left for the reader to infer, and never from
 `provider_timestamp`.
 
 ### Checkpoint
+
+**OBSERVATION ≠ ACKNOWLEDGEMENT — the invariant this whole model
+exists to enforce.** `GET /watchlist` OBSERVES current market state and
+MAY persist a `ChangeEvent` recording that a checkpoint's baseline was
+meaningfully exceeded (a market-observed fact) — but it never advances,
+replaces, or creates a `Checkpoint`, under any condition, including a
+brand-new instrument with no checkpoint at all. Only an explicit Mark as
+Seen (single instrument) or Mark All as Seen action ever writes a
+`Checkpoint` — establishing the first baseline, advancing an existing
+one, and acknowledging that instrument's active `ChangeEvent`(s) in the
+same action. `id` below is a durable, application-assigned UUID
+(distinct from MongoDB's own `_id`), regenerated on every explicit
+advance, so a `ChangeEvent.checkpoint_id` can durably reference the
+exact checkpoint version it was detected against even after that
+(owner, instrument) pair's checkpoint is later replaced — see
+`decisions.md`'s "Checkpoint gets a durable, application-assigned `id`"
+decision.
+
 ```
 {
   _id,
@@ -379,20 +567,36 @@ composite model later (explicitly deferred, not attempted now).
 Both constants live in one place in code, are named, and are the first
 thing to tune if the demo data looks wrong.
 
-**No baseline case (hard question G):** if no `Checkpoint` exists for a
-(user, instrument) pair, the Change Engine does not run — it cannot invent
-a comparison. The API returns an explicit `baseline_pending` state for
-that instrument. The Checkpoint Service creates an implicit checkpoint on
-first sight, which resolves this state on the instrument's next poll
-cycle.
+**No baseline case (hard question G) — CORRECTED from the original
+design.** If no `Checkpoint` exists for a (user, instrument) pair, the
+Change Engine does not run a comparison — it cannot invent one. `GET
+/watchlist` reports `change.has_baseline: false` with
+`reason: "Baseline pending — no previous check to compare against."`
+for that instrument. **The originally-designed implicit checkpoint
+creation on first sight does NOT run from this (or any) read path.**
+`CheckpointService.ensure_initial_checkpoint` (the create-if-absent,
+IMPLICIT-source primitive) still exists as a correct, tested, isolated
+method, but is called from no production code path — see
+`decisions.md`'s "Explicit checkpoints are never silently overwritten
+by implicit ones" entry and the Checkpoint Model / OBSERVATION ≠
+ACKNOWLEDGEMENT distinction below for why: calling it from `GET
+/watchlist` would mean a mere page load could establish a baseline the
+very next read would then treat as an acknowledged comparison point —
+opening the app is not acknowledgement. A `baseline_pending` instrument
+stays `baseline_pending` across any number of repeated `GET` calls;
+only an explicit Mark as Seen / Mark All action ever resolves it.
 
 **Not re-surfacing the same change (hard question H):** a `ChangeEvent` is
 created once, at detection time, tied to the checkpoint it was detected
-against. When the user's checkpoint advances (explicit "mark as seen" or
-implicit next-session logic), events tied to the prior checkpoint are
-marked `acknowledged: true` and excluded from the Attention Engine's
-active list. The Change Engine does not re-run comparisons against an
-already-superseded checkpoint.
+against. When the user's checkpoint advances via an **explicit** Mark as
+Seen / Mark All action (there is no implicit next-session advancement —
+see above), events tied to the prior checkpoint are marked
+`acknowledged: true` and excluded from the Attention Engine's active
+list. The Change Engine does not re-run comparisons against an
+already-superseded checkpoint, and — per the P0 Hardening #3 fix — a
+`GET` evaluation that was computed against a checkpoint later superseded
+by a concurrent Mark Seen is detected and discarded rather than
+persisted as a stale, orphaned event.
 
 ## Attention Engine — Design
 
@@ -410,6 +614,18 @@ artificially suppress its rank) or as automatically maximal. No new
 scoring model is introduced; ranking reuses the Change Engine's own
 numbers so the "why is this ranked here" answer is always traceable to the
 same explanation already shown for the change itself.
+
+**Attention levels** (locked bands, inclusive lower bounds — matching
+the Change Engine's own inclusive `>=` threshold convention): `HIGH` when
+`score >= 2.0`; `MEDIUM` when `1.25 <= score < 2.0`; `WATCH` when
+`1.0 <= score < 1.25`. A `ChangeEvent` only exists at all when at least
+one signal was already `>= 1.0×` its own threshold at detection time
+(that is what `meaningful_change` meant) — so `WATCH` is the true floor,
+never a catch-all for an unreachable case below it. `rank` is assigned
+after sorting the active set by `attention_score` descending — it is a
+position, not a separately computed value, and the frontend never
+recomputes or re-sorts by anything else (see Frontend Architecture
+below).
 
 **Explanation generation**: a template filled from the `signals` object
 already stored on the `ChangeEvent`. **Exact required wording for the
@@ -634,8 +850,15 @@ results in a `MarketSnapshot.status` of `stale`/`invalid`/`unavailable`.
    of what was actually detected and when.
 4. Attention ranking is always fully derivable from active `ChangeEvent`s;
    it is never the persisted source of truth.
-5. The poll loop fetches each **distinct** instrument at most once per
-   cycle, regardless of how many users/watchlists reference it.
+5. ~~The poll loop fetches each **distinct** instrument at most once per
+   cycle, regardless of how many users/watchlists reference it.~~ **Does
+   not currently hold** — this was the originally-designed invariant for
+   the background-poll-loop model. As implemented (on-demand fetch per
+   request), each request fetches independently; N concurrent users
+   currently cause N concurrent provider fetches for the same
+   instrument, with no shared-fetch deduplication. See the Current
+   Implementation Note under Data Flow and `decisions.md`'s "On-demand
+   fetch" entry for this known, disclosed gap.
 6. A provider failure degrades a snapshot's status; it never raises an
    unhandled exception into a request-serving code path.
 7. `fetched_at` (our own timestamp) is the sole authoritative input to
@@ -657,29 +880,32 @@ results in a `MarketSnapshot.status` of `stale`/`invalid`/`unavailable`.
 
 ## Failure Modes & Responses
 
+**Current implementation note**: the rows below describing "keep/retain
+last known valid snapshot" and the backoff policy paragraph describe the
+originally-designed, persisted-poll-loop model. **As currently
+implemented, there is no persisted snapshot to retain** — each request
+fetches live, and a failed instrument simply reports `unavailable` for
+that one request, with no cached prior value served in its place (a real
+current gap, not a design choice — see Known Limitations). This is
+called out per-row below rather than only once, since it changes what
+the user actually sees for several of these rows.
+
 | Failure | Backend behavior | User sees |
 |---|---|---|
-| Provider timeout | Retain last known valid snapshot, mark `stale` after threshold | "Delayed · Xm ago" |
-| Provider rate-limited (429) | Exponential backoff on the poll loop (e.g., double the interval up to a cap, reset after a clean cycle); never retry immediately in a tight loop; keep last-known snapshot | "Delayed · Xm ago", no crash |
-| Provider returns malformed/partial response | Reject the update for that instrument this cycle, log it, keep prior snapshot | Stale indicator if it persists across cycles |
-| Price missing, non-numeric, or non-finite | Reject the value outright, mark `invalid`, retain prior good snapshot | Data-issue indicator, never a wrong price shown as real |
+| Provider timeout | **As implemented**: no persisted snapshot exists to retain; this instrument reports `unavailable` for this request only, and may succeed again on the next request/poll with no memory of the failure. *(Originally designed: retain last known valid snapshot, mark `stale` after threshold.)* | "Data unavailable" this cycle; may recover next poll |
+| Provider rate-limited (429) | No backoff loop exists (there is no poll loop to back off) — a 429 is caught the same as any other provider failure, per-instrument, per-request; not exercised by any live test. *(Originally designed: exponential backoff on the poll loop.)* | Same as any other single-request provider failure — "Data unavailable" this cycle |
+| Provider returns malformed/partial response | Reject the update for that instrument this request; no snapshot is produced (see the market-data hardening fix below for the specific non-finite/non-positive-price case) | "Data unavailable" this cycle |
+| Price missing, non-numeric, or non-finite | Reject the value outright; no snapshot for that instrument this request — and, per the P0 Hardening #2 fix, this failure is scoped to the one malformed instrument and never aborts sibling instruments' snapshots in the same batch | "Data unavailable" this cycle for that instrument; siblings unaffected |
 | Volume missing, non-numeric, non-finite, or negative | Reject the volume value; retain the price if it is otherwise valid, mark the volume signal unavailable rather than discarding the whole snapshot (negative volume is rejected as a real impossibility; missing/non-numeric volume degrades gracefully rather than invalidating the snapshot) | Price still shown if valid; volume/change-detection simply omitted for that update |
-| Provider unavailable entirely (network failure, service down) | Do not fabricate a snapshot; keep serving last known valid snapshot marked `stale`/`unavailable` as age dictates | "Data unavailable · last update Xm ago" |
+| Provider unavailable entirely (network failure, service down) | Do not fabricate a snapshot; report `unavailable` for every affected instrument this request | "Data unavailable" this cycle |
 | Checkpoint and current snapshot span a session boundary | Volume acceleration marked unavailable; price comparison still computed | Change may still surface on price alone; no volume claim shown |
 | New instrument, no snapshot yet | `status: unavailable` | "Fetching initial data..." |
 | New instrument, no checkpoint yet | Change Engine skips it | "Baseline pending" instead of a change or a crash |
-| Two requests advance the same checkpoint concurrently | Last-write-wins is acceptable here — see `decisions.md` for why this doesn't need transaction-level protection | No visible inconsistency for a single user's own action |
+| Two requests advance the same checkpoint concurrently | Last-write-wins via `replace_one(upsert=True)` — a single atomic MongoDB operation, so the result is always one complete, valid checkpoint document (never a torn/partial write), whichever request's write lands last | No visible inconsistency for a single user's own action |
+| A `GET` evaluation races a concurrent Mark Seen on the same instrument | `ChangeEventService` re-validates the checkpoint is still current before persisting a `ChangeEvent` (P0 Hardening #3 fix) — a stale evaluation is silently dropped, never persisted against a superseded checkpoint | No orphaned/resurfaced attention item |
+| Concurrent Add Stock / first-owner seeding for the same new `(symbol, exchange)` | `DuplicateKeyError` recovery re-fetches the winning request's document and adds it to the losing request's own membership (P0 Hardening #4/#5 fix) | Both owners end up with correct membership; no 500 |
 | Empty watchlist | Return empty list, not an error | "Your watchlist is empty — add a stock to get started" |
-
-**Backoff policy detail**: on a 429 or repeated timeout, the poll loop
-increases its interval (e.g., 60s → 120s → 240s, capped) rather than
-retrying immediately — "do not hammer the provider" is a hard
-requirement, not a best-effort preference. No 429s or errors were
-observed in the one live test run performed, so this policy remains
-untested against a real rate-limit event; it is implemented defensively
-regardless. The frontend is unaffected by this backoff beyond seeing
-slightly older `fetched_at` timestamps — it always continues serving
-whatever the last known valid snapshot was.
+| `GET /watchlist`/`GET /watchlist/attention` request itself fails, or returns a malformed 200 | Frontend distinguishes "never successfully loaded" from "confirmed empty/caught-up" (P0 Hardening #6 fix); a malformed-shape 200 is treated as a failure, not rendered | Truthful "unavailable"/error state, never a false "empty"/"caught up" claim |
 
 **Note on removed assumptions**: an earlier draft of this table listed
 "zero volume mid-session" and "circuit-limit-violating jump" as examples
@@ -692,69 +918,150 @@ inventing an exchange constraint rather than checking a real one.
 
 ## API Contracts (frontend-facing)
 
+**The shapes below are the actual, current contract**, read directly
+from `app/routes/watchlist.py` — not the originally-illustrative shape
+this section used to show (see `decisions.md`'s "Attention Engine
+exposed as its own endpoint" decision, which already noted that the
+original illustration was aspirational and never matched what
+`GET /watchlist` actually returns).
+
 ```
-GET  /watchlist                     -> current user's watchlist with
-                                        snapshots + freshness + active
-                                        change events, attention-ranked
+GET  /watchlist                     -> current owner's watchlist:
+                                        current price/volume/status per
+                                        instrument, plus that
+                                        instrument's own change
+                                        comparison against its
+                                        checkpoint (if any). Read-only
+                                        with respect to Checkpoint state;
+                                        may persist a ChangeEvent (see
+                                        Checkpoint Model below).
 
-POST /watchlist/instruments         -> add instrument (body: symbol,
-                                        exchange)
+GET  /watchlist/attention           -> this owner's ranked, active
+                                        (unacknowledged) attention items.
+                                        Pure read — creates, advances, or
+                                        acknowledges nothing.
 
-DELETE /watchlist/instruments/{id}  -> remove instrument
+POST /watchlist/instruments         -> Add Stock (body: symbol,
+                                        exchange). No remove-instrument
+                                        endpoint exists — there is no
+                                        DELETE route in this API.
 
 POST /watchlist/instruments/{id}/checkpoint
                                      -> explicit "mark as seen" for one
                                         instrument (advances checkpoint,
-                                        acknowledges its change events)
+                                        acknowledges its active change
+                                        events). 404 if the instrument
+                                        doesn't exist OR isn't in the
+                                        caller's own watchlist (same
+                                        status for both, so a caller
+                                        cannot distinguish the two).
 
 POST /watchlist/checkpoint          -> explicit "mark all as seen" for
-                                        the whole watchlist
+                                        the whole watchlist; reports
+                                        which instruments were updated
+                                        vs. skipped (no valid current
+                                        data), never fails the whole
+                                        batch for one instrument.
 ```
 
-`GET /watchlist` response shape (illustrative):
+`GET /watchlist` response shape (actual):
 ```json
 {
   "instruments": [
     {
-      "instrument": { "symbol": "RELIANCE", "exchange": "NSE" },
-      "snapshot": {
-        "last_price": 2456.75,
-        "percent_change": 0.5,
-        "volume": 8234567,
-        "status": "ok",
-        "status_label": "Fresh · 42s ago",
-        "as_of": "2026-09-04T10:15:00Z"
-      },
-      "change_state": "baseline_pending" | "no_change" | "changed",
-      "active_change": {
-        "reason": "RELIANCE moved 4.2%. Trading volume accelerated to 2.3× the rate observed before you last checked.",
+      "instrument_id": "66f...",
+      "symbol": "RELIANCE",
+      "exchange": "NSE",
+      "price": 2456.75,
+      "percent_change": 0.5,
+      "cumulative_volume": 8234567,
+      "status": "ok",
+      "freshness_label": "Updated 42s ago",
+      "data_age_seconds": 42,
+      "change": {
+        "has_baseline": true,
+        "meaningful_change": true,
+        "price_change_pct": 4.2,
+        "volume_acceleration_ratio": 2.3,
         "volume_signal_available": true,
-        "attention_rank": 1
-      }
-    },
-    {
-      "instrument": { "symbol": "TCS", "exchange": "NSE" },
-      "snapshot": { "...": "..." },
-      "change_state": "changed",
-      "active_change": {
-        "reason": "TCS moved 3.1%.",
-        "volume_signal_available": false,
-        "attention_rank": 2
+        "reason": "Price moved +4.2% and trading activity accelerated to 2.3× its baseline rate."
       }
     }
   ]
 }
 ```
-The second example illustrates a change detected across a session
-boundary (or where the near-open guard applied): price-only, with
-`volume_signal_available: false` and no volume claim in the explanation
-string.
+`status` is one of `ok`/`stale`/`unavailable`/`invalid` (`invalid` is
+modeled but never actually serialized by this route today — an invalid
+snapshot is reported as `unavailable`, per the market-data hardening
+work). When `status` is `unavailable`, `price`/`percent_change`/
+`cumulative_volume` are all `null` and `change` reports
+`has_baseline: false` regardless of whether a real checkpoint exists in
+storage — the response never claims to compare against a baseline it
+cannot currently verify (the checkpoint document itself, in Mongo, is
+left untouched).
 
-## Frontend Consumption of Attention Data
+`GET /watchlist/attention` response shape (actual):
+```json
+{
+  "attention_items": [
+    {
+      "instrument_id": "66f...",
+      "symbol": "RELIANCE",
+      "checkpoint_id": "9b8...",
+      "detected_at": "2026-09-04T10:15:00+00:00",
+      "price_change_pct": 4.2,
+      "volume_acceleration_ratio": 2.3,
+      "volume_acceleration_available": true,
+      "attention_score": 2.1,
+      "attention_level": "high",
+      "explanation": "RELIANCE moved +4.2% since your last check. Trading volume accelerated to 2.3× the rate observed before you last checked.",
+      "rank": 1
+    }
+  ]
+}
+```
 
-The attention-first web dashboard (built after the sections above) does
-not introduce any new backend API or business logic — it is a read-only
-consumer of the two existing endpoints:
+`POST /watchlist/instruments/{id}/checkpoint` response shape (actual):
+```json
+{
+  "instrument_id": "66f...",
+  "symbol": "RELIANCE",
+  "checkpoint_price": 2456.75,
+  "checkpoint_at": "2026-09-04T10:16:00+00:00",
+  "message": "Baseline saved at ₹2456.75"
+}
+```
+Returns `503` (not a checkpoint) if no valid current snapshot is
+available for that instrument this request — invalid/unavailable data
+can never become a baseline.
+
+`POST /watchlist/checkpoint` response shape (actual):
+```json
+{
+  "updated": [ { "instrument_id": "66f...", "symbol": "RELIANCE", "checkpoint_price": 2456.75 } ],
+  "skipped": [ { "instrument_id": "70a...", "symbol": "INFY" } ]
+}
+```
+
+`POST /watchlist/instruments` response shape (actual):
+```json
+{ "instrument_id": "70a...", "symbol": "WIPRO", "exchange": "NSE", "created": true }
+```
+`created: false` means the global `Instrument` already existed (this
+owner's membership was still added, or was already present) — see
+`decisions.md`'s "Add Stock's three-case duplicate-add rule."
+
+## Frontend Architecture
+
+The frontend (`frontend/src/`) is a single-page React app (`App.jsx`)
+with two presentational children (`AttentionSection.jsx`,
+`WatchlistTable.jsx`) and a thin API client (`api.js`). It introduces no
+new backend API or business logic of its own — it is a read-only
+consumer of `GET /watchlist`/`GET /watchlist/attention`, and a caller of
+the three mutation routes, never a second implementation of any backend
+decision.
+
+**Attention Data Consumption**
 
 - The attention experience is `GET /watchlist/attention`'s
   `attention_items` joined, client-side, with `GET /watchlist`'s
@@ -770,20 +1077,114 @@ consumer of the two existing endpoints:
 - Attention levels, scores, and ranking remain entirely backend-derived
   (`AttentionEngine`); the frontend only partitions the already-sorted
   list by the existing `attention_level` value into two display groups
-  (see Important Invariant 4) — it does not sort, score, or reclassify.
+  ("High Attention" for `high`, "Worth Checking" for everything else) —
+  it does not sort, score, or reclassify (see Important Invariant 4).
 - Freshness/status (`freshness_label`, `status`) remain backend/provider-
   derived and are displayed unchanged; the frontend does not compute or
   infer freshness itself.
-- Checkpoint acknowledgement semantics are unchanged: "Mark as seen" on
-  an attention card calls the same explicit per-instrument checkpoint
-  endpoint used elsewhere; there is no "mark all as seen" control in the
-  frontend (the corresponding backend endpoint exists but is not called
-  from the UI — see `decisions.md`).
 - The attention card does not display a company name (`GET /watchlist`
-  does not return one) or a "View details" action or a calculated
-  "strongest signal" — none of these exist in the backend response or in
-  any frontend logic; see `decisions.md` for why each was deliberately
-  left out rather than invented.
+  does not return one) or a calculated "strongest signal" — neither
+  exists in the backend response or in any frontend logic; see
+  `decisions.md` for why each was deliberately left out rather than
+  invented.
+
+**Search and Filters** (`App.jsx`'s `searchQuery`/`watchlistFilter`
+state, applied by pure functions `matchesSearch`/`matchesWatchlistFilter`)
+
+- Frontend-only, presentation-layer filtering over already-fetched
+  arrays. Neither triggers a fetch, changes the global attention
+  count/breakdown shown in the banner (computed from the full,
+  unfiltered `attentionItems`), mutates a checkpoint or `ChangeEvent`,
+  or affects polling — search/filter changes never call `loadAll()`.
+- Search matches `symbol`/`exchange`, case-insensitively, applied
+  identically to the watchlist table and to attention cards.
+- Filters (`All`/`Attention`/`Normal`/`Baseline Pending`) apply only to
+  `WatchlistTable`'s rows, derived entirely from fields `GET /watchlist`
+  already returns (`change.has_baseline`, membership in the already-
+  fetched attention list) — no new classification logic.
+- A search/filter combination that matches zero rows renders a distinct,
+  truthful "no results" message — never the same message used for a
+  genuinely empty watchlist or a genuinely zero-item attention list (see
+  Failure Model below).
+
+**Add Stock** — a form (`addSymbol`/`addExchange`/`addFormOpen` state)
+calling `POST /watchlist/instruments`. Clears and re-fetches
+(`loadAll()`) only after a confirmed success; a failure leaves the form
+and existing state untouched (no optimistic membership).
+
+**Mark as Seen / Mark All as Seen** — `handleMarkAsSeen`/
+`handleMarkAllAsSeen` call the corresponding backend routes, tracked by
+their own in-flight/error state (per-instrument `inFlightIds`/
+`actionErrors` for the former, dedicated `markAllInFlight`/
+`markAllError`/`markAllPartialMessage` for the latter, since Mark All
+affects many instruments at once). Both re-fetch via the same
+`loadAll()` only after a *confirmed* backend success — neither ever
+optimistically removes an attention item or marks a row acknowledged
+before the backend confirms it. `markAllPartialMessage` truthfully
+surfaces the backend's own `skipped` list rather than implying every
+instrument was acknowledged.
+
+**View Details** — a local `useState` toggle inside `AttentionCard`
+(`AttentionSection.jsx`), built entirely from props the card already
+has. No route, no modal, no API call, no checkpoint write, no
+acknowledgement — see `decisions.md`'s "View Details as a local
+expandable card" decision. Its "Result: Threshold crossed / Below
+threshold" row is a plain `>=` restatement of the same locked 2.0%/2.0×
+constants the backend already used to flag the item meaningful — it
+does not independently decide meaningfulness.
+
+**Failure-state truthfulness** (P0 Hardening #6) — `App.jsx` tracks,
+independently of the single combined `error` banner string, whether
+each of `GET /watchlist`/`GET /watchlist/attention` has *ever*
+succeeded (`hasLoadedWatchlistOnce`/`hasLoadedAttentionOnce`). Before
+either feed's first success, its section shows a distinct "unavailable"
+message rather than the default empty-state copy ("Your watchlist is
+empty.", "You're all caught up...") — an absence of data is never
+presented as a backend-confirmed empty/caught-up state. `WatchlistTable`
+additionally distinguishes a real empty watchlist from a non-empty one
+whose current search/filter matched nothing. `api.js` rejects a 200
+response with a missing/non-array `instruments`/`attention_items` field,
+routing it through the same failure-handling path as a network/HTTP
+error rather than letting it crash the page downstream.
+
+## Known Limitations
+
+Consolidated from scattered notes above — none of these are treated as
+problems requiring a fix before this hackathon; they are disclosed,
+accepted boundaries of this build's scope.
+
+- **Anonymous capability identity is not full authentication.** No
+  password, no account recovery, no multi-device linking beyond sharing
+  the same browser/cookie. See the Anonymous Identity section above.
+- **yfinance/Yahoo Finance freshness is not guaranteed.** No SLA, no
+  documented rate limit, no verified exchange-trade-time field — see
+  External Dependency below.
+- **Request-time market-data fetching is not a background pipeline.**
+  Every `GET /watchlist` (and the two Mark Seen/Mark All routes) makes a
+  live provider call; there is no shared poll process and no fan-out
+  deduplication across concurrent users. See the Current Implementation
+  Note under Data Flow above and `decisions.md`'s "On-demand fetch per
+  request" entry.
+- **No persisted last-known-good snapshot.** A provider failure for an
+  instrument reports `unavailable` for that request only, with nothing
+  cached to fall back to — unlike the originally-designed
+  persisted-poll-loop model, which would have retained a prior valid
+  value. This is the direct consequence of the on-demand-fetch deviation
+  above, not a separate choice.
+- **No frontend automated test harness.** The frontend has no test
+  framework (no vitest/jest/testing-library) in `package.json`; frontend
+  correctness is verified by `npm run lint`/`npm run build` and direct
+  code tracing, not automated tests. The backend has an extensive
+  `pytest` suite; this asymmetry is disclosed, not hidden.
+- **No real-time WebSocket/SSE stream.** Polling only, from the frontend
+  — see `decisions.md`'s "No WebSockets / real-time push" decision.
+- **No transaction/distributed-lock layer.** Every write is a
+  single-document atomic MongoDB operation; see Database Integrity
+  above for why this has been sufficient for every race actually found.
+- **Hackathon-scale architecture throughout** — a handful of users, a
+  handful of instruments, one FastAPI process, one MongoDB database. No
+  claim of horizontal scalability, multi-region deployment, or
+  production-grade uptime is made anywhere in this document.
 
 ## Major Architectural Trade-offs
 

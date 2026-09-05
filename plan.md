@@ -85,11 +85,19 @@ explainable change detection, and attention ranking.
 - LLM/AI involvement in the core change-detection or attention-scoring
   logic (explicitly excluded — must be deterministic and explainable).
 - Options/F&O instruments, multi-exchange arbitrage detection.
-- Historical price charting UI.
+- Historical price charting UI, or any persisted tick/snapshot history.
 - Alerts/notifications (push, email, SMS).
 - Horizontal scaling, load balancing, multi-region deployment.
 - Admin tooling / back-office views.
 - Payments, blockchain, x402, or any unrelated infra.
+- Portfolio tracking, holdings/P&L views, or buy/sell recommendations —
+  this product surfaces "what changed," never a position or a trade
+  suggestion.
+- News/social features.
+- A persisted "last-known-good" snapshot fallback for provider failure.
+- Full authentication/account system (OAuth, passwords, login UI) — see
+  the Persistent Anonymous Watchlist Identity note under Current Status
+  for what identity mechanism was actually built instead.
 
 ## Data Source Decision (locked — confirmed by live test)
 
@@ -154,6 +162,19 @@ polling loop must react to actual error/429 responses rather than assume
 a fixed ceiling (none was observed in the live test, and none is
 assumed).
 
+**Current implementation note**: this section describes the originally
+designed shared backend poll loop. The implementation instead fetches
+on demand, synchronously, inside `GET /watchlist`'s own request
+handler — there is no standalone backend process polling on a timer,
+and no fan-out deduplication across users yet. The "every 60 seconds"
+behavior a user actually experiences today comes from the **frontend's**
+own client-side poll (`App.jsx`'s `setInterval`), which simply calls
+`GET /watchlist`/`GET /watchlist/attention` again. This is a documented,
+deliberate sequencing choice, not an oversight — see `decisions.md`'s
+"On-demand fetch per request, not a separate background poll process"
+entry for the full reasoning and its known trade-offs (no shared-fetch
+protection under concurrent users yet).
+
 ## Build Order
 
 1. Data model + MongoDB schema for all five core entities (see
@@ -208,37 +229,130 @@ early.
 
 ## Current Status
 
-Backend and frontend both implemented; UI polish in progress. Not yet
-committed past UI Polish Pass 3 — see `decisions.md` for the specific
-decisions behind each item below.
+Product implementation is functionally complete. Seven dedicated P0
+adversarial-hardening passes (identity/authorization, market-data
+correctness, checkpoint/ChangeEvent lifecycle, MongoDB concurrency,
+API/frontend failure handling, and a final end-to-end regression audit)
+have run against the finished feature set and their fixes are committed
+(`21e45bc fix: harden watchlist state and failure handling`). See
+`decisions.md` for the specific decisions and fixes behind each item
+below.
 
-**Completed:**
-- Backend: checkpoint semantics (explicit-only advancement), Meaningful
-  Change Engine, ChangeEvent persistence, Attention Engine, the
-  `GET /watchlist/attention` endpoint, and the `session_date`
-  correctness fix (P1-1).
-- Frontend: attention-first home experience (`GET /watchlist/attention`
-  and `GET /watchlist` joined client-side by `instrument_id`, rendered
-  ahead of the full watchlist table).
-- Frontend: structured "What changed / Why it matters / Signals"
-  explanation per attention item, built only from backend-computed
-  fields (`attention_level`, `price_change_pct`,
-  `volume_acceleration_ratio`) — no new frontend scoring logic.
-- Frontend: High Attention / Worth Checking hierarchy, partitioning the
-  backend-ranked attention list into two groups without re-sorting or
-  re-scoring.
-- Frontend: light desktop web-dashboard visual foundation (color/spacing/
-  radius tokens, re-themed surfaces), header/hero composition (tagline,
-  subtitle), "Since You Last Checked" banner with a high/worth-checking
-  breakdown, and attention-card visual polish (price area with
-  since-checkpoint vs. day-over-day movement, signals list, detection
-  timestamp). Purely presentational — no backend or API changes.
+**COMPLETED:**
 
-**Remaining (intended order):**
-1. Watchlist table UI polish (currently only re-themed via Pass 1's
-   color tokens; structure/layout untouched).
-2. Real browser visual verification of the full dashboard.
-3. Full frontend/backend regression pass.
-4. Documentation consistency check.
-5. Final Git audit.
-6. Demo rehearsal / submission.
+Backend:
+1. Watchlist CRUD (add + list; no remove-instrument endpoint was ever
+   built — see Known Deviations below).
+2. Persistent anonymous watchlist identity (httpOnly capability cookie,
+   CSPRNG-generated owner token — not an account/login system).
+3. Owner-scoped watchlist membership (`Watchlist.instrument_ids`
+   activated as the real per-owner record; `Instrument` remains global).
+4. Deterministic price + volume meaningful-change engine (2.0% price /
+   2.0× volume-acceleration thresholds, locked).
+5. Session-aware volume acceleration (same-session only; cross-session
+   comparisons explicitly unavailable, never fabricated).
+6. Checkpoint semantics (explicit-only advancement — observation never
+   silently becomes acknowledgement).
+7. ChangeEvent persistence, deduplication, and acknowledgement lifecycle.
+8. Attention Engine (`GET /watchlist/attention`) with HIGH/MEDIUM/WATCH
+   ranking bands.
+9. Freshness / delayed / unavailable / invalid snapshot handling.
+10. Provider failure isolation (one instrument's bad data can no longer
+    take down its siblings in the same batch — P0 Hardening #2 fix).
+11. Checkpoint/ChangeEvent race hardening (a `GET` racing a concurrent
+    Mark Seen can no longer persist a stale-checkpoint `ChangeEvent` —
+    P0 Hardening #3 fix).
+12. MongoDB concurrency hardening (`DuplicateKeyError` recovery added
+    for concurrent Add Stock and concurrent first-owner seed creation —
+    P0 Hardening #4/#5 fixes).
+
+Frontend:
+13. Attention-first home experience ("Since You Last Checked" above the
+    full watchlist table).
+14. High Attention / Worth Checking hierarchy.
+15. Structured What changed / Why it matters / Signals explanation per
+    attention item.
+16. View Details (local expandable card state — no API call, no
+    checkpoint/acknowledgement side effect).
+17. Explicit Mark as Seen (per instrument).
+18. Mark All as Seen (whole-watchlist, with truthful partial-failure
+    reporting).
+19. Search (frontend-only, symbol/exchange, case-insensitive).
+20. Watchlist filters (All / Attention / Normal / Baseline Pending —
+    frontend-only).
+21. Add Stock (symbol + exchange, with provider-resolution validation).
+22. API/frontend failure-state handling — a failed fetch is never
+    presented as confirmed-empty or confirmed-caught-up, and a
+    malformed-but-200 response can no longer crash the page (P0
+    Hardening #6 fixes).
+
+**CURRENT (in progress / not yet done):**
+- Deployment configuration (see "Remaining" below) — a pre-deployment
+  environment inspection has already identified the exact two
+  hardcoded-origin edits required (CORS allow-list, frontend
+  `API_BASE`) and the environment variables to set; neither edit has
+  been made yet.
+
+**REMAINING (intended order):**
+1. Deployment configuration (the two hardcoded-origin edits identified
+   by the environment inspection, plus setting `ENVIRONMENT=production`
+   and the MongoDB Atlas connection variables on the chosen hosts).
+2. Deployment (static frontend host + FastAPI backend host + the
+   already-provisioned MongoDB Atlas cluster).
+3. Live browser QA against the deployed environment.
+4. Fix only deployment/real-environment issues surfaced by that QA —
+   not a new feature or hardening pass.
+5. Final UI polish, if the live QA surfaces anything worth it.
+6. Final documentation verification (re-check this file and
+   `architecture.md`/`decisions.md` against whatever the deployment
+   step actually required).
+7. Final Git cleanup (confirm no scratch/local files or secrets are
+   staged).
+8. Push.
+9. Demo/pitch/Q&A preparation.
+
+**DEFERRED / CUT (explicitly not built — see the CUT section above for
+the original list; reconfirmed accurate as of this status update):**
+- WebSockets/SSE, Redis, Kafka, message queues, microservices,
+  Kubernetes — no code path in this project needs them (see
+  `decisions.md`'s "No microservices, queues, Redis, Kafka, WebSockets,
+  Kubernetes, or LLM" decision).
+- LLM/AI involvement in change detection or attention scoring — fully
+  deterministic, rule-based, and remains so.
+- Alerts/notifications (push, email, SMS).
+- A portfolio/P&L tracking view, or buy/sell recommendations — this
+  product surfaces "what changed," never a position, holding, or trade
+  suggestion.
+- News/social features.
+- Historical price charting UI, or any tick-level/append-only history —
+  `MarketSnapshot`-shaped data is a per-request value object, not a
+  persisted history (see Known Deviations below).
+- A persisted "last-known-good" snapshot fallback on provider failure —
+  a failed instrument reports `unavailable` for that request; there is
+  no cached prior value served in its place. This is a real, current
+  gap (not a design choice made lightly) — see `architecture.md`'s
+  Known Limitations.
+- Full authentication/account system (OAuth, passwords, login UI,
+  multi-tenant orgs) — identity is an anonymous capability cookie, not
+  an account system; see `decisions.md`'s "Persistent anonymous
+  watchlist identity."
+- Remove-instrument from the watchlist — Add Stock exists; there is no
+  corresponding remove endpoint or UI action.
+
+**Known Deviations from the original design (see `decisions.md` for
+full reasoning on each):**
+- Market data is fetched **on demand, synchronously inside the request
+  handler**, not via a separate always-on background poll loop writing
+  to MongoDB on a timer. The "poll every 60 seconds" behavior that
+  exists today is the **frontend's** client-side `setInterval` calling
+  `GET /watchlist`/`GET /watchlist/attention` again — not a backend
+  process. `MarketSnapshot`'s shape is used as an in-memory value
+  object per request; no `market_snapshots` documents are ever written,
+  despite the collection's index existing. See decisions.md's
+  "On-demand fetch per request, not a separate background poll process"
+  entry.
+- Two UI-polish-era decisions ("No 'Mark all as seen' CTA introduced,"
+  "No 'View details' action added") were later superseded once those
+  features were actually built as real, scoped features — see
+  `decisions.md`'s newer entries, which explicitly mark that
+  supersession rather than silently contradicting the earlier ones.
